@@ -18,6 +18,8 @@ RUN mkdir -p rpc-plane/src rpc-plane-core/src \
 # Build the real binary.
 COPY rpc-plane/src       rpc-plane/src
 COPY rpc-plane-core/src  rpc-plane-core/src
+# Embedded by `rpc-plane init` (include_str! at compile time).
+COPY config.example.toml config.example.toml
 
 # Touch sources so cargo knows they changed after the stub build.
 RUN touch rpc-plane/src/main.rs rpc-plane-core/src/lib.rs \
