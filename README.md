@@ -39,14 +39,7 @@ Your app replaces its provider URL with `http://localhost:9400`. No other change
 curl -sSf https://rpcplane.dev/install.sh | sh
 ```
 
-**Manual download:** grab the binary for your platform from [GitHub Releases](https://github.com/rpcplane/rpc-plane/releases).
-
-| Platform | Binary |
-|----------|--------|
-| Linux x86_64 | `rpc-plane-x86_64-unknown-linux-gnu` |
-| Linux aarch64 | `rpc-plane-aarch64-unknown-linux-gnu` |
-| macOS x86_64 | `rpc-plane-x86_64-apple-darwin` |
-| macOS arm64 | `rpc-plane-aarch64-apple-darwin` |
+**Manual download:** grab the binary for your platform from [GitHub Releases](https://github.com/rpcplane/rpc-plane/releases) — Linux and macOS, x86_64 and aarch64.
 
 The Linux binaries are built against **glibc 2.35** (Ubuntu 22.04). They run on Ubuntu 22.04+, Debian 12+, Amazon Linux 2023, and Rocky/RHEL 9+. For older systems (RHEL/Rocky 8, Debian 11), use the Docker image or build from source.
 
@@ -82,6 +75,10 @@ url  = "https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}"
 [[providers]]
 name = "quicknode"
 url  = "https://your-endpoint.quiknode.pro/${QUICKNODE_API_KEY}"
+
+[[providers]]
+name = "triton"
+url  = "https://your-pool.rpcpool.com/${TRITON_API_KEY}"
 ```
 
 Run `rpc-plane init` to generate a full config with all options and their defaults.
