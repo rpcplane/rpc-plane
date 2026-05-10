@@ -203,7 +203,7 @@ async fn write_method_broadcasts_to_all_providers() {
         post(move |body: axum::body::Bytes| {
             let c = cnt_a.clone();
             async move {
-                if std::str::from_utf8(&body).map_or(false, |s| s.contains("sendTransaction")) {
+                if std::str::from_utf8(&body).is_ok_and(|s| s.contains("sendTransaction")) {
                     c.fetch_add(1, Ordering::Relaxed);
                 }
                 slot_response(1)
@@ -217,7 +217,7 @@ async fn write_method_broadcasts_to_all_providers() {
         post(move |body: axum::body::Bytes| {
             let c = cnt_b.clone();
             async move {
-                if std::str::from_utf8(&body).map_or(false, |s| s.contains("sendTransaction")) {
+                if std::str::from_utf8(&body).is_ok_and(|s| s.contains("sendTransaction")) {
                     c.fetch_add(1, Ordering::Relaxed);
                 }
                 slot_response(1)

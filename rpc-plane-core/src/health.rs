@@ -683,8 +683,11 @@ mod tests {
             weight: 1,
             pricing: None,
         };
-        let monitor =
-            HealthMonitor::new(&[provider.clone()], HealthConfig::default(), Metrics::new());
+        let monitor = HealthMonitor::new(
+            std::slice::from_ref(&provider),
+            HealthConfig::default(),
+            Metrics::new(),
+        );
         // Manually replace the entry with a fresh ProviderHealth so background loops
         // are not started (avoids real HTTP probes in the unit test).
         {

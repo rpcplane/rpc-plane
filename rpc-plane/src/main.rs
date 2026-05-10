@@ -221,17 +221,16 @@ async fn status(config_path: PathBuf) -> Result<()> {
         .max(4);
 
     println!(
-        "  {:<name_w$}  {:>6}  {:>12}  {:>6}  {:>10}  {}",
-        "NAME", "SCORE", "SLOT", "DRIFT", "LATENCY", "CIRCUIT"
+        "  {:<name_w$}  {:>6}  {:>12}  {:>6}  {:>10}  CIRCUIT",
+        "NAME", "SCORE", "SLOT", "DRIFT", "LATENCY"
     );
     println!(
-        "  {:<name_w$}  {:>6}  {:>12}  {:>6}  {:>10}  {}",
+        "  {:<name_w$}  {:>6}  {:>12}  {:>6}  {:>10}  -------",
         "-".repeat(name_w),
         "------",
         "------------",
         "------",
-        "----------",
-        "-------"
+        "----------"
     );
 
     for p in &providers {
