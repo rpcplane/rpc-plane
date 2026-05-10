@@ -1,0 +1,26 @@
+# Single provider with health monitoring
+#
+# Even with one provider, RPC Plane adds:
+#   - Real-time health scoring and Prometheus metrics
+#   - Slot drift detection
+#   - Automatic retry on transient errors (429, 503, timeout)
+#   - Structured request logging
+#
+# Usage:
+#   export TRITON_API_KEY=...
+#   rpc-plane -c examples/single-provider.toml run
+
+[server]
+listen         = "127.0.0.1:9400"
+metrics_listen = "127.0.0.1:9401"
+
+[health]
+interval_ms          = 2000
+slot_drift_threshold = 10
+
+[routing]
+max_retries = 1   # only one provider, but still retry on 429/timeout
+
+[[providers]]
+name = "triton"
+url  = "https://your-pool.rpcpool.com/${TRITON_API_KEY}"

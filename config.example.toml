@@ -1,0 +1,53 @@
+[server]
+listen = "127.0.0.1:9400"
+metrics_listen = "127.0.0.1:9401"
+
+# ── Health scoring ─────────────────────────────────────────────────────────────
+[health]
+interval_ms = 2000            # how often to probe each provider
+window_secs = 60              # sliding window for error rate
+slot_drift_threshold = 10     # slots behind tip before deprioritised
+
+# Circuit breaker: opens when consecutive_failures >= N or error_rate >= threshold
+circuit_open_failures = 5
+circuit_error_threshold = 0.5
+circuit_cooldown_secs = 30    # wait before half-open probe
+
+# Score weights (normalised — do not need to sum to 1.0)
+w_latency = 0.4
+w_error   = 0.3
+w_slot    = 0.2
+w_success = 0.1
+
+# ── Routing ────────────────────────────────────────────────────────────────────
+[routing]
+# best_score | weighted_random | failover_ordered | parallel_race
+strategy    = "best_score"
+max_retries = 2               # retry on next-best provider on transient errors
+cost_aware  = false
+cost_weight = 0.2             # w_cost when cost_aware = true
+
+# ── Providers ──────────────────────────────────────────────────────────────────
+[[providers]]
+name   = "helius"
+url    = "https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}"
+weight = 1
+
+[[providers]]
+name   = "quicknode"
+url    = "https://your-endpoint.quiknode.pro/${QUICKNODE_API_KEY}"
+weight = 1
+
+[[providers]]
+name   = "triton"
+url    = "https://your-pool.rpcpool.com/${TRITON_API_KEY}"
+weight = 1
+
+# ── Telemetry reporting ────────────────────────────────────────────────────────
+# Presence of this block enables RemoteReporter. Absence keeps Prometheus-only mode.
+# [reporting]
+# endpoint          = "http://localhost:3000/api/ingest"
+# api_key           = "rp_live_xxxx"
+# flush_interval_ms = 5000   # how often to POST batched events
+# buffer_size       = 1000   # max buffered events (oldest dropped when full)
+# batch_size        = 100    # max events per HTTP POST

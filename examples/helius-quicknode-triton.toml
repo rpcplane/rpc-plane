@@ -1,0 +1,33 @@
+# Standard three-provider setup
+#
+# Routes reads to the healthiest provider, broadcasts writes to all three.
+# This is the recommended starting config for most production workloads.
+#
+# Usage:
+#   export HELIUS_API_KEY=...
+#   export QUICKNODE_API_KEY=...
+#   export TRITON_API_KEY=...
+#   rpc-plane -c examples/helius-quicknode-triton.toml run
+
+[server]
+listen         = "127.0.0.1:9400"
+metrics_listen = "127.0.0.1:9401"
+
+[routing]
+strategy    = "best_score"   # healthiest provider gets reads
+max_retries = 2
+
+[[providers]]
+name   = "helius"
+url    = "https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}"
+weight = 1
+
+[[providers]]
+name   = "quicknode"
+url    = "https://your-endpoint.quiknode.pro/${QUICKNODE_API_KEY}"
+weight = 1
+
+[[providers]]
+name   = "triton"
+url    = "https://your-pool.rpcpool.com/${TRITON_API_KEY}"
+weight = 1

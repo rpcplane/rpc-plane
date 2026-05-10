@@ -1,0 +1,19 @@
+# Rust build output
+/target/
+**/*.rs.bk
+
+# Local runtime config (contains real provider URLs / API keys).
+# Use config.example.toml as the committed template.
+/rpc-plane.toml
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store

@@ -1,0 +1,57 @@
+# Trading bot: write-path optimized
+#
+# Tuned for workloads that need to land transactions fast and reliably.
+#
+# Key differences from the default config:
+#   - All writes (sendTransaction) broadcast to every healthy provider
+#   - Tighter health probe interval — faster detection of degraded providers
+#   - Tighter slot drift threshold — never route to a stale node
+#   - Faster circuit breaker — fail fast and failover
+#   - Reads use best_score — always go to the freshest provider
+#
+# This is the default write behaviour (broadcast is always on), but the
+# tighter health settings ensure you're broadcasting to only the best nodes.
+#
+# Usage:
+#   export HELIUS_API_KEY=...
+#   export QUICKNODE_API_KEY=...
+#   export TRITON_API_KEY=...
+#   rpc-plane -c examples/trading-bot.toml run
+
+[server]
+listen         = "127.0.0.1:9400"
+metrics_listen = "127.0.0.1:9401"
+
+[health]
+interval_ms            = 1000   # probe every second
+window_secs            = 30     # shorter error window — react faster
+slot_drift_threshold   = 3      # aggressively deprioritize stale nodes
+slot_interval_ms       = 500    # track slots twice per second
+circuit_open_failures  = 3      # open circuit after 3 failures
+circuit_error_threshold = 0.3   # open at 30% error rate
+circuit_cooldown_secs  = 10     # recover quickly
+
+# Weight slot freshness heavily — stale transactions fail.
+w_latency = 0.3
+w_error   = 0.2
+w_slot    = 0.4
+w_success = 0.1
+
+[routing]
+strategy    = "best_score"   # reads go to the freshest provider
+max_retries = 3              # retry aggressively on reads
+
+[[providers]]
+name   = "helius"
+url    = "https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}"
+weight = 1
+
+[[providers]]
+name   = "quicknode"
+url    = "https://your-endpoint.quiknode.pro/${QUICKNODE_API_KEY}"
+weight = 1
+
+[[providers]]
+name   = "triton"
+url    = "https://your-pool.rpcpool.com/${TRITON_API_KEY}"
+weight = 1
