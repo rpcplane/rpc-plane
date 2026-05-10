@@ -158,10 +158,19 @@ impl Metrics {
         drift: u64,
         circuit_open: bool,
     ) {
-        self.0.health_score.with_label_values(&[provider]).set(score);
+        self.0
+            .health_score
+            .with_label_values(&[provider])
+            .set(score);
         if let Some(s) = slot {
-            self.0.slot_height.with_label_values(&[provider]).set(s as f64);
-            self.0.slot_drift.with_label_values(&[provider]).set(drift as f64);
+            self.0
+                .slot_height
+                .with_label_values(&[provider])
+                .set(s as f64);
+            self.0
+                .slot_drift
+                .with_label_values(&[provider])
+                .set(drift as f64);
         }
         self.0
             .circuit_state

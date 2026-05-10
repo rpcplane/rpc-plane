@@ -222,7 +222,9 @@ async fn sequential(
                             attempt,
                             "retryable RPC error, trying next provider"
                         );
-                        state.metrics.record_request(method, name, "error", latency_ms);
+                        state
+                            .metrics
+                            .record_request(method, name, "error", latency_ms);
                         state.reporter.emit(TelemetryEvent::Request {
                             id: request_id.to_string(),
                             method: method.to_string(),
@@ -272,7 +274,9 @@ async fn sequential(
                     error = %e,
                     "provider error, trying next"
                 );
-                state.metrics.record_request(method, name, "error", latency_ms);
+                state
+                    .metrics
+                    .record_request(method, name, "error", latency_ms);
                 state.reporter.emit(TelemetryEvent::Request {
                     id: request_id.to_string(),
                     method: method.to_string(),
@@ -336,7 +340,9 @@ async fn broadcast(
     while let Some(res) = set.join_next().await {
         match res {
             Ok((name, Ok(bytes), latency_ms)) => {
-                state.metrics.record_request(method, &name, "ok", latency_ms);
+                state
+                    .metrics
+                    .record_request(method, &name, "ok", latency_ms);
                 state.reporter.emit(TelemetryEvent::Request {
                     id: request_id.to_string(),
                     method: method.to_string(),
@@ -360,7 +366,9 @@ async fn broadcast(
             }
             Ok((name, Err(e), latency_ms)) => {
                 warn!(request_id = %request_id, provider = %name, method, error = %e, "broadcast provider failed");
-                state.metrics.record_request(method, &name, "error", latency_ms);
+                state
+                    .metrics
+                    .record_request(method, &name, "error", latency_ms);
                 state.reporter.emit(TelemetryEvent::Request {
                     id: request_id.to_string(),
                     method: method.to_string(),

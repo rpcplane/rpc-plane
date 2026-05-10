@@ -88,8 +88,7 @@ async fn run(config_path: PathBuf) -> Result<()> {
         None => Arc::new(NoopReporter),
     };
 
-    let state =
-        rpc_plane_core::proxy::ProxyState::new_with_reporter(config, reporter.clone());
+    let state = rpc_plane_core::proxy::ProxyState::new_with_reporter(config, reporter.clone());
     let proxy_router = rpc_plane_core::proxy::build_router(state.clone());
     let metrics_router = rpc_plane_core::proxy::build_metrics_router(state.clone());
 
@@ -196,11 +195,9 @@ async fn status(config_path: PathBuf) -> Result<()> {
         .timeout(Duration::from_secs(5))
         .build()?;
 
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("could not reach proxy at {url}: {e}\nIs rpc-plane running?"))?;
+    let resp = client.get(&url).send().await.map_err(|e| {
+        anyhow::anyhow!("could not reach proxy at {url}: {e}\nIs rpc-plane running?")
+    })?;
 
     let body: serde_json::Value = resp.json().await?;
 

@@ -166,7 +166,6 @@ pub fn route(
     }
 }
 
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -303,21 +302,30 @@ mod tests {
     #[test]
     fn non_retryable_http_status_codes() {
         for code in [200u16, 400, 401, 403, 404, 422] {
-            assert!(!is_retryable_http(code), "expected {code} to be non-retryable");
+            assert!(
+                !is_retryable_http(code),
+                "expected {code} to be non-retryable"
+            );
         }
     }
 
     #[test]
     fn retryable_rpc_error_codes() {
         for code in [-32003i64, -32005, -32603] {
-            assert!(is_retryable_rpc_code(code), "expected {code} to be retryable");
+            assert!(
+                is_retryable_rpc_code(code),
+                "expected {code} to be retryable"
+            );
         }
     }
 
     #[test]
     fn non_retryable_rpc_error_codes() {
         for code in [-32700i64, -32600, -32601, -32602, 0, 1] {
-            assert!(!is_retryable_rpc_code(code), "expected {code} to be non-retryable");
+            assert!(
+                !is_retryable_rpc_code(code),
+                "expected {code} to be non-retryable"
+            );
         }
     }
 

@@ -36,7 +36,10 @@ impl Config {
             anyhow::ensure!(!p.url.is_empty(), "provider '{}' has an empty url", p.name);
         }
         if let Some(r) = &self.reporting {
-            anyhow::ensure!(!r.endpoint.is_empty(), "reporting.endpoint must not be empty");
+            anyhow::ensure!(
+                !r.endpoint.is_empty(),
+                "reporting.endpoint must not be empty"
+            );
         }
         Ok(())
     }

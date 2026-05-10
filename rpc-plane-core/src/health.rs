@@ -281,7 +281,14 @@ impl HealthMonitor {
                 };
                 (e.health.clone(), e.stop.clone())
             };
-            Self::spawn_loops(health, stop, client.clone(), provider, self.cfg.clone(), self.metrics.clone());
+            Self::spawn_loops(
+                health,
+                stop,
+                client.clone(),
+                provider,
+                self.cfg.clone(),
+                self.metrics.clone(),
+            );
         }
     }
 
@@ -289,11 +296,18 @@ impl HealthMonitor {
     pub fn add_provider(&self, client: Arc<Client>, provider: ProviderConfig) {
         let stop = Arc::new(AtomicBool::new(false));
         let health = ProviderHealth::new(&provider.name);
-        Self::spawn_loops(health.clone(), stop.clone(), client, provider.clone(), self.cfg.clone(), self.metrics.clone());
-        self.entries.write().unwrap().insert(
-            provider.name.clone(),
-            ProviderEntry { health, stop },
+        Self::spawn_loops(
+            health.clone(),
+            stop.clone(),
+            client,
+            provider.clone(),
+            self.cfg.clone(),
+            self.metrics.clone(),
         );
+        self.entries
+            .write()
+            .unwrap()
+            .insert(provider.name.clone(), ProviderEntry { health, stop });
     }
 
     /// Signal the background loops for this provider to exit and remove it.
@@ -323,7 +337,12 @@ impl HealthMonitor {
         });
 
         tokio::spawn(crate::slot_tracker::slot_poll_loop(
-            health, client, provider, interval_ms, metrics, stop,
+            health,
+            client,
+            provider,
+            interval_ms,
+            metrics,
+            stop,
         ));
     }
 
@@ -664,7 +683,8 @@ mod tests {
             weight: 1,
             pricing: None,
         };
-        let monitor = HealthMonitor::new(&[provider.clone()], HealthConfig::default(), Metrics::new());
+        let monitor =
+            HealthMonitor::new(&[provider.clone()], HealthConfig::default(), Metrics::new());
         // Manually replace the entry with a fresh ProviderHealth so background loops
         // are not started (avoids real HTTP probes in the unit test).
         {

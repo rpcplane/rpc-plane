@@ -225,7 +225,10 @@ mod tests {
     #[test]
     fn noop_reporter_is_zero_cost() {
         let r = NoopReporter;
-        r.emit(TelemetryEvent::CacheEvent { method: "getSlot".into(), hit: true });
+        r.emit(TelemetryEvent::CacheEvent {
+            method: "getSlot".into(),
+            hit: true,
+        });
         r.flush();
         // no panic = pass
     }

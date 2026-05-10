@@ -163,8 +163,10 @@ async fn sequential_failover_on_connection_refused() {
 /// to retry the request on provider B.
 #[tokio::test]
 async fn retryable_rpc_error_causes_retry_to_next_provider() {
-    let mock_a = Router::new()
-        .route("/", post(|| async { rpc_error_response(-32603, "internal error") }));
+    let mock_a = Router::new().route(
+        "/",
+        post(|| async { rpc_error_response(-32603, "internal error") }),
+    );
     let mock_b = Router::new().route("/", post(|| async { slot_response(777) }));
 
     let (url_a, _abort_a) = start_mock(mock_a).await;
@@ -254,7 +256,7 @@ async fn circuit_open_provider_excluded_from_routing() {
     let cfg = test_config(
         &[("a", &url_a), ("b", &url_b)],
         RoutingStrategy::FailoverOrdered, // A first in config order
-        0,                               // no retries — if A were tried, it would fail
+        0,                                // no retries — if A were tried, it would fail
         3,
     );
     let state = ProxyState::new(cfg);
