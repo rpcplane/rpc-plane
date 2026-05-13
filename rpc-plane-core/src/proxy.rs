@@ -1,7 +1,7 @@
 use crate::config::{Config, ProviderConfig};
 use crate::health::{CircuitState, HealthMonitor};
 use crate::metrics::Metrics;
-use crate::router::{extract_rpc_error_code, is_retryable_rpc_code, route};
+use crate::router::{extract_rpc_error_code, is_retryable_http, is_retryable_rpc_code, route};
 use crate::telemetry::{NoopReporter, Reporter, TelemetryEvent};
 use axum::{
     body::Bytes,
@@ -454,7 +454,12 @@ async fn forward(
     }
 
     let resp = builder.body(body.clone()).send().await?;
-    Ok(resp.bytes().await?)
+    let status = resp.status().as_u16();
+    let bytes = resp.bytes().await?;
+    if is_retryable_http(status) {
+        anyhow::bail!("provider returned HTTP {status}");
+    }
+    Ok(bytes)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

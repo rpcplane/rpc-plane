@@ -291,7 +291,7 @@ url = "http://localhost:8899"
         assert_eq!(cfg.providers.len(), 1);
         assert_eq!(cfg.providers[0].name, "test");
         assert_eq!(cfg.server.listen, "127.0.0.1:9400");
-        assert_eq!(cfg.health.interval_ms, 2000);
+        assert_eq!(cfg.health.interval_ms, 1000);
         assert_eq!(cfg.routing.max_retries, 2);
     }
 

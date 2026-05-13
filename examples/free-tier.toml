@@ -1,0 +1,64 @@
+# Free-tier maxxing
+#
+# Spreads load across five free or no-cost endpoints so no single provider
+# sees enough traffic to hit its rate limit.
+#
+# Two providers need no sign-up at all:
+#   - api.mainnet-beta.solana.com  (Solana Foundation public RPC)
+#   - rpc.ankr.com/solana          (Ankr public RPC)
+#
+# The remaining three require a free account:
+#   - Helius   https://helius.dev       (Developer plan)
+#   - QuickNode https://quicknode.com   (Free starter endpoint)
+#   - Alchemy  https://alchemy.com      (Free tier)
+#
+# Usage:
+#   export HELIUS_API_KEY=...
+#   export QUICKNODE_API_KEY=...
+#   export ALCHEMY_API_KEY=...
+#   rpc-plane -c examples/free-tier.toml run
+
+[server]
+listen         = "127.0.0.1:9400"
+metrics_listen = "127.0.0.1:9401"
+
+[health]
+interval_ms             = 2000
+window_secs             = 30
+circuit_open_failures   = 3     # open quickly when a key rate-limits
+circuit_error_threshold = 0.4
+circuit_cooldown_secs   = 2     # RPS windows reset per-second; recover fast
+
+[routing]
+strategy    = "weighted_random"  # spread load evenly — avoid hammering one key
+max_retries = 4                  # try all five before giving up
+
+# ── No sign-up required ────────────────────────────────────────────────────────
+
+[[providers]]
+name   = "solana-foundation"
+url    = "https://api.mainnet-beta.solana.com"
+weight = 1
+
+[[providers]]
+name   = "ankr"
+url    = "https://rpc.ankr.com/solana"
+weight = 1
+
+# ── Free-tier accounts ─────────────────────────────────────────────────────────
+
+[[providers]]
+name   = "helius"
+url    = "https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}"
+weight = 1
+http3  = true
+
+[[providers]]
+name   = "quicknode"
+url    = "https://your-endpoint.quiknode.pro/${QUICKNODE_API_KEY}"
+weight = 1
+
+[[providers]]
+name   = "alchemy"
+url    = "https://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}"
+weight = 1
