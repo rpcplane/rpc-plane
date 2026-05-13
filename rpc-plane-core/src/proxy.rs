@@ -30,9 +30,7 @@ pub fn build_client(provider: &ProviderConfig) -> Client {
         .tcp_keepalive(std::time::Duration::from_secs(60))
         .pool_max_idle_per_host(32);
     if provider.http3 {
-        builder = builder
-            .http3_prior_knowledge()
-            .http3_send_grease(false);
+        builder = builder.http3_prior_knowledge().http3_send_grease(false);
     }
     builder.build().expect("failed to build HTTP client")
 }

@@ -343,13 +343,19 @@ async fn watch_config(
                     clients.write().unwrap().remove(name);
                     monitor.remove_provider(name);
                     let client = Arc::new(rpc_plane_core::proxy::build_client(new_p));
-                    clients.write().unwrap().insert(name.clone(), client.clone());
+                    clients
+                        .write()
+                        .unwrap()
+                        .insert(name.clone(), client.clone());
                     monitor.add_provider(client, new_p.clone());
                     info!(provider = %name, "hot reload: provider URL updated");
                 }
                 None => {
                     let client = Arc::new(rpc_plane_core::proxy::build_client(new_p));
-                    clients.write().unwrap().insert(name.clone(), client.clone());
+                    clients
+                        .write()
+                        .unwrap()
+                        .insert(name.clone(), client.clone());
                     monitor.add_provider(client, new_p.clone());
                     info!(provider = %name, "hot reload: provider added");
                 }

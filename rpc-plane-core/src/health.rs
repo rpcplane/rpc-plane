@@ -1,7 +1,7 @@
 use crate::config::{HealthConfig, ProviderConfig};
 use crate::metrics::Metrics;
-use reqwest::Client;
 use crate::proxy::Clients;
+use reqwest::Client;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -277,7 +277,9 @@ impl HealthMonitor {
         for provider in providers {
             let client = {
                 let map = clients.read().unwrap();
-                let Some(c) = map.get(&provider.name) else { continue; };
+                let Some(c) = map.get(&provider.name) else {
+                    continue;
+                };
                 c.clone()
             };
             let (health, stop) = {
