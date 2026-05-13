@@ -5,6 +5,7 @@ WORKDIR /build
 
 # Cache dependency compilation separately from source changes.
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY .cargo/config.toml          .cargo/config.toml
 COPY rpc-plane/Cargo.toml        rpc-plane/Cargo.toml
 COPY rpc-plane-core/Cargo.toml   rpc-plane-core/Cargo.toml
 
