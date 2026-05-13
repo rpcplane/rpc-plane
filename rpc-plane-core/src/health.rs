@@ -290,7 +290,7 @@ impl HealthMonitor {
             Self::spawn_loops(
                 health,
                 stop,
-                client.clone(),
+                client,
                 provider,
                 self.cfg.clone(),
                 self.metrics.clone(),

@@ -15,7 +15,7 @@ listen         = "127.0.0.1:9400"
 metrics_listen = "127.0.0.1:9401"
 
 [health]
-interval_ms          = 2000
+interval_ms          = 1000
 slot_drift_threshold = 10
 
 [routing]

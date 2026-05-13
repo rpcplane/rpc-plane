@@ -23,10 +23,9 @@ listen         = "127.0.0.1:9400"
 metrics_listen = "127.0.0.1:9401"
 
 [health]
-interval_ms            = 1000   # probe every second
+interval_ms            = 500    # probe every 500ms
 window_secs            = 30     # shorter error window — react faster
 slot_drift_threshold   = 3      # aggressively deprioritize stale nodes
-slot_interval_ms       = 500    # track slots twice per second
 circuit_open_failures  = 3      # open circuit after 3 failures
 circuit_error_threshold = 0.3   # open at 30% error rate
 circuit_cooldown_secs  = 10     # recover quickly

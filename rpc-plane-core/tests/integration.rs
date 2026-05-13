@@ -55,7 +55,6 @@ fn test_config(
         server: ServerConfig::default(),
         health: HealthConfig {
             interval_ms: 999_999,
-            slot_interval_ms: 999_999,
             circuit_open_failures,
             // Disable error-rate trigger — use only consecutive_failures.
             circuit_error_threshold: 1.1,

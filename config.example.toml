@@ -4,7 +4,7 @@ metrics_listen = "127.0.0.1:9401"
 
 # ── Health scoring ─────────────────────────────────────────────────────────────
 [health]
-interval_ms = 2000            # how often to probe each provider
+interval_ms = 1000            # how often to probe each provider
 window_secs = 60              # sliding window for error rate
 slot_drift_threshold = 10     # slots behind tip before deprioritised
 
@@ -32,6 +32,7 @@ cost_weight = 0.2             # w_cost when cost_aware = true
 name   = "helius"
 url    = "https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}"
 weight = 1
+http3  = true
 
 [[providers]]
 name   = "quicknode"
@@ -42,6 +43,7 @@ weight = 1
 name   = "triton"
 url    = "https://your-pool.rpcpool.com/${TRITON_API_KEY}"
 weight = 1
+http3  = true
 
 # ── Telemetry reporting ────────────────────────────────────────────────────────
 # Presence of this block enables RemoteReporter. Absence keeps Prometheus-only mode.

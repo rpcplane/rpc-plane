@@ -93,9 +93,6 @@ pub struct HealthConfig {
     /// Slots behind network tip before a provider is considered drifting.
     #[serde(default = "default_slot_drift_threshold")]
     pub slot_drift_threshold: u64,
-    /// How often the dedicated slot tracker polls each provider (ms).
-    #[serde(default = "default_slot_interval_ms")]
-    pub slot_interval_ms: u64,
     /// Consecutive probe failures before the circuit opens.
     #[serde(default = "default_circuit_open_failures")]
     pub circuit_open_failures: u32,
@@ -122,7 +119,6 @@ impl Default for HealthConfig {
             interval_ms: default_interval_ms(),
             window_secs: default_window_secs(),
             slot_drift_threshold: default_slot_drift_threshold(),
-            slot_interval_ms: default_slot_interval_ms(),
             circuit_open_failures: default_circuit_open_failures(),
             circuit_error_threshold: default_circuit_error_threshold(),
             circuit_cooldown_secs: default_circuit_cooldown_secs(),
@@ -135,16 +131,13 @@ impl Default for HealthConfig {
 }
 
 fn default_interval_ms() -> u64 {
-    2000
+    1000
 }
 fn default_window_secs() -> u64 {
     60
 }
 fn default_slot_drift_threshold() -> u64 {
     10
-}
-fn default_slot_interval_ms() -> u64 {
-    1000
 }
 fn default_circuit_open_failures() -> u32 {
     5
@@ -224,6 +217,9 @@ pub struct ProviderConfig {
     #[serde(default = "default_weight")]
     pub weight: u32,
     pub pricing: Option<ProviderPricing>,
+    /// Use HTTP/3 (QUIC) for outbound connections to this provider.
+    #[serde(default)]
+    pub http3: bool,
 }
 
 fn default_weight() -> u32 {
