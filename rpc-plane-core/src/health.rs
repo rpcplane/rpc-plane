@@ -676,6 +676,7 @@ mod tests {
             url: "http://127.0.0.1:1".to_string(),
             weight: 1,
             pricing: None,
+            http3: false,
         };
         let monitor = HealthMonitor::new(
             std::slice::from_ref(&provider),
@@ -707,6 +708,7 @@ mod tests {
             url: "http://localhost:8899".to_string(),
             weight: 1,
             pricing: None,
+            http3: false,
         };
         // add_provider spawns background tasks, so we need a tokio runtime
         // We don't call add_provider here (needs real HTTP) — just verify map ops

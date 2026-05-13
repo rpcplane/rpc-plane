@@ -73,6 +73,7 @@ fn test_config(
                 url: url.to_string(),
                 weight: 1,
                 pricing: None,
+                http3: false,
             })
             .collect(),
         reporting: None,
