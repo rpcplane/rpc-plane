@@ -21,6 +21,7 @@ max_retries = 2
 name   = "helius"
 url    = "https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}"
 weight = 1
+http3  = true
 
 [[providers]]
 name   = "quicknode"
@@ -31,3 +32,4 @@ weight = 1
 name   = "triton"
 url    = "https://your-pool.rpcpool.com/${TRITON_API_KEY}"
 weight = 1
+http3  = true

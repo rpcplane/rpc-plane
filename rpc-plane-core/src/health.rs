@@ -1,6 +1,7 @@
 use crate::config::{HealthConfig, ProviderConfig};
 use crate::metrics::Metrics;
 use reqwest::Client;
+use crate::proxy::Clients;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -272,8 +273,13 @@ impl HealthMonitor {
     }
 
     /// Spawn health + slot loops for every provider currently in the map.
-    pub fn start(&self, client: Arc<Client>, providers: Vec<ProviderConfig>) {
+    pub fn start(&self, clients: Clients, providers: Vec<ProviderConfig>) {
         for provider in providers {
+            let client = {
+                let map = clients.read().unwrap();
+                let Some(c) = map.get(&provider.name) else { continue; };
+                c.clone()
+            };
             let (health, stop) = {
                 let map = self.entries.read().unwrap();
                 let Some(e) = map.get(&provider.name) else {
@@ -325,25 +331,9 @@ impl HealthMonitor {
         cfg: Arc<HealthConfig>,
         metrics: Metrics,
     ) {
-        let interval_ms = cfg.slot_interval_ms;
-
         tokio::spawn({
-            let health = health.clone();
-            let stop = stop.clone();
-            let client = client.clone();
-            let provider = provider.clone();
-            let metrics = metrics.clone();
             async move { health_loop(health, client, provider, cfg, metrics, stop).await }
         });
-
-        tokio::spawn(crate::slot_tracker::slot_poll_loop(
-            health,
-            client,
-            provider,
-            interval_ms,
-            metrics,
-            stop,
-        ));
     }
 
     /// Network tip = max slot height across all providers.
@@ -466,13 +456,15 @@ async fn probe(client: &Client, provider: &ProviderConfig) -> anyhow::Result<u64
         "method": "getSlot",
         "params": [{"commitment": "processed"}]
     });
-    let resp = client
+    let mut req = client
         .post(&provider.url)
         .header("content-type", "application/json")
         .timeout(Duration::from_secs(5))
-        .json(&body)
-        .send()
-        .await?;
+        .json(&body);
+    if provider.http3 {
+        req = req.version(reqwest::Version::HTTP_3);
+    }
+    let resp = req.send().await?;
     anyhow::ensure!(resp.status().is_success(), "HTTP {}", resp.status());
     let json: Value = resp.json().await?;
     json["result"]

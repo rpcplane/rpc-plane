@@ -9,6 +9,7 @@ license.workspace = true
 name = "rpc-plane"
 path = "src/main.rs"
 
+
 [dependencies]
 rpc-plane-core = { path = "../rpc-plane-core" }
 tokio.workspace = true
@@ -19,3 +20,4 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
 anyhow.workspace = true
+bytes.workspace = true

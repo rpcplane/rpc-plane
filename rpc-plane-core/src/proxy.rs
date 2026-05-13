@@ -13,7 +13,10 @@ use axum::{
 };
 use reqwest::Client;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
+
+pub type Clients = Arc<std::sync::RwLock<HashMap<String, Arc<Client>>>>;
 use std::time::Instant;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
@@ -21,12 +24,33 @@ use uuid::Uuid;
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
+pub fn build_client(provider: &ProviderConfig) -> Client {
+    let mut builder = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .tcp_keepalive(std::time::Duration::from_secs(60))
+        .pool_max_idle_per_host(32);
+    if provider.http3 {
+        builder = builder
+            .http3_prior_knowledge()
+            .http3_send_grease(false);
+    }
+    builder.build().expect("failed to build HTTP client")
+}
+
+fn build_clients(providers: &[ProviderConfig]) -> Clients {
+    let map = providers
+        .iter()
+        .map(|p| (p.name.clone(), Arc::new(build_client(p))))
+        .collect();
+    Arc::new(std::sync::RwLock::new(map))
+}
+
 #[derive(Clone)]
 pub struct ProxyState {
     /// Live config — swapped atomically on hot reload. Read the Arc cheaply
     /// at the start of each handler; never hold the lock across an await.
     config: Arc<std::sync::RwLock<Arc<Config>>>,
-    pub client: Arc<Client>,
+    pub clients: Clients,
     pub monitor: HealthMonitor,
     pub metrics: Metrics,
     pub reporter: Arc<dyn Reporter>,
@@ -40,20 +64,13 @@ impl ProxyState {
 
     /// Build with a custom reporter (e.g. `RemoteReporter` for telemetry).
     pub fn new_with_reporter(config: Config, reporter: Arc<dyn Reporter>) -> Self {
-        let client = Arc::new(
-            Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .tcp_keepalive(std::time::Duration::from_secs(60))
-                .pool_max_idle_per_host(32)
-                .build()
-                .expect("failed to build HTTP client"),
-        );
+        let clients = build_clients(&config.providers);
         let metrics = Metrics::new();
         let monitor = HealthMonitor::new(&config.providers, config.health.clone(), metrics.clone());
-        monitor.start(client.clone(), config.providers.clone());
+        monitor.start(clients.clone(), config.providers.clone());
         Self {
             config: Arc::new(std::sync::RwLock::new(Arc::new(config))),
-            client,
+            clients,
             monitor,
             metrics,
             reporter,
@@ -63,6 +80,16 @@ impl ProxyState {
     /// Clone of the Arc wrapping the live config. Pass to the hot-reload watcher.
     pub fn config_handle(&self) -> Arc<std::sync::RwLock<Arc<Config>>> {
         self.config.clone()
+    }
+
+    /// Clone of the clients map. Pass to the hot-reload watcher so it can
+    /// insert/remove per-provider clients on config changes.
+    pub fn clients_handle(&self) -> Clients {
+        self.clients.clone()
+    }
+
+    fn client_for(&self, name: &str) -> Option<Arc<Client>> {
+        self.clients.read().unwrap().get(name).cloned()
     }
 
     /// Cheaply snapshot the current config (clones an Arc, not the Config).
@@ -206,8 +233,11 @@ async fn sequential(
             continue;
         };
 
+        let Some(client) = state.client_for(name) else {
+            continue;
+        };
         let t0 = Instant::now();
-        let result = forward(&state.client, provider, headers, body).await;
+        let result = forward(&client, provider, headers, body).await;
         let latency_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         match result {
@@ -321,7 +351,9 @@ async fn broadcast(
         let Some(provider) = config.providers.iter().find(|p| p.name == *name) else {
             continue;
         };
-        let client = state.client.clone();
+        let Some(client) = state.client_for(name) else {
+            continue;
+        };
         let provider = provider.clone();
         let headers = headers.clone();
         let body = body.clone();
@@ -412,6 +444,10 @@ async fn forward(
         .post(&provider.url)
         .header("content-type", "application/json")
         .header("accept", "application/json");
+
+    if provider.http3 {
+        builder = builder.version(reqwest::Version::HTTP_3);
+    }
 
     for name in &["x-request-id", "x-trace-id", "traceparent", "tracestate"] {
         if let Some(value) = incoming_headers.get(*name) {

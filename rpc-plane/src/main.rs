@@ -102,8 +102,8 @@ async fn run(config_path: PathBuf) -> Result<()> {
     // Hot-reload watcher
     let config_handle = state.config_handle();
     let monitor = state.monitor.clone();
-    let client = state.client.clone();
-    tokio::spawn(watch_config(config_path, config_handle, monitor, client));
+    let clients = state.clients_handle();
+    tokio::spawn(watch_config(config_path, config_handle, monitor, clients));
 
     // ProviderHealth telemetry emitter — emits a snapshot for every provider every 10s.
     let health_reporter = reporter.clone();
@@ -283,7 +283,7 @@ async fn watch_config(
     path: PathBuf,
     config: Arc<std::sync::RwLock<Arc<rpc_plane_core::config::Config>>>,
     monitor: rpc_plane_core::health::HealthMonitor,
-    client: Arc<reqwest::Client>,
+    clients: rpc_plane_core::proxy::Clients,
 ) {
     let mut last_mtime = mtime(&path);
     let mut ticker = tokio::time::interval(Duration::from_secs(2));
@@ -327,6 +327,7 @@ async fn watch_config(
         // Removed providers.
         for name in old_providers.keys() {
             if !new_providers.contains_key(name) {
+                clients.write().unwrap().remove(name);
                 monitor.remove_provider(name);
                 info!(provider = %name, "hot reload: provider removed");
             }
@@ -339,12 +340,17 @@ async fn watch_config(
                     // Unchanged — keep existing health state.
                 }
                 Some(_) => {
+                    clients.write().unwrap().remove(name);
                     monitor.remove_provider(name);
-                    monitor.add_provider(client.clone(), new_p.clone());
+                    let client = Arc::new(rpc_plane_core::proxy::build_client(new_p));
+                    clients.write().unwrap().insert(name.clone(), client.clone());
+                    monitor.add_provider(client, new_p.clone());
                     info!(provider = %name, "hot reload: provider URL updated");
                 }
                 None => {
-                    monitor.add_provider(client.clone(), new_p.clone());
+                    let client = Arc::new(rpc_plane_core::proxy::build_client(new_p));
+                    clients.write().unwrap().insert(name.clone(), client.clone());
+                    monitor.add_provider(client, new_p.clone());
                     info!(provider = %name, "hot reload: provider added");
                 }
             }
