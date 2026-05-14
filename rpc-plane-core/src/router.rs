@@ -58,6 +58,7 @@ pub fn route(
     snapshots: &[HealthSnapshot],
     strategy: &RoutingStrategy,
     config_weights: &[(String, u32)],
+    broadcast_writes: bool,
 ) -> RouteDecision {
     let class = classify(method);
 
@@ -68,11 +69,11 @@ pub fn route(
         // All circuits open: try every provider anyway — degraded but not dead.
         return RouteDecision {
             providers: snapshots.iter().map(|s| s.name.clone()).collect(),
-            broadcast: class == MethodClass::Write,
+            broadcast: broadcast_writes && class == MethodClass::Write,
         };
     }
 
-    if class == MethodClass::Write {
+    if class == MethodClass::Write && broadcast_writes {
         return RouteDecision {
             providers: available.iter().map(|s| s.name.clone()).collect(),
             broadcast: true,
@@ -211,6 +212,7 @@ mod tests {
             &snaps,
             &RoutingStrategy::BestScore,
             &weights(&["a", "b", "c"]),
+            false,
         );
         assert_eq!(d.providers[0], "a");
         assert_eq!(d.providers[1], "b");
@@ -218,13 +220,28 @@ mod tests {
     }
 
     #[test]
-    fn write_method_broadcasts() {
+    fn write_routes_sequentially_by_default() {
         let snaps = vec![snap("a", 0.9), snap("b", 0.7)];
         let d = route(
             "sendTransaction",
             &snaps,
             &RoutingStrategy::BestScore,
             &weights(&["a", "b"]),
+            false,
+        );
+        assert!(!d.broadcast);
+        assert_eq!(d.providers[0], "a");
+    }
+
+    #[test]
+    fn write_broadcasts_when_enabled() {
+        let snaps = vec![snap("a", 0.9), snap("b", 0.7)];
+        let d = route(
+            "sendTransaction",
+            &snaps,
+            &RoutingStrategy::BestScore,
+            &weights(&["a", "b"]),
+            true,
         );
         assert!(d.broadcast);
         assert_eq!(d.providers.len(), 2);
@@ -238,6 +255,7 @@ mod tests {
             &snaps,
             &RoutingStrategy::BestScore,
             &weights(&["a", "b", "c"]),
+            false,
         );
         assert!(!d.providers.contains(&"b".to_string()));
     }
@@ -250,6 +268,7 @@ mod tests {
             &snaps,
             &RoutingStrategy::BestScore,
             &weights(&["a", "b", "c"]),
+            true,
         );
         assert!(!d.providers.contains(&"b".to_string()));
         assert_eq!(d.providers.len(), 2);
@@ -263,6 +282,7 @@ mod tests {
             &snaps,
             &RoutingStrategy::BestScore,
             &weights(&["a", "b"]),
+            false,
         );
         assert_eq!(d.providers.len(), 2);
     }
@@ -275,7 +295,13 @@ mod tests {
             ("a".to_string(), 1),
             ("b".to_string(), 1),
         ];
-        let d = route("getSlot", &snaps, &RoutingStrategy::FailoverOrdered, &cw);
+        let d = route(
+            "getSlot",
+            &snaps,
+            &RoutingStrategy::FailoverOrdered,
+            &cw,
+            false,
+        );
         assert_eq!(d.providers, vec!["c", "a", "b"]);
     }
 
@@ -337,6 +363,7 @@ mod tests {
             &snaps,
             &RoutingStrategy::ParallelRace,
             &weights(&["a", "b"]),
+            false,
         );
         assert!(d.broadcast);
         assert_eq!(d.providers, vec!["a", "b"]);
@@ -350,6 +377,7 @@ mod tests {
             &snaps,
             &RoutingStrategy::BestScore,
             &weights(&["a", "b"]),
+            false,
         );
         assert_eq!(d.providers, vec!["b"]);
         assert!(!d.broadcast);

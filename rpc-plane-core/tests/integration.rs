@@ -228,12 +228,13 @@ async fn write_method_broadcasts_to_all_providers() {
     let (url_a, _abort_a) = start_mock(mock_a).await;
     let (url_b, _abort_b) = start_mock(mock_b).await;
 
-    let cfg = test_config(
+    let mut cfg = test_config(
         &[("a", &url_a), ("b", &url_b)],
         RoutingStrategy::BestScore,
         0,
         5,
     );
+    cfg.routing.broadcast_writes = true;
     let state = ProxyState::new(cfg);
     let router = build_router(state);
 
@@ -281,12 +282,13 @@ async fn broadcast_partial_failure_still_succeeds() {
     let mock_b = Router::new().route("/", post(|| async { slot_response(321) }));
     let (url_b, _abort) = start_mock(mock_b).await;
 
-    let cfg = test_config(
+    let mut cfg = test_config(
         &[("a", &url_a), ("b", &url_b)],
         RoutingStrategy::BestScore,
         0,
         5,
     );
+    cfg.routing.broadcast_writes = true;
     let state = ProxyState::new(cfg);
     let router = build_router(state);
 

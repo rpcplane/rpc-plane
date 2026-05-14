@@ -1,7 +1,7 @@
-# Standard three-provider setup
+# Standard three-provider setup — Helius, QuickNode, and Triton One
 #
-# Routes reads to the healthiest provider, broadcasts writes to all three.
-# This is the recommended starting config for most production workloads.
+# Routes reads to the healthiest provider. Enable broadcast_writes to fan
+# out sendTransaction to all three simultaneously.
 #
 # Usage:
 #   export HELIUS_API_KEY=...
@@ -16,6 +16,7 @@ metrics_listen = "127.0.0.1:9401"
 [routing]
 strategy    = "best_score"   # healthiest provider gets reads
 max_retries = 2
+# broadcast_writes = true    # fan out sendTransaction to all providers
 
 [[providers]]
 name   = "helius"

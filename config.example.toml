@@ -22,10 +22,11 @@ w_success = 0.1
 # ── Routing ────────────────────────────────────────────────────────────────────
 [routing]
 # best_score | weighted_random | failover_ordered | parallel_race
-strategy    = "best_score"
-max_retries = 2               # retry on next-best provider on transient errors
-cost_aware  = false
-cost_weight = 0.2             # w_cost when cost_aware = true
+strategy         = "best_score"
+max_retries      = 2               # retry on next-best provider on transient errors
+cost_aware       = false
+cost_weight      = 0.2             # w_cost when cost_aware = true
+# broadcast_writes = false         # fan out sendTransaction to all providers
 
 # ── Providers ──────────────────────────────────────────────────────────────────
 [[providers]]

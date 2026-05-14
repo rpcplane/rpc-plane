@@ -174,6 +174,7 @@ async fn handle_rpc(State(state): State<ProxyState>, headers: HeaderMap, body: B
         &snapshots,
         &config.routing.strategy,
         &config_weights,
+        config.routing.broadcast_writes,
     );
 
     if decision.broadcast {

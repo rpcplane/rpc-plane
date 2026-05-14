@@ -188,6 +188,10 @@ pub struct RoutingConfig {
     pub cost_aware: bool,
     #[serde(default = "default_cost_weight")]
     pub cost_weight: f64,
+    /// Broadcast sendTransaction / simulateTransaction to all healthy providers
+    /// simultaneously. Off by default — writes are routed like reads.
+    #[serde(default)]
+    pub broadcast_writes: bool,
 }
 
 impl Default for RoutingConfig {
@@ -197,6 +201,7 @@ impl Default for RoutingConfig {
             max_retries: default_max_retries(),
             cost_aware: false,
             cost_weight: default_cost_weight(),
+            broadcast_writes: false,
         }
     }
 }

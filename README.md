@@ -24,7 +24,7 @@ Your app replaces its provider URL with `http://localhost:9400`. No other change
 ## What it does
 
 - **Routes reads** to the healthiest provider based on latency, error rate, and slot freshness
-- **Broadcasts writes** (`sendTransaction`) to all healthy providers simultaneously — maximizes landing probability
+- **Optional write broadcasting**: set `routing.broadcast_writes = true` to fan out `sendTransaction` to all healthy providers — maximizes landing probability
 - **Circuit breaker** per provider: opens on failure, probes for recovery, resumes traffic automatically
 - **Slot tracker**: tracks slot height across providers, deprioritizes drifting nodes
 - **Auto-retry** on transient errors (429, 503, timeout) — tries the next-best provider
@@ -120,11 +120,11 @@ curl http://localhost:9400/health | jq
 **Provider status:**
 ```bash
 rpc-plane status
-#   NAME        SCORE          SLOT   DRIFT     LATENCY  CIRCUIT
-#   --------  -------  ------------  ------  ----------  -------
-#   helius      0.912   341892471       0      23.4ms     closed
-#   quicknode   0.841   341892469       2      31.1ms     closed
-#   triton      0.000           —       —           —     open
+#   NAME          SCORE          SLOT   DRIFT     LATENCY  CIRCUIT
+#   ----------  -------  ------------  ------  ----------  -------
+#   provider-a    0.912   341892471       0      23.4ms     closed
+#   provider-b    0.841   341892469       2      31.1ms     closed
+#   provider-c    0.724   341892468       3      38.7ms     closed
 ```
 
 **Prometheus:**
@@ -138,7 +138,7 @@ Key metrics: `rpc_plane_requests_total`, `rpc_plane_request_duration_seconds`, `
 
 See the [`examples/`](examples/) directory:
 
-- [`helius-quicknode-triton.toml`](examples/helius-quicknode-triton.toml) — standard three-provider setup
+- [`helius-quicknode-triton.toml`](examples/helius-quicknode-triton.toml) — standard three-provider setup (Helius, QuickNode, Triton One)
 - [`single-provider.toml`](examples/single-provider.toml) — single provider with health monitoring
 - [`trading-bot.toml`](examples/trading-bot.toml) — write-path optimized for transaction landing
 
