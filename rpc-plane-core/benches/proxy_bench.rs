@@ -35,8 +35,7 @@ fn prov(name: &str) -> ProviderConfig {
 // ── Benchmarks ────────────────────────────────────────────────────────────────
 
 fn bench_extract_method(c: &mut Criterion) {
-    let single =
-        br#"{"jsonrpc":"2.0","id":1,"method":"getSlot","params":[]}"#;
+    let single = br#"{"jsonrpc":"2.0","id":1,"method":"getSlot","params":[]}"#;
     let batch = br#"[{"jsonrpc":"2.0","id":1,"method":"getSlot"},{"jsonrpc":"2.0","id":2,"method":"getBalance","params":["9bT...", {"commitment":"confirmed"}]}]"#;
 
     let mut g = c.benchmark_group("extract_method");
@@ -46,7 +45,11 @@ fn bench_extract_method(c: &mut Criterion) {
 }
 
 fn bench_route(c: &mut Criterion) {
-    let snapshots = vec![snap("helius", 0.9), snap("quicknode", 0.7), snap("alchemy", 0.5)];
+    let snapshots = vec![
+        snap("helius", 0.9),
+        snap("quicknode", 0.7),
+        snap("alchemy", 0.5),
+    ];
     let providers = vec![prov("helius"), prov("quicknode"), prov("alchemy")];
 
     let mut g = c.benchmark_group("route");
@@ -87,10 +90,8 @@ fn bench_route(c: &mut Criterion) {
 }
 
 fn bench_extract_rpc_error_code(c: &mut Criterion) {
-    let ok =
-        br#"{"jsonrpc":"2.0","result":{"context":{"slot":100},"value":1000},"id":1}"#;
-    let err =
-        br#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"Internal error"},"id":1}"#;
+    let ok = br#"{"jsonrpc":"2.0","result":{"context":{"slot":100},"value":1000},"id":1}"#;
+    let err = br#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"Internal error"},"id":1}"#;
 
     let mut g = c.benchmark_group("extract_rpc_error_code");
     g.bench_function("success_response", |b| {
@@ -102,5 +103,10 @@ fn bench_extract_rpc_error_code(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, bench_extract_method, bench_route, bench_extract_rpc_error_code);
+criterion_group!(
+    benches,
+    bench_extract_method,
+    bench_route,
+    bench_extract_rpc_error_code
+);
 criterion_main!(benches);

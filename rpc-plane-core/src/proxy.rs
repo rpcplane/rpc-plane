@@ -38,7 +38,12 @@ pub fn build_client(provider: &ProviderConfig, pool_max_idle_per_host: usize) ->
 fn build_clients(providers: &[ProviderConfig], pool_max_idle_per_host: usize) -> Clients {
     let map = providers
         .iter()
-        .map(|p| (p.name.clone(), Arc::new(build_client(p, pool_max_idle_per_host))))
+        .map(|p| {
+            (
+                p.name.clone(),
+                Arc::new(build_client(p, pool_max_idle_per_host)),
+            )
+        })
         .collect();
     Arc::new(parking_lot::RwLock::new(map))
 }

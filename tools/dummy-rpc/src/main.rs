@@ -109,7 +109,9 @@ async fn main() {
         .expect("invalid address");
     let socket = tokio::net::TcpSocket::new_v4().expect("TcpSocket::new_v4");
     socket.set_reuseaddr(true).expect("SO_REUSEADDR");
-    socket.bind(addr).unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
+    socket
+        .bind(addr)
+        .unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
     let listener = socket
         .listen(cli.backlog)
         .unwrap_or_else(|e| panic!("failed to listen on {addr}: {e}"));
