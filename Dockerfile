@@ -5,16 +5,18 @@ WORKDIR /build
 
 # Cache dependency compilation separately from source changes.
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
-COPY .cargo/config.toml          .cargo/config.toml
-COPY rpc-plane/Cargo.toml        rpc-plane/Cargo.toml
-COPY rpc-plane-core/Cargo.toml   rpc-plane-core/Cargo.toml
+COPY .cargo/config.toml            .cargo/config.toml
+COPY rpc-plane/Cargo.toml          rpc-plane/Cargo.toml
+COPY rpc-plane-core/Cargo.toml     rpc-plane-core/Cargo.toml
+COPY tools/dummy-rpc/Cargo.toml    tools/dummy-rpc/Cargo.toml
 
 # Stub sources so cargo can compile dependencies without the real code.
-RUN mkdir -p rpc-plane/src rpc-plane-core/src \
+RUN mkdir -p rpc-plane/src rpc-plane-core/src tools/dummy-rpc/src \
  && echo 'fn main() {}' > rpc-plane/src/main.rs \
  && touch rpc-plane-core/src/lib.rs \
+ && echo 'fn main() {}' > tools/dummy-rpc/src/main.rs \
  && cargo build --release -p rpc-plane \
- && rm -rf rpc-plane/src rpc-plane-core/src
+ && rm -rf rpc-plane/src rpc-plane-core/src tools/dummy-rpc/src
 
 # Build the real binary.
 COPY rpc-plane/src       rpc-plane/src
