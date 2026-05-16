@@ -99,6 +99,20 @@ impl Metrics {
         )
         .unwrap();
 
+        let build_info = GaugeVec::new(
+            Opts::new("rpc_plane_build_info", "Build information"),
+            &["version", "commit", "branch", "rustc"],
+        )
+        .unwrap();
+        build_info
+            .with_label_values(&[
+                env!("CARGO_PKG_VERSION"),
+                option_env!("GIT_COMMIT_HASH").unwrap_or("unknown"),
+                option_env!("GIT_BRANCH").unwrap_or("unknown"),
+                option_env!("RUSTC_VERSION").unwrap_or("unknown"),
+            ])
+            .set(1.0);
+
         for collector in [
             Box::new(requests.clone()) as Box<dyn prometheus::core::Collector>,
             Box::new(duration.clone()),
@@ -108,9 +122,17 @@ impl Metrics {
             Box::new(slot_height.clone()),
             Box::new(slot_drift.clone()),
             Box::new(circuit_state.clone()),
+            Box::new(build_info.clone()),
         ] {
             registry.register(collector).unwrap();
         }
+
+        #[cfg(target_os = "linux")]
+        registry
+            .register(Box::new(
+                prometheus::process_collector::ProcessCollector::for_self(),
+            ))
+            .unwrap();
 
         Self(Arc::new(Inner {
             registry,
@@ -250,5 +272,13 @@ mod tests {
         let text = m.render();
         assert!(text.contains("rpc_plane_provider_health_score{provider=\"helius\"} 0.95"));
         assert!(text.contains("rpc_plane_circuit_breaker_state{provider=\"helius\"} 0"));
+    }
+
+    #[test]
+    fn build_info_emitted() {
+        let text = Metrics::new().render();
+        assert!(text.contains("rpc_plane_build_info{"));
+        assert!(text.contains(&format!("version=\"{}\"", env!("CARGO_PKG_VERSION"))));
+        assert!(text.contains("} 1"));
     }
 }
