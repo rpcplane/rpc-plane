@@ -1,0 +1,18 @@
+[package]
+name = "load-test"
+description = "HTTP load tester that supports both TCP and Unix domain sockets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "load-test"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+hyper = { version = "1", features = ["http1", "client"] }
+hyper-util.workspace = true
+http-body-util = "0.1"
+clap.workspace = true
+anyhow.workspace = true

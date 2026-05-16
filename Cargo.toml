@@ -3,6 +3,7 @@ members = [
     "rpc-plane",
     "rpc-plane-core",
     "tools/dummy-rpc",
+    "tools/load-test",
 ]
 resolver = "2"
 
@@ -35,3 +36,7 @@ sha2 = "0.10"
 hex = "0.4"
 tower-http = { version = "0.6", features = ["fs", "catch-panic"] }
 libc = "0.2"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "server-graceful"] }
+tower = "0.5"
+http-body-util = "0.1"

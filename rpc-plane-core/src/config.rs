@@ -70,6 +70,10 @@ pub struct ServerConfig {
     /// Set to at least your expected peak concurrency to avoid cold TCP handshakes.
     #[serde(default = "default_pool_max_idle_per_host")]
     pub pool_max_idle_per_host: usize,
+    /// Number of Tokio worker threads. Defaults to the number of logical CPUs.
+    /// Set this to dedicate a fixed core count when sharing a host with other services.
+    #[serde(default)]
+    pub worker_threads: Option<usize>,
 }
 
 impl Default for ServerConfig {
@@ -79,6 +83,7 @@ impl Default for ServerConfig {
             metrics_listen: default_metrics_listen(),
             listen_backlog: default_listen_backlog(),
             pool_max_idle_per_host: default_pool_max_idle_per_host(),
+            worker_threads: None,
         }
     }
 }

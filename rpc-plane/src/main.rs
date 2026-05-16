@@ -7,6 +7,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tracing::{info, warn};
 
+fn is_unix_path(s: &str) -> bool {
+    s.starts_with('/') || s.starts_with("./")
+}
+
 #[derive(Parser)]
 #[command(
     name = "rpc-plane",
@@ -39,8 +43,7 @@ enum Command {
     Init,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
 
     tracing_subscriber::fmt()
@@ -50,12 +53,39 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    match cli.command.unwrap_or(Command::Run) {
-        Command::Run => run(cli.config).await,
-        Command::Check => check(cli.config).await,
-        Command::Status => status(cli.config).await,
-        Command::Init => init(cli.config).await,
+    let worker_threads = match cli.command {
+        Some(Command::Run) | None => peek_worker_threads(&cli.config),
+        _ => None,
+    };
+
+    let mut rt = tokio::runtime::Builder::new_multi_thread();
+    if let Some(n) = worker_threads {
+        rt.worker_threads(n);
     }
+    let rt = rt.enable_all().build()?;
+
+    rt.block_on(async move {
+        match cli.command.unwrap_or(Command::Run) {
+            Command::Run => run(cli.config).await,
+            Command::Check => check(cli.config).await,
+            Command::Status => status(cli.config).await,
+            Command::Init => init(cli.config).await,
+        }
+    })
+}
+
+fn peek_worker_threads(path: &Path) -> Option<usize> {
+    #[derive(serde::Deserialize, Default)]
+    struct Peek {
+        #[serde(default)]
+        server: PeekServer,
+    }
+    #[derive(serde::Deserialize, Default)]
+    struct PeekServer {
+        worker_threads: Option<usize>,
+    }
+    let raw = std::fs::read_to_string(path).ok()?;
+    toml::from_str::<Peek>(&raw).ok()?.server.worker_threads
 }
 
 async fn run(config_path: PathBuf) -> Result<()> {
@@ -95,20 +125,12 @@ async fn run(config_path: PathBuf) -> Result<()> {
     let proxy_router = rpc_plane_core::proxy::build_router(state.clone());
     let metrics_router = rpc_plane_core::proxy::build_metrics_router(state.clone());
 
-    let listener = tcp_listen(&listen, listen_backlog).await?;
-    let metrics_listener = tcp_listen(&metrics_listen, listen_backlog).await?;
-
-    info!("proxy listening on http://{listen}");
-    info!("replace your provider URL with http://{listen} in your Solana app");
-    info!("metrics listening on http://{metrics_listen}/metrics");
-
-    // Hot-reload watcher
+    // Background tasks common to both TCP and UDS paths.
     let config_handle = state.config_handle();
     let monitor = state.monitor.clone();
     let clients = state.clients_handle();
     tokio::spawn(watch_config(config_path, config_handle, monitor, clients));
 
-    // ProviderHealth telemetry emitter — emits a snapshot for every provider every 10s.
     let health_reporter = reporter.clone();
     let health_monitor = state.monitor.clone();
     tokio::spawn(async move {
@@ -129,20 +151,39 @@ async fn run(config_path: PathBuf) -> Result<()> {
         }
     });
 
+    let metrics_listener = tcp_listen(&metrics_listen, listen_backlog).await?;
     tokio::spawn(async move {
         if let Err(e) = axum::serve(metrics_listener, metrics_router).await {
             tracing::error!("metrics server error: {e}");
         }
     });
 
-    axum::serve(listener, proxy_router)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // Serve on unix socket or TCP depending on the listen address.
+    if is_unix_path(&listen) {
+        #[cfg(not(unix))]
+        anyhow::bail!("unix socket paths are only supported on unix");
+
+        #[cfg(unix)]
+        {
+            info!("proxy listening on unix:{listen}");
+            info!("configure your Solana app to connect via unix socket at {listen}");
+            info!("metrics listening on http://{metrics_listen}/metrics");
+            let listener = unix_listen(&listen)?;
+            serve_unix(listener, proxy_router).await?;
+        }
+    } else {
+        let listener = tcp_listen(&listen, listen_backlog).await?;
+        info!("proxy listening on http://{listen}");
+        info!("replace your provider URL with http://{listen} in your Solana app");
+        info!("metrics listening on http://{metrics_listen}/metrics");
+        axum::serve(listener, proxy_router)
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
+    }
 
     // Flush any buffered telemetry before exiting.
     reporter.flush();
     tokio::time::sleep(Duration::from_millis(500)).await;
-
     info!("shutdown complete");
     Ok(())
 }
@@ -192,7 +233,15 @@ async fn check(config_path: PathBuf) -> Result<()> {
 
 async fn status(config_path: PathBuf) -> Result<()> {
     let config = rpc_plane_core::config::Config::load(&config_path)?;
-    let url = format!("http://{}/health", config.server.listen);
+    let listen = &config.server.listen;
+
+    if is_unix_path(listen) {
+        println!("Proxy is listening on a unix socket. To check health:");
+        println!("  curl --unix-socket {listen} http://localhost/health | jq");
+        return Ok(());
+    }
+
+    let url = format!("http://{listen}/health");
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -389,8 +438,61 @@ async fn tcp_listen(addr: &str, backlog: u32) -> Result<tokio::net::TcpListener>
     let addr: std::net::SocketAddr = addr.parse()?;
     let socket = tokio::net::TcpSocket::new_v4()?;
     socket.set_reuseaddr(true)?;
+    #[cfg(unix)]
+    socket.set_reuseport(true)?;
     socket.bind(addr)?;
     Ok(socket.listen(backlog)?)
+}
+
+#[cfg(unix)]
+fn unix_listen(path: &str) -> Result<tokio::net::UnixListener> {
+    // Remove a stale socket file so re-binding works without a restart.
+    let _ = std::fs::remove_file(path);
+    Ok(tokio::net::UnixListener::bind(path)?)
+}
+
+// axum 0.7's serve() only accepts TcpListener, so UDS connections are served
+// through hyper directly. GracefulShutdown coordinates in-flight draining.
+#[cfg(unix)]
+async fn serve_unix(
+    listener: tokio::net::UnixListener,
+    router: axum::Router,
+) -> std::io::Result<()> {
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder;
+    use hyper_util::server::graceful::GracefulShutdown;
+    use tower::Service as _;
+
+    let builder = Builder::new(TokioExecutor::new());
+    let graceful = GracefulShutdown::new();
+    let mut sig = std::pin::pin!(shutdown_signal());
+
+    loop {
+        tokio::select! {
+            res = listener.accept() => {
+                let (stream, _addr) = match res {
+                    Ok(v) => v,
+                    Err(e) => { tracing::error!("unix socket accept error: {e}"); continue; }
+                };
+                let io = TokioIo::new(stream);
+                let app = router.clone();
+                let conn = builder.serve_connection_with_upgrades(
+                    io,
+                    hyper::service::service_fn(move |req| app.clone().call(req)),
+                );
+                let conn = graceful.watch(conn.into_owned());
+                tokio::spawn(async move {
+                    if let Err(e) = conn.await {
+                        tracing::debug!("unix socket connection error: {e}");
+                    }
+                });
+            }
+            _ = &mut sig => break,
+        }
+    }
+
+    graceful.shutdown().await;
+    Ok(())
 }
 
 // ── System limits ─────────────────────────────────────────────────────────────

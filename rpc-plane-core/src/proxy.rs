@@ -28,7 +28,8 @@ pub fn build_client(provider: &ProviderConfig, pool_max_idle_per_host: usize) ->
     let mut builder = Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .tcp_keepalive(std::time::Duration::from_secs(60))
-        .pool_max_idle_per_host(pool_max_idle_per_host);
+        .pool_max_idle_per_host(pool_max_idle_per_host)
+        .pool_idle_timeout(std::time::Duration::from_secs(90));
     if provider.http3 {
         builder = builder.http3_prior_knowledge().http3_send_grease(false);
     }
