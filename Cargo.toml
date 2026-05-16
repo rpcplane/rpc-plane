@@ -2,6 +2,7 @@
 members = [
     "rpc-plane",
     "rpc-plane-core",
+    "tools/dummy-rpc",
 ]
 resolver = "2"
 
@@ -26,9 +27,10 @@ anyhow = "1"
 thiserror = "1"
 uuid = { version = "1", features = ["v4"] }
 prometheus = { version = "0.13", default-features = false, features = ["process"] }
+parking_lot = "0.12"
 rand = "0.8"
 shellexpand = "3"
 tempfile = "3"
 sha2 = "0.10"
 hex = "0.4"
-tower-http = { version = "0.6", features = ["fs"] }
+tower-http = { version = "0.6", features = ["fs", "catch-panic"] }

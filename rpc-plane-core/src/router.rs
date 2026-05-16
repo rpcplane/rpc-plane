@@ -1,6 +1,7 @@
-use crate::config::RoutingStrategy;
+use crate::config::{ProviderConfig, RoutingStrategy};
 use crate::health::HealthSnapshot;
 use rand::Rng;
+use std::sync::Arc;
 
 // ── Method classification ─────────────────────────────────────────────────────
 
@@ -45,19 +46,20 @@ pub fn extract_rpc_error_code(body: &[u8]) -> Option<i64> {
 pub struct RouteDecision {
     /// Provider names to try, in priority order.
     /// For broadcasts all are contacted concurrently.
-    pub providers: Vec<String>,
+    pub providers: Vec<Arc<str>>,
     pub broadcast: bool,
 }
 
 /// Select providers given current health snapshots.
 ///
-/// `config_weights`: `(name, weight)` pairs in config order — used for
-/// `WeightedRandom` and as the stable tiebreak for `FailoverOrdered`.
+/// `providers`: config entries in config order — `weight` drives
+/// `WeightedRandom` and the order is the stable tiebreak for `FailoverOrdered`.
+/// Borrowed directly from the live config so nothing is allocated per request.
 pub fn route(
     method: &str,
     snapshots: &[HealthSnapshot],
     strategy: &RoutingStrategy,
-    config_weights: &[(String, u32)],
+    providers: &[ProviderConfig],
     broadcast_writes: bool,
 ) -> RouteDecision {
     let class = classify(method);
@@ -98,10 +100,10 @@ pub fn route(
             let weights: Vec<f64> = available
                 .iter()
                 .map(|s| {
-                    let w = config_weights
+                    let w = providers
                         .iter()
-                        .find(|(n, _)| n == &s.name)
-                        .map_or(1, |(_, w)| *w) as f64;
+                        .find(|p| p.name.as_str() == s.name.as_ref())
+                        .map_or(1, |p| p.weight) as f64;
                     (w * s.score).max(1e-9) // keep non-zero so circuit-open is never picked
                 })
                 .collect();
@@ -125,24 +127,29 @@ pub fn route(
                     .partial_cmp(&a.score)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
-            let mut providers = vec![primary_snap.name.clone()];
-            providers.extend(available.iter().map(|s| s.name.clone()));
+            let mut result = vec![primary_snap.name.clone()];
+            result.extend(available.iter().map(|s| s.name.clone()));
 
             RouteDecision {
-                providers,
+                providers: result,
                 broadcast: false,
             }
         }
 
         RoutingStrategy::FailoverOrdered => {
             // Preserve config order, skipping circuit-open.
-            let mut ordered: Vec<&HealthSnapshot> = config_weights
+            let mut ordered: Vec<&HealthSnapshot> = providers
                 .iter()
-                .filter_map(|(name, _)| available.iter().find(|s| s.name == *name).copied())
+                .filter_map(|p| {
+                    available
+                        .iter()
+                        .find(|s| s.name.as_ref() == p.name.as_str())
+                        .copied()
+                })
                 .collect();
-            // Append any providers not in config_weights at the end.
+            // Append any providers not in the config list at the end.
             for s in &available {
-                if !config_weights.iter().any(|(n, _)| n == &s.name) {
+                if !providers.iter().any(|p| p.name.as_str() == s.name.as_ref()) {
                     ordered.push(s);
                 }
             }
@@ -172,11 +179,12 @@ pub fn route(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ProviderConfig;
     use crate::health::CircuitState;
 
     fn snap(name: &str, score: f64) -> HealthSnapshot {
         HealthSnapshot {
-            name: name.to_string(),
+            name: name.into(),
             score,
             slot_height: Some(100),
             slot_drift: 0,
@@ -189,7 +197,7 @@ mod tests {
 
     fn snap_open(name: &str) -> HealthSnapshot {
         HealthSnapshot {
-            name: name.to_string(),
+            name: name.into(),
             score: 0.0,
             slot_height: None,
             slot_drift: 0,
@@ -200,8 +208,21 @@ mod tests {
         }
     }
 
-    fn weights(names: &[&str]) -> Vec<(String, u32)> {
-        names.iter().map(|n| (n.to_string(), 1u32)).collect()
+    fn providers(names: &[&str]) -> Vec<ProviderConfig> {
+        names
+            .iter()
+            .map(|n| ProviderConfig {
+                name: n.to_string(),
+                url: "http://x".to_string(),
+                weight: 1,
+                pricing: None,
+                http3: false,
+            })
+            .collect()
+    }
+
+    fn names(d: &RouteDecision) -> Vec<&str> {
+        d.providers.iter().map(|p| p.as_ref()).collect()
     }
 
     #[test]
@@ -211,11 +232,11 @@ mod tests {
             "getSlot",
             &snaps,
             &RoutingStrategy::BestScore,
-            &weights(&["a", "b", "c"]),
+            &providers(&["a", "b", "c"]),
             false,
         );
-        assert_eq!(d.providers[0], "a");
-        assert_eq!(d.providers[1], "b");
+        assert_eq!(&*d.providers[0], "a");
+        assert_eq!(&*d.providers[1], "b");
         assert!(!d.broadcast);
     }
 
@@ -226,11 +247,11 @@ mod tests {
             "sendTransaction",
             &snaps,
             &RoutingStrategy::BestScore,
-            &weights(&["a", "b"]),
+            &providers(&["a", "b"]),
             false,
         );
         assert!(!d.broadcast);
-        assert_eq!(d.providers[0], "a");
+        assert_eq!(&*d.providers[0], "a");
     }
 
     #[test]
@@ -240,7 +261,7 @@ mod tests {
             "sendTransaction",
             &snaps,
             &RoutingStrategy::BestScore,
-            &weights(&["a", "b"]),
+            &providers(&["a", "b"]),
             true,
         );
         assert!(d.broadcast);
@@ -254,10 +275,10 @@ mod tests {
             "getSlot",
             &snaps,
             &RoutingStrategy::BestScore,
-            &weights(&["a", "b", "c"]),
+            &providers(&["a", "b", "c"]),
             false,
         );
-        assert!(!d.providers.contains(&"b".to_string()));
+        assert!(!d.providers.iter().any(|p| p.as_ref() == "b"));
     }
 
     #[test]
@@ -267,10 +288,10 @@ mod tests {
             "sendTransaction",
             &snaps,
             &RoutingStrategy::BestScore,
-            &weights(&["a", "b", "c"]),
+            &providers(&["a", "b", "c"]),
             true,
         );
-        assert!(!d.providers.contains(&"b".to_string()));
+        assert!(!d.providers.iter().any(|p| p.as_ref() == "b"));
         assert_eq!(d.providers.len(), 2);
     }
 
@@ -281,7 +302,7 @@ mod tests {
             "getSlot",
             &snaps,
             &RoutingStrategy::BestScore,
-            &weights(&["a", "b"]),
+            &providers(&["a", "b"]),
             false,
         );
         assert_eq!(d.providers.len(), 2);
@@ -290,19 +311,15 @@ mod tests {
     #[test]
     fn failover_ordered_respects_config_order() {
         let snaps = vec![snap("a", 0.3), snap("b", 0.9), snap("c", 0.6)];
-        let cw = vec![
-            ("c".to_string(), 1u32),
-            ("a".to_string(), 1),
-            ("b".to_string(), 1),
-        ];
+        let cfg = providers(&["c", "a", "b"]);
         let d = route(
             "getSlot",
             &snaps,
             &RoutingStrategy::FailoverOrdered,
-            &cw,
+            &cfg,
             false,
         );
-        assert_eq!(d.providers, vec!["c", "a", "b"]);
+        assert_eq!(names(&d), ["c", "a", "b"]);
     }
 
     #[test]
@@ -362,11 +379,11 @@ mod tests {
             "getSlot",
             &snaps,
             &RoutingStrategy::ParallelRace,
-            &weights(&["a", "b"]),
+            &providers(&["a", "b"]),
             false,
         );
         assert!(d.broadcast);
-        assert_eq!(d.providers, vec!["a", "b"]);
+        assert_eq!(names(&d), ["a", "b"]);
     }
 
     #[test]
@@ -376,10 +393,10 @@ mod tests {
             "getSlot",
             &snaps,
             &RoutingStrategy::BestScore,
-            &weights(&["a", "b"]),
+            &providers(&["a", "b"]),
             false,
         );
-        assert_eq!(d.providers, vec!["b"]);
+        assert_eq!(names(&d), ["b"]);
         assert!(!d.broadcast);
     }
 

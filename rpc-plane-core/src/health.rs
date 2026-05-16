@@ -1,13 +1,13 @@
 use crate::config::{HealthConfig, ProviderConfig};
 use crate::metrics::Metrics;
 use crate::proxy::Clients;
+use parking_lot::RwLock;
 use reqwest::Client;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 // ── Circuit breaker state ────────────────────────────────────────────────────
@@ -23,7 +23,7 @@ pub enum CircuitState {
 
 #[derive(Debug, Clone)]
 pub struct HealthSnapshot {
-    pub name: String,
+    pub name: Arc<str>,
     /// Normalised health score 0.0–1.0. Open circuit = 0.0.
     pub score: f64,
     /// None until the first successful slot probe.
@@ -152,12 +152,12 @@ impl Inner {
 // ── ProviderHealth ────────────────────────────────────────────────────────────
 
 pub struct ProviderHealth {
-    pub name: String,
+    pub name: Arc<str>,
     inner: RwLock<Inner>,
 }
 
 impl ProviderHealth {
-    pub fn new(name: impl Into<String>) -> Arc<Self> {
+    pub fn new(name: impl Into<Arc<str>>) -> Arc<Self> {
         Arc::new(Self {
             name: name.into(),
             inner: RwLock::new(Inner::new()),
@@ -165,8 +165,8 @@ impl ProviderHealth {
     }
 
     /// Read-only snapshot for routing decisions.
-    pub async fn snapshot(&self, slot_tip: u64, cfg: &HealthConfig) -> HealthSnapshot {
-        let g = self.inner.read().await;
+    pub fn snapshot(&self, slot_tip: u64, cfg: &HealthConfig) -> HealthSnapshot {
+        let g = self.inner.read();
         let (slot_drift, is_drifting) = match g.slot_height {
             Some(h) => {
                 let drift = slot_tip.saturating_sub(h);
@@ -187,14 +187,14 @@ impl ProviderHealth {
     }
 
     /// Record the outcome of any request (probe or real).
-    pub async fn record(&self, success: bool, latency_ms: f64, cfg: &HealthConfig) {
-        let mut g = self.inner.write().await;
+    pub fn record(&self, success: bool, latency_ms: f64, cfg: &HealthConfig) {
+        let mut g = self.inner.write();
         g.push_result(success, latency_ms, cfg.window_secs);
         apply_circuit_transitions(&mut g, &self.name, cfg);
     }
 
-    pub async fn update_slot(&self, slot: u64) {
-        self.inner.write().await.slot_height = Some(slot);
+    pub fn update_slot(&self, slot: u64) {
+        self.inner.write().slot_height = Some(slot);
     }
 }
 
@@ -246,7 +246,7 @@ struct ProviderEntry {
 /// Shared health state for all providers. Cheap to clone (all Arcs inside).
 #[derive(Clone)]
 pub struct HealthMonitor {
-    entries: Arc<std::sync::RwLock<HashMap<String, ProviderEntry>>>,
+    entries: Arc<RwLock<HashMap<String, ProviderEntry>>>,
     pub cfg: Arc<HealthConfig>,
     metrics: Metrics,
 }
@@ -259,14 +259,14 @@ impl HealthMonitor {
                 (
                     p.name.clone(),
                     ProviderEntry {
-                        health: ProviderHealth::new(&p.name),
+                        health: ProviderHealth::new(p.name.as_str()),
                         stop: Arc::new(AtomicBool::new(false)),
                     },
                 )
             })
             .collect();
         Self {
-            entries: Arc::new(std::sync::RwLock::new(entries)),
+            entries: Arc::new(RwLock::new(entries)),
             cfg: Arc::new(cfg),
             metrics,
         }
@@ -276,14 +276,14 @@ impl HealthMonitor {
     pub fn start(&self, clients: Clients, providers: Vec<ProviderConfig>) {
         for provider in providers {
             let client = {
-                let map = clients.read().unwrap();
+                let map = clients.read();
                 let Some(c) = map.get(&provider.name) else {
                     continue;
                 };
                 c.clone()
             };
             let (health, stop) = {
-                let map = self.entries.read().unwrap();
+                let map = self.entries.read();
                 let Some(e) = map.get(&provider.name) else {
                     continue;
                 };
@@ -303,7 +303,7 @@ impl HealthMonitor {
     /// Add a new provider and start its background loops.
     pub fn add_provider(&self, client: Arc<Client>, provider: ProviderConfig) {
         let stop = Arc::new(AtomicBool::new(false));
-        let health = ProviderHealth::new(&provider.name);
+        let health = ProviderHealth::new(provider.name.as_str());
         Self::spawn_loops(
             health.clone(),
             stop.clone(),
@@ -314,13 +314,12 @@ impl HealthMonitor {
         );
         self.entries
             .write()
-            .unwrap()
             .insert(provider.name.clone(), ProviderEntry { health, stop });
     }
 
     /// Signal the background loops for this provider to exit and remove it.
     pub fn remove_provider(&self, name: &str) {
-        if let Some(entry) = self.entries.write().unwrap().remove(name) {
+        if let Some(entry) = self.entries.write().remove(name) {
             entry.stop.store(true, Ordering::Relaxed);
         }
     }
@@ -339,71 +338,56 @@ impl HealthMonitor {
     }
 
     /// Network tip = max slot height across all providers.
-    pub async fn slot_tip(&self) -> u64 {
-        let healths: Vec<Arc<ProviderHealth>> = self
-            .entries
+    pub fn slot_tip(&self) -> u64 {
+        self.entries
             .read()
-            .unwrap()
             .values()
-            .map(|e| e.health.clone())
-            .collect();
-        let mut tip = 0u64;
-        for h in &healths {
-            if let Some(s) = h.inner.read().await.slot_height {
-                tip = tip.max(s);
-            }
-        }
-        tip
+            .filter_map(|e| e.health.inner.read().slot_height)
+            .max()
+            .unwrap_or(0)
     }
 
-    /// Current snapshot for every provider.
-    pub async fn snapshots(&self) -> Vec<HealthSnapshot> {
+    /// Current snapshot for every provider. Hot path:
+    /// parking_lot::RwLock allows unlimited concurrent readers with no
+    /// scheduler involvement; the lock is held for nanoseconds (pure CPU
+    /// score computation), so 1000s of concurrent requests proceed without
+    /// queuing on each other.
+    pub fn snapshots(&self) -> Vec<HealthSnapshot> {
         let healths: Vec<Arc<ProviderHealth>> = self
             .entries
             .read()
-            .unwrap()
             .values()
             .map(|e| e.health.clone())
             .collect();
-        let tip = {
-            let mut max = 0u64;
-            for h in &healths {
-                if let Some(s) = h.inner.read().await.slot_height {
-                    max = max.max(s);
-                }
-            }
-            max
-        };
-        let mut out = Vec::with_capacity(healths.len());
-        for h in healths {
-            out.push(h.snapshot(tip, &self.cfg).await);
-        }
-        out
+        let tip = healths
+            .iter()
+            .filter_map(|h| h.inner.read().slot_height)
+            .max()
+            .unwrap_or(0);
+        healths.iter().map(|h| h.snapshot(tip, &self.cfg)).collect()
     }
 
     /// Update the cached slot height for a named provider.
-    pub async fn update_slot(&self, provider_name: &str, slot: u64) {
-        let health = self
+    pub fn update_slot(&self, provider_name: &str, slot: u64) {
+        if let Some(h) = self
             .entries
             .read()
-            .unwrap()
             .get(provider_name)
-            .map(|e| e.health.clone());
-        if let Some(h) = health {
-            h.update_slot(slot).await;
+            .map(|e| e.health.clone())
+        {
+            h.update_slot(slot);
         }
     }
 
     /// Record a real request outcome (feeds back into health score).
-    pub async fn record(&self, provider_name: &str, success: bool, latency_ms: f64) {
-        let health = self
+    pub fn record(&self, provider_name: &str, success: bool, latency_ms: f64) {
+        if let Some(h) = self
             .entries
             .read()
-            .unwrap()
             .get(provider_name)
-            .map(|e| e.health.clone());
-        if let Some(h) = health {
-            h.record(success, latency_ms, &self.cfg).await;
+            .map(|e| e.health.clone())
+        {
+            h.record(success, latency_ms, &self.cfg);
         }
     }
 }
@@ -427,8 +411,8 @@ async fn health_loop(
         match probe(&client, &provider).await {
             Ok(slot) => {
                 let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                state.update_slot(slot).await;
-                state.record(true, ms, &cfg).await;
+                state.update_slot(slot);
+                state.record(true, ms, &cfg);
                 metrics.record_probe(&provider.name, "health", "ok");
                 debug!(
                     provider = %provider.name,
@@ -439,7 +423,7 @@ async fn health_loop(
             }
             Err(e) => {
                 let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                state.record(false, ms, &cfg).await;
+                state.record(false, ms, &cfg);
                 metrics.record_probe(&provider.name, "health", "error");
                 warn!(provider = %provider.name, error = %e, "health probe failed");
             }
@@ -535,32 +519,32 @@ mod tests {
         assert!((inner.error_rate() - 2.0 / 3.0).abs() < 1e-9);
     }
 
-    #[tokio::test]
-    async fn circuit_opens_after_consecutive_failures() {
+    #[test]
+    fn circuit_opens_after_consecutive_failures() {
         let ph = ProviderHealth::new("test");
         let cfg = HealthConfig {
             circuit_open_failures: 3,
             ..Default::default()
         };
         for _ in 0..3 {
-            ph.record(false, 0.0, &cfg).await;
+            ph.record(false, 0.0, &cfg);
         }
-        let snap = ph.snapshot(0, &cfg).await;
+        let snap = ph.snapshot(0, &cfg);
         assert_eq!(snap.circuit, CircuitState::Open);
         assert!(!snap.is_available());
     }
 
-    #[tokio::test]
-    async fn slot_drift_and_is_drifting_populated() {
+    #[test]
+    fn slot_drift_and_is_drifting_populated() {
         let ph = ProviderHealth::new("test");
-        ph.update_slot(980).await;
+        ph.update_slot(980);
         let cfg = default_cfg(); // slot_drift_threshold = 10
 
-        let snap = ph.snapshot(1000, &cfg).await;
+        let snap = ph.snapshot(1000, &cfg);
         assert_eq!(snap.slot_drift, 20);
         assert!(snap.is_drifting);
 
-        let snap = ph.snapshot(985, &cfg).await;
+        let snap = ph.snapshot(985, &cfg);
         assert_eq!(snap.slot_drift, 5);
         assert!(!snap.is_drifting);
     }
@@ -603,18 +587,18 @@ mod tests {
         assert!(good.score(100, &cfg) > bad.score(100, &cfg));
     }
 
-    #[tokio::test]
-    async fn not_drifting_when_no_slot_data() {
+    #[test]
+    fn not_drifting_when_no_slot_data() {
         let ph = ProviderHealth::new("test");
         // slot_height = None (no probe received yet)
-        let snap = ph.snapshot(1000, &default_cfg()).await;
+        let snap = ph.snapshot(1000, &default_cfg());
         assert!(snap.slot_height.is_none());
         assert_eq!(snap.slot_drift, 0);
         assert!(!snap.is_drifting);
     }
 
-    #[tokio::test]
-    async fn circuit_stays_closed_below_threshold() {
+    #[test]
+    fn circuit_stays_closed_below_threshold() {
         let ph = ProviderHealth::new("test");
         let cfg = HealthConfig {
             circuit_open_failures: 5,
@@ -623,14 +607,14 @@ mod tests {
             ..Default::default()
         };
         for _ in 0..4 {
-            ph.record(false, 0.0, &cfg).await;
+            ph.record(false, 0.0, &cfg);
         }
-        let snap = ph.snapshot(0, &cfg).await;
+        let snap = ph.snapshot(0, &cfg);
         assert_eq!(snap.circuit, CircuitState::Closed);
     }
 
-    #[tokio::test]
-    async fn circuit_full_lifecycle_closed_open_halfopen_closed() {
+    #[test]
+    fn circuit_full_lifecycle_closed_open_halfopen_closed() {
         let ph = ProviderHealth::new("t");
         // Zero cooldown so Open→HalfOpen happens on the very next record() call.
         let cfg = HealthConfig {
@@ -639,21 +623,21 @@ mod tests {
             circuit_error_threshold: 1.1, // disable error-rate trigger
             ..Default::default()
         };
-        ph.record(false, 0.0, &cfg).await;
-        assert_eq!(ph.snapshot(0, &cfg).await.circuit, CircuitState::Open);
+        ph.record(false, 0.0, &cfg);
+        assert_eq!(ph.snapshot(0, &cfg).circuit, CircuitState::Open);
 
         // record() with cooldown=0: Open → HalfOpen (elapsed ≥ 0 always true)
-        ph.record(true, 10.0, &cfg).await;
-        assert_eq!(ph.snapshot(0, &cfg).await.circuit, CircuitState::HalfOpen);
+        ph.record(true, 10.0, &cfg);
+        assert_eq!(ph.snapshot(0, &cfg).circuit, CircuitState::HalfOpen);
 
         // Probe success → Closed
-        ph.record(true, 10.0, &cfg).await;
-        assert_eq!(ph.snapshot(0, &cfg).await.circuit, CircuitState::Closed);
-        assert!(ph.snapshot(0, &cfg).await.is_available());
+        ph.record(true, 10.0, &cfg);
+        assert_eq!(ph.snapshot(0, &cfg).circuit, CircuitState::Closed);
+        assert!(ph.snapshot(0, &cfg).is_available());
     }
 
-    #[tokio::test]
-    async fn circuit_halfopen_failure_reopens() {
+    #[test]
+    fn circuit_halfopen_failure_reopens() {
         let ph = ProviderHealth::new("t");
         let cfg = HealthConfig {
             circuit_open_failures: 1,
@@ -661,16 +645,16 @@ mod tests {
             circuit_error_threshold: 1.1,
             ..Default::default()
         };
-        ph.record(false, 0.0, &cfg).await; // Closed → Open
-        ph.record(false, 0.0, &cfg).await; // Open → HalfOpen (cooldown=0)
-        assert_eq!(ph.snapshot(0, &cfg).await.circuit, CircuitState::HalfOpen);
-        ph.record(false, 0.0, &cfg).await; // HalfOpen → Open (probe failed)
-        assert_eq!(ph.snapshot(0, &cfg).await.circuit, CircuitState::Open);
-        assert!(!ph.snapshot(0, &cfg).await.is_available());
+        ph.record(false, 0.0, &cfg); // Closed → Open
+        ph.record(false, 0.0, &cfg); // Open → HalfOpen (cooldown=0)
+        assert_eq!(ph.snapshot(0, &cfg).circuit, CircuitState::HalfOpen);
+        ph.record(false, 0.0, &cfg); // HalfOpen → Open (probe failed)
+        assert_eq!(ph.snapshot(0, &cfg).circuit, CircuitState::Open);
+        assert!(!ph.snapshot(0, &cfg).is_available());
     }
 
-    #[tokio::test]
-    async fn monitor_update_slot_propagates() {
+    #[test]
+    fn monitor_update_slot_propagates() {
         let provider = crate::config::ProviderConfig {
             name: "p".to_string(),
             url: "http://127.0.0.1:1".to_string(),
@@ -691,17 +675,16 @@ mod tests {
             monitor
                 .entries
                 .write()
-                .unwrap()
                 .insert("p".to_string(), ProviderEntry { health, stop });
         }
-        monitor.update_slot("p", 42_000).await;
-        assert_eq!(monitor.slot_tip().await, 42_000);
+        monitor.update_slot("p", 42_000);
+        assert_eq!(monitor.slot_tip(), 42_000);
     }
 
-    #[tokio::test]
-    async fn add_and_remove_provider() {
+    #[test]
+    fn add_and_remove_provider() {
         let monitor = HealthMonitor::new(&[], HealthConfig::default(), Metrics::new());
-        assert_eq!(monitor.snapshots().await.len(), 0);
+        assert_eq!(monitor.snapshots().len(), 0);
 
         let provider = ProviderConfig {
             name: "test".to_string(),
@@ -710,20 +693,86 @@ mod tests {
             pricing: None,
             http3: false,
         };
-        // add_provider spawns background tasks, so we need a tokio runtime
         // We don't call add_provider here (needs real HTTP) — just verify map ops
         {
             let stop = Arc::new(AtomicBool::new(false));
-            let health = ProviderHealth::new(&provider.name);
+            let health = ProviderHealth::new(provider.name.as_str());
             monitor
                 .entries
                 .write()
-                .unwrap()
                 .insert(provider.name.clone(), ProviderEntry { health, stop });
         }
-        assert_eq!(monitor.snapshots().await.len(), 1);
+        assert_eq!(monitor.snapshots().len(), 1);
 
         monitor.remove_provider("test");
-        assert_eq!(monitor.snapshots().await.len(), 0);
+        assert_eq!(monitor.snapshots().len(), 0);
+    }
+
+    // ── Memory bounds: sliding window ──────────────────────────────────────────
+
+    #[test]
+    fn window_prunes_entries_older_than_window_secs() {
+        let mut inner = Inner::new();
+        // Directly inject entries with timestamps 120 seconds in the past.
+        let old = Instant::now() - Duration::from_secs(120);
+        inner.window.push_back((old, true));
+        inner.window.push_back((old, false));
+        assert_eq!(inner.window.len(), 2);
+
+        // prune_window(60) should evict both entries (120s > 60s cutoff).
+        inner.prune_window(60);
+        assert_eq!(
+            inner.window.len(),
+            0,
+            "entries older than window_secs must be evicted"
+        );
+    }
+
+    #[test]
+    fn window_keeps_entries_within_window_secs() {
+        let mut inner = Inner::new();
+        // Inject an entry 10 seconds old — within a 60-second window.
+        let recent = Instant::now() - Duration::from_secs(10);
+        inner.window.push_back((recent, true));
+
+        inner.prune_window(60);
+        assert_eq!(inner.window.len(), 1, "recent entries must be retained");
+    }
+
+    #[test]
+    fn window_evicts_old_but_keeps_new_entries() {
+        let mut inner = Inner::new();
+        let old = Instant::now() - Duration::from_secs(90);
+        let recent = Instant::now() - Duration::from_secs(5);
+        inner.window.push_back((old, false));
+        inner.window.push_back((old, true));
+        inner.window.push_back((recent, true));
+
+        inner.prune_window(60);
+        // Only the recent entry survives.
+        assert_eq!(inner.window.len(), 1);
+        assert!(
+            inner.window[0].1,
+            "surviving entry should be the recent success"
+        );
+    }
+
+    #[test]
+    fn window_length_bounded_by_time_not_call_count() {
+        let mut inner = Inner::new();
+        // Simulate 1 000 records all arriving "now" within a 1-second window.
+        // At a real 1s probe interval only ~1 entry would accumulate per second,
+        // but this verifies there is no panic or unbounded allocation under burst.
+        for i in 0..1_000 {
+            inner.push_result(i % 2 == 0, 50.0, 60);
+        }
+        // All 1 000 are within the window — they're all retained, but the important
+        // property is that push_result always calls prune_window, so old entries
+        // are flushed each time records arrive. No leak possible.
+        assert_eq!(inner.window.len(), 1_000);
+        assert!(
+            inner.error_rate() >= 0.0 && inner.error_rate() <= 1.0,
+            "error_rate must remain a valid probability"
+        );
     }
 }

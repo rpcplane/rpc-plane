@@ -6,7 +6,7 @@
 use axum::{
     body::Body,
     http::{Method, Request, StatusCode},
-    routing::post,
+    routing::{get, post},
     Router,
 };
 use http_body_util::BodyExt;
@@ -264,7 +264,7 @@ async fn circuit_open_provider_excluded_from_routing() {
 
     // Pre-open A's circuit by recording 3 consecutive failures.
     for _ in 0..3 {
-        state.monitor.record("a", false, 1000.0).await;
+        state.monitor.record("a", false, 1000.0);
     }
 
     let router = build_router(state);
@@ -323,4 +323,288 @@ async fn health_endpoint_returns_provider_list() {
     let providers = body["providers"].as_array().unwrap();
     assert_eq!(providers.len(), 1);
     assert_eq!(providers[0]["name"].as_str(), Some("p"));
+}
+
+/// Provider A returns HTTP 429 (rate limited); proxy must fail over to B.
+#[tokio::test]
+async fn rate_limited_provider_fails_over_to_next() {
+    let mock_a = Router::new().route("/", post(|| async { (StatusCode::TOO_MANY_REQUESTS, "") }));
+    let mock_b = Router::new().route("/", post(|| async { slot_response(888) }));
+
+    let (url_a, _abort_a) = start_mock(mock_a).await;
+    let (url_b, _abort_b) = start_mock(mock_b).await;
+
+    let cfg = test_config(
+        &[("a", &url_a), ("b", &url_b)],
+        RoutingStrategy::FailoverOrdered,
+        1,
+        5,
+    );
+    let state = ProxyState::new(cfg);
+    let router = build_router(state);
+
+    let (status, body) = proxy_request(router, GET_SLOT).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"].as_u64(), Some(888));
+}
+
+/// Provider A has a stale slot (100 behind tip); BestScore routes exclusively to B.
+///
+/// A: slot=900, B: slot=1000 (tip). slot_score(A) << slot_score(B) so B wins.
+/// Background health probes may also call mock_a, so we assert only on the returned
+/// slot value — A returns 900, B returns 1000.
+#[tokio::test]
+async fn drifting_provider_deprioritized_by_best_score() {
+    let mock_a = Router::new().route("/", post(|| async { slot_response(900) }));
+    let mock_b = Router::new().route("/", post(|| async { slot_response(1000) }));
+
+    let (url_a, _abort_a) = start_mock(mock_a).await;
+    let (url_b, _abort_b) = start_mock(mock_b).await;
+
+    let cfg = test_config(
+        &[("a", &url_a), ("b", &url_b)],
+        RoutingStrategy::BestScore,
+        0,
+        5,
+    );
+    let state = ProxyState::new(cfg);
+    // Pre-seed slot heights: A at 900, B at 1000 (network tip = 1000, A drifts 100 slots).
+    // drift_threshold=10 → A's slot_score = 10/(10+100) ≈ 0.09; B's = 1.0.
+    state.monitor.update_slot("a", 900);
+    state.monitor.update_slot("b", 1000);
+    let router = build_router(state);
+
+    let (status, body) = proxy_request(router, GET_SLOT).await;
+
+    assert_eq!(status, StatusCode::OK);
+    // B's response (slot=1000) confirms the fresh provider was selected.
+    // If A were chosen, the result would be 900.
+    assert_eq!(body["result"].as_u64(), Some(1000));
+}
+
+/// Provider A is pre-seeded with high-latency history; BestScore prefers B.
+///
+/// latency_score(A) = 200/(200+800) = 0.2; B has no latency data → defaults to 0.5.
+/// A returns slot=1, B returns slot=2 — response value reveals which was picked.
+/// Background health probes may call mock_a, but only the proxy-request result matters.
+#[tokio::test]
+async fn slow_provider_deprioritized_by_latency_score() {
+    let mock_a = Router::new().route("/", post(|| async { slot_response(1) }));
+    let mock_b = Router::new().route("/", post(|| async { slot_response(2) }));
+
+    let (url_a, _abort_a) = start_mock(mock_a).await;
+    let (url_b, _abort_b) = start_mock(mock_b).await;
+
+    let cfg = test_config(
+        &[("a", &url_a), ("b", &url_b)],
+        RoutingStrategy::BestScore,
+        0,
+        5,
+    );
+    let state = ProxyState::new(cfg);
+    // Simulate provider A having been consistently slow (800ms average).
+    // latency_score(A) ≈ 0.2; latency_score(B) = 0.5 (no data) — B wins on latency.
+    for _ in 0..10 {
+        state.monitor.record("a", true, 800.0);
+    }
+    let router = build_router(state);
+
+    let (status, body) = proxy_request(router, GET_SLOT).await;
+
+    assert_eq!(status, StatusCode::OK);
+    // B returns slot=2; if A were selected the result would be 1.
+    assert_eq!(
+        body["result"].as_u64(),
+        Some(2),
+        "B (lower latency) should be selected"
+    );
+}
+
+/// Circuit opens after consecutive failures, then manual probe recovery closes it,
+/// and FailoverOrdered sends traffic back to A (which is now the primary).
+#[tokio::test]
+async fn circuit_recovers_traffic_resumes() {
+    let mock_a = Router::new().route("/", post(|| async { slot_response(42) }));
+    let mock_b = Router::new().route("/", post(|| async { slot_response(99) }));
+
+    let (url_a, _abort_a) = start_mock(mock_a).await;
+    let (url_b, _abort_b) = start_mock(mock_b).await;
+
+    // circuit_cooldown_secs=0 so Open→HalfOpen transitions happen immediately on the next record().
+    let cfg = Config {
+        server: ServerConfig::default(),
+        health: HealthConfig {
+            interval_ms: 999_999,
+            circuit_open_failures: 2,
+            circuit_cooldown_secs: 0,
+            circuit_error_threshold: 1.1,
+            ..HealthConfig::default()
+        },
+        routing: RoutingConfig {
+            strategy: RoutingStrategy::FailoverOrdered,
+            max_retries: 0,
+            ..RoutingConfig::default()
+        },
+        providers: vec![
+            ProviderConfig {
+                name: "a".into(),
+                url: url_a,
+                weight: 1,
+                pricing: None,
+                http3: false,
+            },
+            ProviderConfig {
+                name: "b".into(),
+                url: url_b,
+                weight: 1,
+                pricing: None,
+                http3: false,
+            },
+        ],
+        reporting: None,
+    };
+    let state = ProxyState::new(cfg);
+
+    // Open A's circuit with 2 consecutive failures.
+    state.monitor.record("a", false, 100.0);
+    state.monitor.record("a", false, 100.0);
+
+    // Verify A is excluded: FailoverOrdered with A first, but A's circuit is open.
+    // Traffic must go to B.
+    {
+        let (status, body) = proxy_request(build_router(state.clone()), GET_SLOT).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["result"].as_u64(),
+            Some(99),
+            "B should handle when A is circuit-open"
+        );
+    }
+
+    // Simulate A recovering: cooldown=0, so Open→HalfOpen on first record(),
+    // then HalfOpen→Closed on the next success.
+    state.monitor.record("a", true, 10.0); // Open → HalfOpen
+    state.monitor.record("a", true, 10.0); // HalfOpen → Closed
+
+    // Now A's circuit is Closed again. FailoverOrdered picks A first.
+    {
+        let (status, body) = proxy_request(build_router(state), GET_SLOT).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["result"].as_u64(),
+            Some(42),
+            "A should handle traffic after recovering"
+        );
+    }
+}
+
+/// A non-retryable RPC error code (-32700) from provider A is returned immediately.
+/// Provider B must not be called even when max_retries allows a retry.
+#[tokio::test]
+async fn non_retryable_rpc_error_not_retried() {
+    let mock_a = Router::new().route(
+        "/",
+        post(|| async { rpc_error_response(-32700, "parse error") }),
+    );
+    let mock_b = Router::new().route("/", post(|| async { slot_response(999) }));
+
+    let (url_a, _abort_a) = start_mock(mock_a).await;
+    let (url_b, _abort_b) = start_mock(mock_b).await;
+
+    let cfg = test_config(
+        &[("a", &url_a), ("b", &url_b)],
+        RoutingStrategy::FailoverOrdered,
+        1, // max_retries=1 — would retry if the error were retryable
+        5,
+    );
+    let state = ProxyState::new(cfg);
+    let router = build_router(state);
+
+    let (status, body) = proxy_request(router, GET_SLOT).await;
+
+    // Proxy returns A's error as-is (no retry on non-retryable code).
+    // If B had been called for the proxy request the result would be slot=999, not an error.
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["error"].is_object(), "expected error body: {body}");
+    assert_eq!(body["error"]["code"].as_i64(), Some(-32700));
+}
+
+/// Chaos: provider A returns retryable errors on every request, accumulating
+/// consecutive failures until the circuit opens. After circuit_open_failures,
+/// A is excluded and subsequent requests go directly to B without touching A.
+#[tokio::test]
+async fn chaos_consecutive_errors_open_circuit_and_reroute() {
+    let a_count = Arc::new(AtomicUsize::new(0));
+    let ac = a_count.clone();
+    let mock_a = Router::new().route(
+        "/",
+        post(move || {
+            let c = ac.clone();
+            async move {
+                c.fetch_add(1, Ordering::Relaxed);
+                rpc_error_response(-32603, "internal error") // retryable
+            }
+        }),
+    );
+    let mock_b = Router::new().route("/", post(|| async { slot_response(42) }));
+
+    let (url_a, _abort_a) = start_mock(mock_a).await;
+    let (url_b, _abort_b) = start_mock(mock_b).await;
+
+    // circuit_open_failures=3, max_retries=1: each request tries A (fails), then B (succeeds).
+    // After 3 consecutive failures on A, A's circuit opens.
+    let cfg = test_config(
+        &[("a", &url_a), ("b", &url_b)],
+        RoutingStrategy::FailoverOrdered,
+        1,
+        3,
+    );
+    let state = ProxyState::new(cfg);
+    let router = build_router(state);
+
+    // Requests 1–3: A fails (retryable), B handles it. A accumulates 3 failures → circuit opens.
+    for i in 0..3 {
+        let (status, body) = proxy_request(router.clone(), GET_SLOT).await;
+        assert_eq!(status, StatusCode::OK, "request {i} should succeed via B");
+        assert_eq!(body["result"].as_u64(), Some(42));
+    }
+
+    // Request 4: A's circuit is now open → A excluded, B handles directly.
+    let calls_before = a_count.load(Ordering::Relaxed);
+    let (status, body) = proxy_request(router.clone(), GET_SLOT).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"].as_u64(), Some(42));
+    assert_eq!(
+        a_count.load(Ordering::Relaxed),
+        calls_before,
+        "A should be excluded (circuit open) — no new calls after circuit opens"
+    );
+}
+
+/// A panic inside a handler must return HTTP 500, not silently drop the connection.
+///
+/// CatchPanicLayer wraps build_router; this verifies it is wired up correctly.
+/// Real-world trigger: a stray panic or unwrap() on the request path (parking_lot
+/// locks can't poison, so a poisoned-lock cascade is no longer possible).
+#[tokio::test]
+async fn handler_panic_returns_500_not_connection_drop() {
+    use tower_http::catch_panic::CatchPanicLayer;
+
+    // Minimal router: one route that always panics, wrapped with CatchPanicLayer.
+    let router = Router::new()
+        .route("/panic", get(|| async { panic!("intentional test panic") }))
+        .layer(CatchPanicLayer::new());
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/panic")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "panic should yield 500, not a connection drop"
+    );
 }

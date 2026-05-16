@@ -15,8 +15,9 @@ use reqwest::Client;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tower_http::catch_panic::CatchPanicLayer;
 
-pub type Clients = Arc<std::sync::RwLock<HashMap<String, Arc<Client>>>>;
+pub type Clients = Arc<parking_lot::RwLock<HashMap<String, Arc<Client>>>>;
 use std::time::Instant;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
@@ -40,14 +41,14 @@ fn build_clients(providers: &[ProviderConfig]) -> Clients {
         .iter()
         .map(|p| (p.name.clone(), Arc::new(build_client(p))))
         .collect();
-    Arc::new(std::sync::RwLock::new(map))
+    Arc::new(parking_lot::RwLock::new(map))
 }
 
 #[derive(Clone)]
 pub struct ProxyState {
     /// Live config — swapped atomically on hot reload. Read the Arc cheaply
     /// at the start of each handler; never hold the lock across an await.
-    config: Arc<std::sync::RwLock<Arc<Config>>>,
+    config: Arc<parking_lot::RwLock<Arc<Config>>>,
     pub clients: Clients,
     pub monitor: HealthMonitor,
     pub metrics: Metrics,
@@ -67,7 +68,7 @@ impl ProxyState {
         let monitor = HealthMonitor::new(&config.providers, config.health.clone(), metrics.clone());
         monitor.start(clients.clone(), config.providers.clone());
         Self {
-            config: Arc::new(std::sync::RwLock::new(Arc::new(config))),
+            config: Arc::new(parking_lot::RwLock::new(Arc::new(config))),
             clients,
             monitor,
             metrics,
@@ -76,7 +77,7 @@ impl ProxyState {
     }
 
     /// Clone of the Arc wrapping the live config. Pass to the hot-reload watcher.
-    pub fn config_handle(&self) -> Arc<std::sync::RwLock<Arc<Config>>> {
+    pub fn config_handle(&self) -> Arc<parking_lot::RwLock<Arc<Config>>> {
         self.config.clone()
     }
 
@@ -87,12 +88,12 @@ impl ProxyState {
     }
 
     fn client_for(&self, name: &str) -> Option<Arc<Client>> {
-        self.clients.read().unwrap().get(name).cloned()
+        self.clients.read().get(name).cloned()
     }
 
     /// Cheaply snapshot the current config (clones an Arc, not the Config).
     fn current_config(&self) -> Arc<Config> {
-        self.config.read().unwrap().clone()
+        self.config.read().clone()
     }
 }
 
@@ -102,6 +103,9 @@ pub fn build_router(state: ProxyState) -> Router {
     Router::new()
         .route("/", post(handle_rpc))
         .route("/health", get(handle_health))
+        // Turns any handler panic into HTTP 500 instead of a silent connection drop.
+        // (parking_lot locks can't poison, so this only guards stray panics/unwrap()s.)
+        .layer(CatchPanicLayer::new())
         .with_state(state)
 }
 
@@ -114,12 +118,12 @@ pub fn build_metrics_router(state: ProxyState) -> Router {
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 async fn handle_health(State(state): State<ProxyState>) -> impl IntoResponse {
-    let snaps = state.monitor.snapshots().await;
+    let snaps = state.monitor.snapshots();
     let providers: Vec<_> = snaps
         .iter()
         .map(|s| {
             serde_json::json!({
-                "name": s.name,
+                "name": s.name.as_ref(),
                 "score": (s.score * 1000.0).round() / 1000.0,
                 "slot": s.slot_height,
                 "slot_drift": s.slot_drift,
@@ -139,10 +143,10 @@ async fn handle_health(State(state): State<ProxyState>) -> impl IntoResponse {
 }
 
 async fn handle_metrics(State(state): State<ProxyState>) -> impl IntoResponse {
-    let snaps = state.monitor.snapshots().await;
+    let snaps = state.monitor.snapshots();
     for s in &snaps {
         state.metrics.update_provider_health(
-            &s.name,
+            s.name.as_ref(),
             s.score,
             s.slot_height,
             s.slot_drift,
@@ -163,17 +167,12 @@ async fn handle_rpc(State(state): State<ProxyState>, headers: HeaderMap, body: B
     let method = extract_method(&body).unwrap_or_else(|| "unknown".to_string());
 
     let config = state.current_config();
-    let snapshots = state.monitor.snapshots().await;
-    let config_weights: Vec<(String, u32)> = config
-        .providers
-        .iter()
-        .map(|p| (p.name.clone(), p.weight))
-        .collect();
+    let snapshots = state.monitor.snapshots();
     let decision = route(
         &method,
         &snapshots,
         &config.routing.strategy,
-        &config_weights,
+        &config.providers,
         config.routing.broadcast_writes,
     );
 
@@ -207,28 +206,32 @@ async fn handle_rpc(State(state): State<ProxyState>, headers: HeaderMap, body: B
 async fn sequential(
     state: &ProxyState,
     config: &Config,
-    providers: &[String],
+    providers: &[Arc<str>],
     method: &str,
     headers: &HeaderMap,
     body: &Bytes,
     request_id: Uuid,
 ) -> Response {
     let max_attempts = (config.routing.max_retries + 1).min(providers.len());
-    let mut prev_failed: Option<(String, &'static str)> = None; // (name, reason)
+    let mut prev_failed: Option<(Arc<str>, &'static str)> = None; // (name, reason)
 
     for (attempt, name) in providers.iter().enumerate().take(max_attempts) {
         if attempt > 0 {
             if let Some((ref from, reason)) = prev_failed {
                 state.metrics.record_failover(from, name);
                 state.reporter.emit(TelemetryEvent::Failover {
-                    from_provider: from.clone(),
-                    to_provider: name.clone(),
+                    from_provider: from.to_string(),
+                    to_provider: name.to_string(),
                     reason: reason.to_string(),
                 });
             }
         }
 
-        let Some(provider) = config.providers.iter().find(|p| p.name == *name) else {
+        let Some(provider) = config
+            .providers
+            .iter()
+            .find(|p| p.name.as_str() == name.as_ref())
+        else {
             continue;
         };
 
@@ -257,13 +260,13 @@ async fn sequential(
                         state.reporter.emit(TelemetryEvent::Request {
                             id: request_id.to_string(),
                             method: method.to_string(),
-                            provider: name.clone(),
+                            provider: name.to_string(),
                             latency_ms,
                             status: "error".to_string(),
                             commitment: None,
                             estimated_cost: None,
                         });
-                        state.monitor.record(name, false, latency_ms).await;
+                        state.monitor.record(name, false, latency_ms);
                         prev_failed = Some((name.clone(), "retryable_rpc_error"));
                         continue;
                     }
@@ -280,13 +283,13 @@ async fn sequential(
                 state.reporter.emit(TelemetryEvent::Request {
                     id: request_id.to_string(),
                     method: method.to_string(),
-                    provider: name.clone(),
+                    provider: name.to_string(),
                     latency_ms,
                     status: "ok".to_string(),
                     commitment: None,
                     estimated_cost: None,
                 });
-                state.monitor.record(name, true, latency_ms).await;
+                state.monitor.record(name, true, latency_ms);
                 return (
                     StatusCode::OK,
                     [("content-type", "application/json")],
@@ -309,13 +312,13 @@ async fn sequential(
                 state.reporter.emit(TelemetryEvent::Request {
                     id: request_id.to_string(),
                     method: method.to_string(),
-                    provider: name.clone(),
+                    provider: name.to_string(),
                     latency_ms,
                     status: "error".to_string(),
                     commitment: None,
                     estimated_cost: None,
                 });
-                state.monitor.record(name, false, latency_ms).await;
+                state.monitor.record(name, false, latency_ms);
                 prev_failed = Some((name.clone(), "provider_error"));
             }
         }
@@ -330,7 +333,7 @@ async fn sequential(
 async fn broadcast(
     state: &ProxyState,
     config: &Config,
-    providers: &[String],
+    providers: &[Arc<str>],
     method: &str,
     headers: &HeaderMap,
     body: &Bytes,
@@ -344,10 +347,14 @@ async fn broadcast(
         );
     }
 
-    let mut set: JoinSet<(String, Result<Bytes, String>, f64)> = JoinSet::new();
+    let mut set: JoinSet<(Arc<str>, Result<Bytes, String>, f64)> = JoinSet::new();
 
     for name in providers {
-        let Some(provider) = config.providers.iter().find(|p| p.name == *name) else {
+        let Some(provider) = config
+            .providers
+            .iter()
+            .find(|p| p.name.as_str() == name.as_ref())
+        else {
             continue;
         };
         let Some(client) = state.client_for(name) else {
@@ -377,13 +384,13 @@ async fn broadcast(
                 state.reporter.emit(TelemetryEvent::Request {
                     id: request_id.to_string(),
                     method: method.to_string(),
-                    provider: name.clone(),
+                    provider: name.to_string(),
                     latency_ms,
                     status: "ok".to_string(),
                     commitment: None,
                     estimated_cost: None,
                 });
-                state.monitor.record(&name, true, latency_ms).await;
+                state.monitor.record(&name, true, latency_ms);
                 if first_success.is_none() {
                     info!(
                         request_id = %request_id,
@@ -403,13 +410,13 @@ async fn broadcast(
                 state.reporter.emit(TelemetryEvent::Request {
                     id: request_id.to_string(),
                     method: method.to_string(),
-                    provider: name.clone(),
+                    provider: name.to_string(),
                     latency_ms,
                     status: "error".to_string(),
                     commitment: None,
                     estimated_cost: None,
                 });
-                state.monitor.record(&name, false, latency_ms).await;
+                state.monitor.record(&name, false, latency_ms);
             }
             Err(e) => {
                 warn!(request_id = %request_id, error = %e, "broadcast task panicked");

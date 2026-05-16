@@ -113,10 +113,10 @@ async fn run(config_path: PathBuf) -> Result<()> {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            let snaps = health_monitor.snapshots().await;
+            let snaps = health_monitor.snapshots();
             for s in &snaps {
                 health_reporter.emit(TelemetryEvent::ProviderHealth {
-                    provider: s.name.clone(),
+                    provider: s.name.to_string(),
                     score: s.score,
                     slot_height: s.slot_height,
                     slot_drift: s.slot_drift,
@@ -281,7 +281,7 @@ async fn init(config_path: PathBuf) -> Result<()> {
 
 async fn watch_config(
     path: PathBuf,
-    config: Arc<std::sync::RwLock<Arc<rpc_plane_core::config::Config>>>,
+    config: Arc<parking_lot::RwLock<Arc<rpc_plane_core::config::Config>>>,
     monitor: rpc_plane_core::health::HealthMonitor,
     clients: rpc_plane_core::proxy::Clients,
 ) {
@@ -312,7 +312,6 @@ async fn watch_config(
         // Snapshot old provider map for diffing.
         let old_providers: HashMap<String, String> = config
             .read()
-            .unwrap()
             .providers
             .iter()
             .map(|p| (p.name.clone(), p.url.clone()))
@@ -327,7 +326,7 @@ async fn watch_config(
         // Removed providers.
         for name in old_providers.keys() {
             if !new_providers.contains_key(name) {
-                clients.write().unwrap().remove(name);
+                clients.write().remove(name);
                 monitor.remove_provider(name);
                 info!(provider = %name, "hot reload: provider removed");
             }
@@ -340,22 +339,16 @@ async fn watch_config(
                     // Unchanged — keep existing health state.
                 }
                 Some(_) => {
-                    clients.write().unwrap().remove(name);
+                    clients.write().remove(name);
                     monitor.remove_provider(name);
                     let client = Arc::new(rpc_plane_core::proxy::build_client(new_p));
-                    clients
-                        .write()
-                        .unwrap()
-                        .insert(name.clone(), client.clone());
+                    clients.write().insert(name.clone(), client.clone());
                     monitor.add_provider(client, new_p.clone());
                     info!(provider = %name, "hot reload: provider URL updated");
                 }
                 None => {
                     let client = Arc::new(rpc_plane_core::proxy::build_client(new_p));
-                    clients
-                        .write()
-                        .unwrap()
-                        .insert(name.clone(), client.clone());
+                    clients.write().insert(name.clone(), client.clone());
                     monitor.add_provider(client, new_p.clone());
                     info!(provider = %name, "hot reload: provider added");
                 }
@@ -364,7 +357,7 @@ async fn watch_config(
 
         // Warn about settings that require a restart.
         {
-            let old = config.read().unwrap();
+            let old = config.read();
             if old.server.listen != new_config.server.listen
                 || old.server.metrics_listen != new_config.server.metrics_listen
             {
@@ -372,7 +365,7 @@ async fn watch_config(
             }
         }
 
-        *config.write().unwrap() = Arc::new(new_config);
+        *config.write() = Arc::new(new_config);
         info!(path = %path.display(), "config reloaded");
     }
 }

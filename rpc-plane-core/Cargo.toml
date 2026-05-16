@@ -18,10 +18,13 @@ anyhow.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 prometheus.workspace = true
+parking_lot.workspace = true
 rand.workspace = true
 shellexpand.workspace = true
+tower-http.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 tower = { version = "0.5", features = ["util"] }
+tower-http = { workspace = true }
 http-body-util = "0.1"
