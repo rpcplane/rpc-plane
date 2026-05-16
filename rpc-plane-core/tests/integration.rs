@@ -592,7 +592,7 @@ async fn handler_panic_returns_500_not_connection_drop() {
 
     // Minimal router: one route that always panics, wrapped with CatchPanicLayer.
     let router = Router::new()
-        .route("/panic", get(|| async { panic!("intentional test panic") }))
+        .route("/panic", get(|| async { panic!("intentional test panic"); #[allow(unreachable_code)] () }))
         .layer(CatchPanicLayer::new());
 
     let req = Request::builder()

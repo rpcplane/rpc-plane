@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/rpcplane/rpc-plane/security/advisories/new
+    about: Report a security issue privately via GitHub's advisory system
+  - name: Question / discussion
+    url: https://github.com/rpcplane/rpc-plane/discussions
+    about: Ask a question or share how you're using RPC Plane

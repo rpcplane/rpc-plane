@@ -1,0 +1,76 @@
+name: Bug report
+description: Something isn't working correctly
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For security vulnerabilities, do **not** open an issue — see [SECURITY.md](../../SECURITY.md).
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `rpc-plane --version`
+      placeholder: "rpc-plane 0.1.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS / arch
+      options:
+        - Linux x86_64
+        - Linux aarch64
+        - macOS x86_64
+        - macOS arm64
+        - Docker
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: providers
+    attributes:
+      label: Providers configured
+      description: Provider names only — no URLs or API keys
+      placeholder: "helius, quicknode"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: strategy
+    attributes:
+      label: Routing strategy
+      options:
+        - best_score (default)
+        - weighted_random
+        - failover_ordered
+        - parallel_race
+    validations:
+      required: false
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: Include any relevant log output (set RUST_LOG=debug for verbose output)
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant config (sanitised)
+      description: Remove all URLs and API keys before pasting
+      render: toml
+    validations:
+      required: false

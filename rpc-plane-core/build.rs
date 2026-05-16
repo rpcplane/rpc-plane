@@ -10,8 +10,14 @@ fn git(args: &[&str]) -> String {
 }
 
 fn main() {
-    println!("cargo:rustc-env=GIT_COMMIT_HASH={}", git(&["rev-parse", "--short", "HEAD"]));
-    println!("cargo:rustc-env=GIT_BRANCH={}", git(&["rev-parse", "--abbrev-ref", "HEAD"]));
+    println!(
+        "cargo:rustc-env=GIT_COMMIT_HASH={}",
+        git(&["rev-parse", "--short", "HEAD"])
+    );
+    println!(
+        "cargo:rustc-env=GIT_BRANCH={}",
+        git(&["rev-parse", "--abbrev-ref", "HEAD"])
+    );
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/refs");
 
