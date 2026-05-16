@@ -62,6 +62,14 @@ pub struct ServerConfig {
     pub listen: String,
     #[serde(default = "default_metrics_listen")]
     pub metrics_listen: String,
+    /// OS TCP listen backlog for the proxy and metrics sockets.
+    /// The kernel clamps this to net.core.somaxconn (raise that too for 1000+ concurrency).
+    #[serde(default = "default_listen_backlog")]
+    pub listen_backlog: u32,
+    /// Max idle connections kept in the outbound pool per provider.
+    /// Set to at least your expected peak concurrency to avoid cold TCP handshakes.
+    #[serde(default = "default_pool_max_idle_per_host")]
+    pub pool_max_idle_per_host: usize,
 }
 
 impl Default for ServerConfig {
@@ -69,6 +77,8 @@ impl Default for ServerConfig {
         Self {
             listen: default_listen(),
             metrics_listen: default_metrics_listen(),
+            listen_backlog: default_listen_backlog(),
+            pool_max_idle_per_host: default_pool_max_idle_per_host(),
         }
     }
 }
@@ -78,6 +88,12 @@ fn default_listen() -> String {
 }
 fn default_metrics_listen() -> String {
     "127.0.0.1:9401".to_string()
+}
+fn default_listen_backlog() -> u32 {
+    4096
+}
+fn default_pool_max_idle_per_host() -> usize {
+    512
 }
 
 // ── Health ──────────────────────────────────────────────────────────────────

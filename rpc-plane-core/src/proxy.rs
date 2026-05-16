@@ -12,7 +12,6 @@ use axum::{
     Router,
 };
 use reqwest::Client;
-use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tower_http::catch_panic::CatchPanicLayer;
@@ -25,21 +24,21 @@ use uuid::Uuid;
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
-pub fn build_client(provider: &ProviderConfig) -> Client {
+pub fn build_client(provider: &ProviderConfig, pool_max_idle_per_host: usize) -> Client {
     let mut builder = Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .tcp_keepalive(std::time::Duration::from_secs(60))
-        .pool_max_idle_per_host(32);
+        .pool_max_idle_per_host(pool_max_idle_per_host);
     if provider.http3 {
         builder = builder.http3_prior_knowledge().http3_send_grease(false);
     }
     builder.build().expect("failed to build HTTP client")
 }
 
-fn build_clients(providers: &[ProviderConfig]) -> Clients {
+fn build_clients(providers: &[ProviderConfig], pool_max_idle_per_host: usize) -> Clients {
     let map = providers
         .iter()
-        .map(|p| (p.name.clone(), Arc::new(build_client(p))))
+        .map(|p| (p.name.clone(), Arc::new(build_client(p, pool_max_idle_per_host))))
         .collect();
     Arc::new(parking_lot::RwLock::new(map))
 }
@@ -63,7 +62,7 @@ impl ProxyState {
 
     /// Build with a custom reporter (e.g. `RemoteReporter` for telemetry).
     pub fn new_with_reporter(config: Config, reporter: Arc<dyn Reporter>) -> Self {
-        let clients = build_clients(&config.providers);
+        let clients = build_clients(&config.providers, config.server.pool_max_idle_per_host);
         let metrics = Metrics::new();
         let monitor = HealthMonitor::new(&config.providers, config.health.clone(), metrics.clone());
         monitor.start(clients.clone(), config.providers.clone());
@@ -472,17 +471,23 @@ async fn forward(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn extract_method(body: &[u8]) -> Option<String> {
-    let v: Value = serde_json::from_slice(body).ok()?;
-    if let Some(method) = v.get("method").and_then(Value::as_str) {
-        return Some(method.to_owned());
+// Typed struct skips all irrelevant fields and borrows the method string directly,
+// avoiding the full Value allocation that the naive from_slice::<Value> approach incurs.
+#[derive(serde::Deserialize)]
+struct MethodField<'a> {
+    method: Option<&'a str>,
+}
+
+pub fn extract_method(body: &[u8]) -> Option<String> {
+    let first = body.iter().find(|&&b| !b.is_ascii_whitespace())?;
+    if *first == b'{' {
+        // Single request: parse only the method field, skip everything else.
+        let req: MethodField<'_> = serde_json::from_slice(body).ok()?;
+        return req.method.map(|m| m.to_owned());
     }
-    // Batch request: extract methods from array elements.
-    let arr = v.as_array()?;
-    let methods: Vec<&str> = arr
-        .iter()
-        .filter_map(|req| req.get("method")?.as_str())
-        .collect();
+    // Batch request.
+    let arr: Vec<MethodField<'_>> = serde_json::from_slice(body).ok()?;
+    let methods: Vec<&str> = arr.iter().filter_map(|r| r.method).collect();
     if methods.is_empty() {
         return None;
     }

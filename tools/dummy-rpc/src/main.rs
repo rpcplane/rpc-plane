@@ -48,6 +48,13 @@ struct Cli {
     /// Set to 0 to measure raw proxy throughput capacity instead.
     #[arg(long, default_value = "5", help = "Simulated latency per request (ms)")]
     delay_ms: u64,
+
+    #[arg(
+        long,
+        default_value = "4096",
+        help = "TCP listen backlog (OS caps at net.core.somaxconn)"
+    )]
+    backlog: u32,
 }
 
 #[derive(Clone)]
@@ -97,15 +104,21 @@ async fn main() {
 
     let router = Router::new().route("/", post(handle)).with_state(state);
 
-    let addr = format!("127.0.0.1:{}", cli.port);
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", cli.port)
+        .parse()
+        .expect("invalid address");
+    let socket = tokio::net::TcpSocket::new_v4().expect("TcpSocket::new_v4");
+    socket.set_reuseaddr(true).expect("SO_REUSEADDR");
+    socket.bind(addr).unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
+    let listener = socket
+        .listen(cli.backlog)
+        .unwrap_or_else(|e| panic!("failed to listen on {addr}: {e}"));
 
     info!(
         addr = %addr,
         slot = cli.slot,
         delay_ms = cli.delay_ms,
+        backlog = cli.backlog,
         "dummy-rpc listening"
     );
 

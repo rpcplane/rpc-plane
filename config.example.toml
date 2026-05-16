@@ -1,6 +1,8 @@
 [server]
-listen = "127.0.0.1:9400"
+listen         = "127.0.0.1:9400"
 metrics_listen = "127.0.0.1:9401"
+# listen_backlog        = 4096   # OS TCP backlog; raise net.core.somaxconn too for 1000+ concurrency
+# pool_max_idle_per_host = 512   # idle outbound connections per provider; set >= peak concurrency
 
 # ── Health scoring ─────────────────────────────────────────────────────────────
 [health]

@@ -22,3 +22,4 @@ clap.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
 parking_lot.workspace = true
+libc.workspace = true

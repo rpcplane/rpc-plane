@@ -59,9 +59,12 @@ async fn main() -> Result<()> {
 }
 
 async fn run(config_path: PathBuf) -> Result<()> {
+    #[cfg(unix)]
+    raise_nofile_limit();
     let config = rpc_plane_core::config::Config::load(&config_path)?;
     let listen = config.server.listen.clone();
     let metrics_listen = config.server.metrics_listen.clone();
+    let listen_backlog = config.server.listen_backlog;
 
     info!(
         listen = %listen,
@@ -92,8 +95,8 @@ async fn run(config_path: PathBuf) -> Result<()> {
     let proxy_router = rpc_plane_core::proxy::build_router(state.clone());
     let metrics_router = rpc_plane_core::proxy::build_metrics_router(state.clone());
 
-    let listener = tokio::net::TcpListener::bind(&listen).await?;
-    let metrics_listener = tokio::net::TcpListener::bind(&metrics_listen).await?;
+    let listener = tcp_listen(&listen, listen_backlog).await?;
+    let metrics_listener = tcp_listen(&metrics_listen, listen_backlog).await?;
 
     info!("proxy listening on http://{listen}");
     info!("replace your provider URL with http://{listen} in your Solana app");
@@ -341,13 +344,13 @@ async fn watch_config(
                 Some(_) => {
                     clients.write().remove(name);
                     monitor.remove_provider(name);
-                    let client = Arc::new(rpc_plane_core::proxy::build_client(new_p));
+                    let client = Arc::new(rpc_plane_core::proxy::build_client(new_p, new_config.server.pool_max_idle_per_host));
                     clients.write().insert(name.clone(), client.clone());
                     monitor.add_provider(client, new_p.clone());
                     info!(provider = %name, "hot reload: provider URL updated");
                 }
                 None => {
-                    let client = Arc::new(rpc_plane_core::proxy::build_client(new_p));
+                    let client = Arc::new(rpc_plane_core::proxy::build_client(new_p, new_config.server.pool_max_idle_per_host));
                     clients.write().insert(name.clone(), client.clone());
                     monitor.add_provider(client, new_p.clone());
                     info!(provider = %name, "hot reload: provider added");
@@ -372,6 +375,37 @@ async fn watch_config(
 
 fn mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+// ── Networking helpers ────────────────────────────────────────────────────────
+
+async fn tcp_listen(addr: &str, backlog: u32) -> Result<tokio::net::TcpListener> {
+    let addr: std::net::SocketAddr = addr.parse()?;
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    Ok(socket.listen(backlog)?)
+}
+
+// ── System limits ─────────────────────────────────────────────────────────────
+
+#[cfg(unix)]
+fn raise_nofile_limit() {
+    unsafe {
+        let mut rlim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 && rlim.rlim_cur < 65535 {
+            rlim.rlim_cur = rlim.rlim_max.min(65535);
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) != 0 {
+                tracing::warn!(
+                    limit = rlim.rlim_cur,
+                    "could not raise fd limit; set LimitNOFILE=65535 in the systemd unit"
+                );
+            }
+        }
+    }
 }
 
 // ── Shutdown ──────────────────────────────────────────────────────────────────

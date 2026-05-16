@@ -36,8 +36,15 @@ pub fn is_retryable_rpc_code(code: i64) -> bool {
 }
 
 pub fn extract_rpc_error_code(body: &[u8]) -> Option<i64> {
-    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
-    v.get("error")?.get("code")?.as_i64()
+    #[derive(serde::Deserialize)]
+    struct RpcErr {
+        code: Option<i64>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Wrapper {
+        error: Option<RpcErr>,
+    }
+    serde_json::from_slice::<Wrapper>(body).ok()?.error?.code
 }
 
 // ── Routing decision ──────────────────────────────────────────────────────────

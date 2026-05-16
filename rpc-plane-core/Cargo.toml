@@ -28,3 +28,8 @@ tempfile.workspace = true
 tower = { version = "0.5", features = ["util"] }
 tower-http = { workspace = true }
 http-body-util = "0.1"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "proxy_bench"
+harness = false
