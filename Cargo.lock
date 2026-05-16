@@ -1375,7 +1375,7 @@ dependencies = [
 
 [[package]]
 name = "rpc-plane"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1391,7 +1391,7 @@ dependencies = [
 
 [[package]]
 name = "rpc-plane-core"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
