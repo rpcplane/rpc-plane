@@ -9,18 +9,26 @@ COPY .cargo/config.toml            .cargo/config.toml
 COPY rpc-plane/Cargo.toml          rpc-plane/Cargo.toml
 COPY rpc-plane-core/Cargo.toml     rpc-plane-core/Cargo.toml
 COPY tools/dummy-rpc/Cargo.toml    tools/dummy-rpc/Cargo.toml
+COPY tools/load-test/Cargo.toml    tools/load-test/Cargo.toml
 
 # Stub sources so cargo can compile dependencies without the real code.
-RUN mkdir -p rpc-plane/src rpc-plane-core/src tools/dummy-rpc/src \
+# rpc-plane-core declares a `proxy_bench` bench (harness = false), so the
+# manifest won't parse unless benches/proxy_bench.rs exists too.
+RUN mkdir -p rpc-plane/src rpc-plane-core/src rpc-plane-core/benches tools/dummy-rpc/src tools/load-test/src \
  && echo 'fn main() {}' > rpc-plane/src/main.rs \
  && touch rpc-plane-core/src/lib.rs \
+ && echo 'fn main() {}' > rpc-plane-core/benches/proxy_bench.rs \
  && echo 'fn main() {}' > tools/dummy-rpc/src/main.rs \
+ && echo 'fn main() {}' > tools/load-test/src/main.rs \
  && cargo build --release -p rpc-plane \
- && rm -rf rpc-plane/src rpc-plane-core/src tools/dummy-rpc/src
+ && rm -rf rpc-plane/src rpc-plane-core/src rpc-plane-core/benches tools/dummy-rpc/src tools/load-test/src
 
 # Build the real binary.
-COPY rpc-plane/src       rpc-plane/src
-COPY rpc-plane-core/src  rpc-plane-core/src
+COPY rpc-plane/src           rpc-plane/src
+COPY rpc-plane-core/src      rpc-plane-core/src
+# Not compiled by `-p rpc-plane`, but the manifest declares the bench so the
+# file must exist for cargo to parse rpc-plane-core/Cargo.toml.
+COPY rpc-plane-core/benches  rpc-plane-core/benches
 # Embedded by `rpc-plane init` (include_str! at compile time).
 COPY config.example.toml config.example.toml
 
