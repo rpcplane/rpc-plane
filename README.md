@@ -1,5 +1,10 @@
 # RPC Plane
 
+[![CI](https://github.com/rpcplane/rpc-plane/actions/workflows/ci.yml/badge.svg)](https://github.com/rpcplane/rpc-plane/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/rpcplane/rpc-plane?sort=semver)](https://github.com/rpcplane/rpc-plane/releases)
+[![License: Elastic-2.0](https://img.shields.io/badge/license-Elastic--2.0-blue.svg)](LICENSE)
+[![Docker](https://img.shields.io/badge/ghcr.io-rpcplane%2Frpc--plane-2496ED?logo=docker&logoColor=white)](https://github.com/rpcplane/rpc-plane/pkgs/container/rpc-plane)
+
 Solana RPC proxy with intelligent multi-provider routing, automatic failover, and slot-aware health scoring. A single binary that sits between your app and your RPC providers.
 
 ```
