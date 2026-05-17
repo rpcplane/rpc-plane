@@ -57,15 +57,7 @@ async fn main() -> Result<()> {
 
     // Warmup
     run_batch(
-        cli.warmup,
-        &sem,
-        &ok,
-        &err,
-        &latencies,
-        is_uds,
-        &sock_path,
-        &tcp_host,
-        tcp_port,
+        cli.warmup, &sem, &ok, &err, &latencies, is_uds, &sock_path, &tcp_host, tcp_port,
     )
     .await;
     ok.store(0, Ordering::Relaxed);
