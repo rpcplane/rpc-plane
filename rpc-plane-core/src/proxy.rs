@@ -70,7 +70,12 @@ impl ProxyState {
     pub fn new_with_reporter(config: Config, reporter: Arc<dyn Reporter>) -> Self {
         let clients = build_clients(&config.providers, config.server.pool_max_idle_per_host);
         let metrics = Metrics::new();
-        let monitor = HealthMonitor::new(&config.providers, config.health.clone(), metrics.clone());
+        let monitor = HealthMonitor::new_with_reporter(
+            &config.providers,
+            config.health.clone(),
+            metrics.clone(),
+            reporter.clone(),
+        );
         monitor.start(clients.clone(), config.providers.clone());
         Self {
             config: Arc::new(parking_lot::RwLock::new(Arc::new(config))),

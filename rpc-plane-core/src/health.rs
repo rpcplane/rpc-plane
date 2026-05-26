@@ -1,6 +1,7 @@
 use crate::config::{HealthConfig, ProviderConfig};
 use crate::metrics::Metrics;
 use crate::proxy::Clients;
+use crate::telemetry::{NoopReporter, Reporter, TelemetryEvent};
 use parking_lot::RwLock;
 use reqwest::Client;
 use serde_json::Value;
@@ -249,10 +250,20 @@ pub struct HealthMonitor {
     entries: Arc<RwLock<HashMap<String, ProviderEntry>>>,
     pub cfg: Arc<HealthConfig>,
     metrics: Metrics,
+    reporter: Arc<dyn Reporter>,
 }
 
 impl HealthMonitor {
     pub fn new(providers: &[ProviderConfig], cfg: HealthConfig, metrics: Metrics) -> Self {
+        Self::new_with_reporter(providers, cfg, metrics, Arc::new(NoopReporter))
+    }
+
+    pub fn new_with_reporter(
+        providers: &[ProviderConfig],
+        cfg: HealthConfig,
+        metrics: Metrics,
+        reporter: Arc<dyn Reporter>,
+    ) -> Self {
         let entries = providers
             .iter()
             .map(|p| {
@@ -269,6 +280,7 @@ impl HealthMonitor {
             entries: Arc::new(RwLock::new(entries)),
             cfg: Arc::new(cfg),
             metrics,
+            reporter,
         }
     }
 
@@ -296,6 +308,7 @@ impl HealthMonitor {
                 provider,
                 self.cfg.clone(),
                 self.metrics.clone(),
+                self.reporter.clone(),
             );
         }
     }
@@ -311,6 +324,7 @@ impl HealthMonitor {
             provider.clone(),
             self.cfg.clone(),
             self.metrics.clone(),
+            self.reporter.clone(),
         );
         self.entries
             .write()
@@ -331,9 +345,10 @@ impl HealthMonitor {
         provider: ProviderConfig,
         cfg: Arc<HealthConfig>,
         metrics: Metrics,
+        reporter: Arc<dyn Reporter>,
     ) {
         tokio::spawn({
-            async move { health_loop(health, client, provider, cfg, metrics, stop).await }
+            async move { health_loop(health, client, provider, cfg, metrics, reporter, stop).await }
         });
     }
 
@@ -400,6 +415,7 @@ async fn health_loop(
     provider: ProviderConfig,
     cfg: Arc<HealthConfig>,
     metrics: Metrics,
+    reporter: Arc<dyn Reporter>,
     stop: Arc<AtomicBool>,
 ) {
     let interval = Duration::from_millis(cfg.interval_ms);
@@ -428,6 +444,19 @@ async fn health_loop(
                 warn!(provider = %provider.name, error = %e, "health probe failed");
             }
         }
+        // Emit telemetry snapshot after every probe regardless of outcome.
+        let snap = state.snapshot(0, &cfg);
+        reporter.emit(TelemetryEvent::ProviderHealth {
+            provider: provider.name.clone(),
+            score: snap.score,
+            slot_height: snap.slot_height,
+            slot_drift: snap.slot_drift,
+            circuit_state: match snap.circuit {
+                CircuitState::Closed => "closed".to_string(),
+                CircuitState::HalfOpen => "half_open".to_string(),
+                CircuitState::Open => "open".to_string(),
+            },
+        });
         if stop.load(Ordering::Relaxed) {
             break;
         }
