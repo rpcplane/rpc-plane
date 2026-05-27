@@ -688,7 +688,6 @@ mod tests {
             name: "p".to_string(),
             url: "http://127.0.0.1:1".to_string(),
             weight: 1,
-            pricing: None,
             http3: false,
         };
         let monitor = HealthMonitor::new(
@@ -719,7 +718,6 @@ mod tests {
             name: "test".to_string(),
             url: "http://localhost:8899".to_string(),
             weight: 1,
-            pricing: None,
             http3: false,
         };
         // We don't call add_provider here (needs real HTTP) — just verify map ops

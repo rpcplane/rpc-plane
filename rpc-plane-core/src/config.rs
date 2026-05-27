@@ -205,10 +205,6 @@ pub struct RoutingConfig {
     /// Maximum provider retries on retryable errors (per request).
     #[serde(default = "default_max_retries")]
     pub max_retries: usize,
-    #[serde(default)]
-    pub cost_aware: bool,
-    #[serde(default = "default_cost_weight")]
-    pub cost_weight: f64,
     /// Broadcast sendTransaction / simulateTransaction to all healthy providers
     /// simultaneously. Off by default — writes are routed like reads.
     #[serde(default)]
@@ -220,8 +216,6 @@ impl Default for RoutingConfig {
         Self {
             strategy: RoutingStrategy::default(),
             max_retries: default_max_retries(),
-            cost_aware: false,
-            cost_weight: default_cost_weight(),
             broadcast_writes: false,
         }
     }
@@ -229,9 +223,6 @@ impl Default for RoutingConfig {
 
 fn default_max_retries() -> usize {
     2
-}
-fn default_cost_weight() -> f64 {
-    0.2
 }
 
 // ── Providers ───────────────────────────────────────────────────────────────
@@ -242,7 +233,6 @@ pub struct ProviderConfig {
     pub url: String,
     #[serde(default = "default_weight")]
     pub weight: u32,
-    pub pricing: Option<ProviderPricing>,
     /// Use HTTP/3 (QUIC) for outbound connections to this provider.
     #[serde(default)]
     pub http3: bool,
@@ -250,12 +240,6 @@ pub struct ProviderConfig {
 
 fn default_weight() -> u32 {
     1
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct ProviderPricing {
-    pub model: String,
-    pub monthly_budget_usd: Option<f64>,
 }
 
 // ── Reporting ────────────────────────────────────────────────────────────────

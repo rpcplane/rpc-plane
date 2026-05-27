@@ -27,7 +27,6 @@ fn prov(name: &str) -> ProviderConfig {
         name: name.to_string(),
         url: "http://localhost:9090".to_string(),
         weight: 1,
-        pricing: None,
         http3: false,
     }
 }

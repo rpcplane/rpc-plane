@@ -274,7 +274,6 @@ async fn sequential(
                             latency_ms,
                             status: "error".to_string(),
                             commitment: None,
-                            estimated_cost: None,
                         });
                         state.monitor.record(name, false, latency_ms);
                         prev_failed = Some((name.clone(), "retryable_rpc_error"));
@@ -297,7 +296,7 @@ async fn sequential(
                     latency_ms,
                     status: "ok".to_string(),
                     commitment: None,
-                    estimated_cost: None,
+
                 });
                 state.monitor.record(name, true, latency_ms);
                 return (
@@ -326,7 +325,7 @@ async fn sequential(
                     latency_ms,
                     status: "error".to_string(),
                     commitment: None,
-                    estimated_cost: None,
+
                 });
                 state.monitor.record(name, false, latency_ms);
                 prev_failed = Some((name.clone(), "provider_error"));
@@ -398,7 +397,7 @@ async fn broadcast(
                     latency_ms,
                     status: "ok".to_string(),
                     commitment: None,
-                    estimated_cost: None,
+
                 });
                 state.monitor.record(&name, true, latency_ms);
                 if first_success.is_none() {
@@ -424,7 +423,7 @@ async fn broadcast(
                     latency_ms,
                     status: "error".to_string(),
                     commitment: None,
-                    estimated_cost: None,
+
                 });
                 state.monitor.record(&name, false, latency_ms);
             }
