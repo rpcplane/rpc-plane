@@ -20,8 +20,6 @@ pub enum TelemetryEvent {
         status: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         commitment: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        estimated_cost: Option<f64>,
     },
     ProviderHealth {
         provider: String,
@@ -45,11 +43,6 @@ pub enum TelemetryEvent {
     CacheEvent {
         method: String,
         hit: bool,
-    },
-    BudgetAlert {
-        provider: String,
-        projected_usd: f64,
-        cap_usd: f64,
     },
 }
 
@@ -243,7 +236,6 @@ mod tests {
             latency_ms: 12.5,
             status: "ok".into(),
             commitment: None,
-            estimated_cost: None,
         });
         reporter.flush();
 
@@ -273,7 +265,6 @@ mod tests {
             latency_ms: 1.0,
             status: "ok".into(),
             commitment: None,
-            estimated_cost: None,
         };
         let json = serde_json::to_value(&ev).unwrap();
         assert!(json.get("commitment").is_none());

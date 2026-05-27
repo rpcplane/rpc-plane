@@ -222,7 +222,6 @@ mod tests {
                 name: n.to_string(),
                 url: "http://x".to_string(),
                 weight: 1,
-                pricing: None,
                 http3: false,
             })
             .collect()
