@@ -298,9 +298,11 @@ mod tests {
         Mutex,
     };
 
+    type RequestLog = Arc<Mutex<Vec<(String, String, String, f64)>>>;
+
     struct RecordingReporter {
         events: Arc<Mutex<Vec<TelemetryEvent>>>,
-        requests: Arc<Mutex<Vec<(String, String, String, f64)>>>,
+        requests: RequestLog,
         flush_count: Arc<AtomicUsize>,
     }
 
@@ -308,7 +310,7 @@ mod tests {
         fn new() -> (
             Self,
             Arc<Mutex<Vec<TelemetryEvent>>>,
-            Arc<Mutex<Vec<(String, String, String, f64)>>>,
+            RequestLog,
             Arc<AtomicUsize>,
         ) {
             let events = Arc::new(Mutex::new(Vec::new()));
