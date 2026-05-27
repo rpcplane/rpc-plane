@@ -40,6 +40,12 @@ impl Config {
                 !r.endpoint.is_empty(),
                 "reporting.endpoint must not be empty"
             );
+            anyhow::ensure!(
+                r.flush_interval_ms >= 10_000,
+                "reporting.flush_interval_ms must be >= 10000 (10 s); got {}. \
+                 Values below 10 s produce excessive telemetry volume.",
+                r.flush_interval_ms
+            );
         }
         Ok(())
     }
@@ -265,7 +271,7 @@ pub struct ReportingConfig {
 }
 
 fn default_flush_interval_ms() -> u64 {
-    5000
+    60_000
 }
 fn default_buffer_size() -> usize {
     1000
@@ -398,7 +404,7 @@ api_key = "rp_live_test"
         let r = cfg.reporting.expect("reporting should be present");
         assert_eq!(r.endpoint, "http://localhost:3000/api/ingest");
         assert_eq!(r.api_key.as_deref(), Some("rp_live_test"));
-        assert_eq!(r.flush_interval_ms, 5000);
+        assert_eq!(r.flush_interval_ms, 60_000);
         assert_eq!(r.buffer_size, 1000);
         assert_eq!(r.batch_size, 100);
     }
@@ -422,6 +428,22 @@ endpoint = ""
 "#,
         );
         assert!(Config::load(f.path()).is_err());
+    }
+
+    #[test]
+    fn rejects_flush_interval_below_floor() {
+        let f = write_config(
+            r#"
+[[providers]]
+name = "p"
+url = "http://localhost:8899"
+[reporting]
+endpoint = "http://localhost:3000/api/ingest"
+flush_interval_ms = 1000
+"#,
+        );
+        let err = Config::load(f.path()).unwrap_err();
+        assert!(err.to_string().contains("flush_interval_ms"), "{err}");
     }
 
     #[test]

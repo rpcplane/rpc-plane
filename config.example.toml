@@ -51,6 +51,6 @@ http3  = true
 # [reporting]
 # endpoint          = "http://localhost:3000/api/ingest"
 # api_key           = "rp_live_xxxx"
-# flush_interval_ms = 5000   # how often to POST batched events
+# flush_interval_ms = 60000  # aggregate window + POST interval (ms)
 # buffer_size       = 1000   # max buffered events (oldest dropped when full)
 # batch_size        = 100    # max events per HTTP POST
