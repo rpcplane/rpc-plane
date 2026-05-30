@@ -134,7 +134,7 @@ async fn run(config_path: PathBuf) -> Result<()> {
     let health_reporter = reporter.clone();
     let health_monitor = state.monitor.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;

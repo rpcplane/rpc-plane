@@ -70,12 +70,7 @@ impl ProxyState {
     pub fn new_with_reporter(config: Config, reporter: Arc<dyn Reporter>) -> Self {
         let clients = build_clients(&config.providers, config.server.pool_max_idle_per_host);
         let metrics = Metrics::new();
-        let monitor = HealthMonitor::new_with_reporter(
-            &config.providers,
-            config.health.clone(),
-            metrics.clone(),
-            reporter.clone(),
-        );
+        let monitor = HealthMonitor::new(&config.providers, config.health.clone(), metrics.clone());
         monitor.start(clients.clone(), config.providers.clone());
         Self {
             config: Arc::new(parking_lot::RwLock::new(Arc::new(config))),
@@ -267,14 +262,9 @@ async fn sequential(
                         state
                             .metrics
                             .record_request(method, name, "error", latency_ms);
-                        state.reporter.emit(TelemetryEvent::Request {
-                            id: request_id.to_string(),
-                            method: method.to_string(),
-                            provider: name.to_string(),
-                            latency_ms,
-                            status: "error".to_string(),
-                            commitment: None,
-                        });
+                        state
+                            .reporter
+                            .record_request(method, name, "error", latency_ms);
                         state.monitor.record(name, false, latency_ms);
                         prev_failed = Some((name.clone(), "retryable_rpc_error"));
                         continue;
@@ -289,14 +279,9 @@ async fn sequential(
                     "request ok"
                 );
                 state.metrics.record_request(method, name, "ok", latency_ms);
-                state.reporter.emit(TelemetryEvent::Request {
-                    id: request_id.to_string(),
-                    method: method.to_string(),
-                    provider: name.to_string(),
-                    latency_ms,
-                    status: "ok".to_string(),
-                    commitment: None,
-                });
+                state
+                    .reporter
+                    .record_request(method, name, "ok", latency_ms);
                 state.monitor.record(name, true, latency_ms);
                 return (
                     StatusCode::OK,
@@ -317,14 +302,9 @@ async fn sequential(
                 state
                     .metrics
                     .record_request(method, name, "error", latency_ms);
-                state.reporter.emit(TelemetryEvent::Request {
-                    id: request_id.to_string(),
-                    method: method.to_string(),
-                    provider: name.to_string(),
-                    latency_ms,
-                    status: "error".to_string(),
-                    commitment: None,
-                });
+                state
+                    .reporter
+                    .record_request(method, name, "error", latency_ms);
                 state.monitor.record(name, false, latency_ms);
                 prev_failed = Some((name.clone(), "provider_error"));
             }
@@ -388,14 +368,9 @@ async fn broadcast(
                 state
                     .metrics
                     .record_request(method, &name, "ok", latency_ms);
-                state.reporter.emit(TelemetryEvent::Request {
-                    id: request_id.to_string(),
-                    method: method.to_string(),
-                    provider: name.to_string(),
-                    latency_ms,
-                    status: "ok".to_string(),
-                    commitment: None,
-                });
+                state
+                    .reporter
+                    .record_request(method, &name, "ok", latency_ms);
                 state.monitor.record(&name, true, latency_ms);
                 if first_success.is_none() {
                     info!(
@@ -413,14 +388,9 @@ async fn broadcast(
                 state
                     .metrics
                     .record_request(method, &name, "error", latency_ms);
-                state.reporter.emit(TelemetryEvent::Request {
-                    id: request_id.to_string(),
-                    method: method.to_string(),
-                    provider: name.to_string(),
-                    latency_ms,
-                    status: "error".to_string(),
-                    commitment: None,
-                });
+                state
+                    .reporter
+                    .record_request(method, &name, "error", latency_ms);
                 state.monitor.record(&name, false, latency_ms);
             }
             Err(e) => {
