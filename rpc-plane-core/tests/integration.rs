@@ -19,6 +19,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
+use std::time::Duration;
 use tower::ServiceExt;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -41,6 +42,20 @@ async fn start_mock(router: Router) -> (String, tokio::task::AbortHandle) {
         axum::serve(listener, router).await.unwrap();
     });
     (format!("http://{addr}"), handle.abort_handle())
+}
+
+/// Start a mock that sleeps `delay` before answering every POST with `slot`.
+/// Used to model a degraded-but-eventually-successful provider so broadcast /
+/// ParallelRace early-return can be observed against the wall clock.
+async fn start_slow_mock(slot: u64, delay: Duration) -> (String, tokio::task::AbortHandle) {
+    let router = Router::new().route(
+        "/",
+        post(move || async move {
+            tokio::time::sleep(delay).await;
+            slot_response(slot)
+        }),
+    );
+    start_mock(router).await
 }
 
 /// Build a test Config that disables background health/slot probes (huge intervals)
@@ -610,5 +625,114 @@ async fn handler_panic_returns_500_not_connection_drop() {
         resp.status(),
         StatusCode::INTERNAL_SERVER_ERROR,
         "panic should yield 500, not a connection drop"
+    );
+}
+
+// ── Contract tests ──────────────────────────────────────────────────────────────
+//
+// These pin documented routing/forwarding behaviour. They began life #[ignore]d
+// and failing (documenting bugs the code didn't yet honour); the Milestone 1
+// fixes — broadcast early-return and upstream non-2xx passthrough — landed, so
+// they now run as regression gates.
+
+/// CONTRACT: broadcast must respond on the FIRST provider success, not after the
+/// slowest provider finishes. With
+/// `broadcast_writes`, `sendTransaction` fans out to every provider; a fast
+/// provider and a degraded one (5 s) race, and the client must see the fast
+/// success well under 1 s. The slow provider's outcome is still recorded by the
+/// detached straggler drain, but off the client's critical path.
+#[tokio::test]
+async fn broadcast_returns_on_first_success_before_slow_provider() {
+    let (url_fast, _abort_fast) =
+        start_mock(Router::new().route("/", post(|| async { slot_response(111) }))).await;
+    let (url_slow, _abort_slow) = start_slow_mock(222, Duration::from_secs(5)).await;
+
+    let mut cfg = test_config(
+        &[("fast", &url_fast), ("slow", &url_slow)],
+        RoutingStrategy::BestScore,
+        0,
+        5,
+    );
+    cfg.routing.broadcast_writes = true;
+    let state = ProxyState::new(cfg);
+    let router = build_router(state);
+
+    let started = std::time::Instant::now();
+    let outcome =
+        tokio::time::timeout(Duration::from_secs(1), proxy_request(router, SEND_TX)).await;
+    let elapsed = started.elapsed();
+
+    let (status, body) =
+        outcome.expect("broadcast did not respond within 1s — it waited for the slow provider");
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["result"].as_u64(),
+        Some(111),
+        "should return the fast provider's response"
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "broadcast took {elapsed:?}; expected first-success well under 1s"
+    );
+}
+
+/// CONTRACT: ParallelRace is documented to return the fastest success. It routes
+/// reads through the broadcast path, so a read (`getSlot`) raced across a fast and
+/// a 5 s-degraded provider must return the fast result well under 1 s — the same
+/// early-return property, on the read path.
+#[tokio::test]
+async fn parallel_race_returns_first_success_not_slowest() {
+    let (url_fast, _abort_fast) =
+        start_mock(Router::new().route("/", post(|| async { slot_response(111) }))).await;
+    let (url_slow, _abort_slow) = start_slow_mock(222, Duration::from_secs(5)).await;
+
+    let cfg = test_config(
+        &[("fast", &url_fast), ("slow", &url_slow)],
+        RoutingStrategy::ParallelRace,
+        0,
+        5,
+    );
+    let state = ProxyState::new(cfg);
+    let router = build_router(state);
+
+    let started = std::time::Instant::now();
+    let outcome =
+        tokio::time::timeout(Duration::from_secs(1), proxy_request(router, GET_SLOT)).await;
+    let elapsed = started.elapsed();
+
+    let (status, body) = outcome
+        .expect("ParallelRace did not respond within 1s — it waited for the slowest provider");
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"].as_u64(), Some(111));
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "ParallelRace took {elapsed:?}; expected first-success well under 1s"
+    );
+}
+
+/// CONTRACT: a non-retryable upstream 4xx (e.g. a revoked key → 401) must be
+/// surfaced to the client as that status, not masked as HTTP 200. Chosen
+/// semantics: pass the provider status code through to the client.
+///
+/// Single provider, no retry — there is nowhere to fail over, so the client must
+/// simply see the 401 (and the provider is scored as an error, not healthy).
+#[tokio::test]
+async fn upstream_4xx_status_passed_through_not_200() {
+    let mock = Router::new().route(
+        "/",
+        post(|| async { (StatusCode::UNAUTHORIZED, r#"{"error":"invalid api key"}"#) }),
+    );
+    let (url, _abort) = start_mock(mock).await;
+
+    let cfg = test_config(&[("a", &url)], RoutingStrategy::FailoverOrdered, 0, 5);
+    let state = ProxyState::new(cfg);
+    let router = build_router(state);
+
+    let (status, _body) = proxy_request(router, GET_SLOT).await;
+
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "upstream 401 must pass through, not be masked as 200"
     );
 }

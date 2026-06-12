@@ -147,11 +147,23 @@ impl Metrics {
         }))
     }
 
-    pub fn record_request(&self, method: &str, provider: &str, status: &str, latency_ms: f64) {
+    /// Record one forwarded request. `count` is the number of JSON-RPC calls it
+    /// represents — 1 for a single request, the element count for a batch — so a
+    /// 1000-call batch increments the counter by 1000 (provider-billed volume),
+    /// while the latency histogram still gets a single observation for the one
+    /// round trip.
+    pub fn record_request(
+        &self,
+        method: &str,
+        provider: &str,
+        status: &str,
+        latency_ms: f64,
+        count: u64,
+    ) {
         self.0
             .requests
             .with_label_values(&[method, provider, status])
-            .inc();
+            .inc_by(count as f64);
         if status == "ok" {
             self.0
                 .duration
@@ -217,9 +229,9 @@ mod tests {
     #[test]
     fn counter_increments_correctly() {
         let m = Metrics::new();
-        m.record_request("getSlot", "helius", "ok", 42.0);
-        m.record_request("getSlot", "helius", "ok", 58.0);
-        m.record_request("getSlot", "triton", "error", 0.0);
+        m.record_request("getSlot", "helius", "ok", 42.0, 1);
+        m.record_request("getSlot", "helius", "ok", 58.0, 1);
+        m.record_request("getSlot", "triton", "error", 0.0, 1);
 
         let text = m.render();
         assert!(text.contains(
@@ -231,9 +243,23 @@ mod tests {
     }
 
     #[test]
+    fn batch_count_weights_the_counter() {
+        let m = Metrics::new();
+        // One batch of 1000 getTransaction calls = one round trip, 1000 calls.
+        m.record_request("getTransaction", "helius", "ok", 42.0, 1000);
+
+        let text = m.render();
+        assert!(text.contains(
+            "rpc_plane_requests_total{method=\"getTransaction\",provider=\"helius\",status=\"ok\"} 1000"
+        ));
+        // Single latency observation despite the 1000-call weight.
+        assert!(text.contains("rpc_plane_request_duration_seconds_count{method=\"getTransaction\",provider=\"helius\"} 1"));
+    }
+
+    #[test]
     fn histogram_emits_buckets_and_sum() {
         let m = Metrics::new();
-        m.record_request("getSlot", "helius", "ok", 42.0);
+        m.record_request("getSlot", "helius", "ok", 42.0, 1);
 
         let text = m.render();
         // Prometheus histogram emits _bucket, _sum, _count lines.
@@ -245,7 +271,7 @@ mod tests {
     #[test]
     fn duration_not_observed_for_errors() {
         let m = Metrics::new();
-        m.record_request("getSlot", "helius", "error", 100.0);
+        m.record_request("getSlot", "helius", "error", 100.0, 1);
 
         let text = m.render();
         // No duration lines should appear when no successful requests recorded.
