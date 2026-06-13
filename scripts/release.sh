@@ -21,6 +21,23 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
   exit 1
 fi
 
+# Releases must be cut from the tip of main so the tag is reachable from main's
+# history. Tagging a feature branch publishes unmerged work and leaves the tag
+# dangling off main.
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+if [[ "$BRANCH" != "main" ]]; then
+  echo "error: releases must be tagged from 'main' (currently on '$BRANCH')" >&2
+  echo "       merge your work first, then: git checkout main && git pull" >&2
+  exit 1
+fi
+
+echo "Fetching origin/main ..."
+git fetch --quiet origin main
+if [[ "$(git rev-parse @)" != "$(git rev-parse '@{u}')" ]]; then
+  echo "error: local main differs from origin/main — run 'git pull' first" >&2
+  exit 1
+fi
+
 if git rev-parse "$TAG" &>/dev/null; then
   echo "error: tag $TAG already exists" >&2
   exit 1
@@ -38,7 +55,6 @@ git add Cargo.toml Cargo.lock
 git commit -m "chore: release ${TAG}"
 git tag "${TAG}"
 
-BRANCH=$(git rev-parse --abbrev-ref HEAD)
 echo ""
 echo "Created commit and tag ${TAG} on ${BRANCH}."
 echo "Pushing ..."
