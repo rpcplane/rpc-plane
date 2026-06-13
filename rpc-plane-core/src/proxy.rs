@@ -169,7 +169,9 @@ async fn handle_metrics(State(state): State<ProxyState>) -> impl IntoResponse {
 
 async fn handle_rpc(State(state): State<ProxyState>, headers: HeaderMap, body: Bytes) -> Response {
     let request_id = Uuid::new_v4();
-    let method = extract_method(&body).unwrap_or_else(|| "unknown".to_string());
+    // `call_count` is the number of JSON-RPC calls (batch size) — used to weight
+    // metrics/telemetry so a 1000-call batch is billed as 1000, not 1.
+    let (method, call_count) = extract_method(&body).unwrap_or_else(|| ("unknown".to_string(), 1));
 
     let config = state.current_config();
     let snapshots = state.monitor.snapshots();
@@ -181,30 +183,34 @@ async fn handle_rpc(State(state): State<ProxyState>, headers: HeaderMap, body: B
         config.routing.broadcast_writes,
     );
 
+    let ctx = RequestCtx {
+        method: &method,
+        headers: &headers,
+        body: &body,
+        request_id,
+        count: call_count,
+    };
+
     if decision.broadcast {
-        broadcast(
-            &state,
-            &config,
-            &decision.providers,
-            &method,
-            &headers,
-            &body,
-            request_id,
-        )
-        .await
+        broadcast(&state, &config, &decision.providers, ctx).await
     } else {
-        sequential(
-            &state,
-            &config,
-            &decision.providers,
-            &method,
-            &headers,
-            &body,
-            request_id,
-        )
-        .await
+        sequential(&state, &config, &decision.providers, ctx).await
     }
 }
+
+/// Per-request routing context shared by the sequential and broadcast paths.
+/// Bundled so the hot-path fns keep a small, stable signature as fields grow.
+struct RequestCtx<'a> {
+    method: &'a str,
+    headers: &'a HeaderMap,
+    body: &'a Bytes,
+    request_id: Uuid,
+    /// JSON-RPC call count (batch size) — weights metrics/telemetry.
+    count: u64,
+}
+
+/// Result of one provider forward: (provider name, Ok(status, body) | Err(msg), latency_ms).
+type ForwardOutcome = (Arc<str>, Result<(u16, Bytes), String>, f64);
 
 // ── Sequential (reads + failover) ────────────────────────────────────────────
 
@@ -212,11 +218,15 @@ async fn sequential(
     state: &ProxyState,
     config: &Config,
     providers: &[Arc<str>],
-    method: &str,
-    headers: &HeaderMap,
-    body: &Bytes,
-    request_id: Uuid,
+    ctx: RequestCtx<'_>,
 ) -> Response {
+    let RequestCtx {
+        method,
+        headers,
+        body,
+        request_id,
+        count,
+    } = ctx;
     let max_attempts = (config.routing.max_retries + 1).min(providers.len());
     let mut prev_failed: Option<(Arc<str>, &'static str)> = None; // (name, reason)
 
@@ -248,7 +258,36 @@ async fn sequential(
         let latency_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         match result {
-            Ok(bytes) => {
+            Ok((status, bytes)) => {
+                // Non-2xx that wasn't retryable (retryable HTTP already became an
+                // Err above): a permanent provider error such as a revoked-key 401.
+                // Record it as an error so health scoring reflects real traffic, and
+                // pass the status through to the client instead of replying 200.
+                // Do not fail over — it is non-retryable by construction.
+                if !(200..300).contains(&status) {
+                    warn!(
+                        request_id = %request_id,
+                        provider = %name,
+                        method,
+                        attempt,
+                        status,
+                        "upstream non-2xx, passing status through"
+                    );
+                    state
+                        .metrics
+                        .record_request(method, name, "error", latency_ms, count);
+                    state
+                        .reporter
+                        .record_request(method, name, "error", latency_ms, count);
+                    state.monitor.record(name, false, latency_ms);
+                    return (
+                        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                        [("content-type", "application/json")],
+                        bytes,
+                    )
+                        .into_response();
+                }
+
                 if let Some(code) = extract_rpc_error_code(&bytes) {
                     if is_retryable_rpc_code(code) && attempt + 1 < max_attempts {
                         warn!(
@@ -261,10 +300,10 @@ async fn sequential(
                         );
                         state
                             .metrics
-                            .record_request(method, name, "error", latency_ms);
+                            .record_request(method, name, "error", latency_ms, count);
                         state
                             .reporter
-                            .record_request(method, name, "error", latency_ms);
+                            .record_request(method, name, "error", latency_ms, count);
                         state.monitor.record(name, false, latency_ms);
                         prev_failed = Some((name.clone(), "retryable_rpc_error"));
                         continue;
@@ -278,10 +317,12 @@ async fn sequential(
                     latency_ms = format!("{latency_ms:.1}"),
                     "request ok"
                 );
-                state.metrics.record_request(method, name, "ok", latency_ms);
+                state
+                    .metrics
+                    .record_request(method, name, "ok", latency_ms, count);
                 state
                     .reporter
-                    .record_request(method, name, "ok", latency_ms);
+                    .record_request(method, name, "ok", latency_ms, count);
                 state.monitor.record(name, true, latency_ms);
                 return (
                     StatusCode::OK,
@@ -301,10 +342,10 @@ async fn sequential(
                 );
                 state
                     .metrics
-                    .record_request(method, name, "error", latency_ms);
+                    .record_request(method, name, "error", latency_ms, count);
                 state
                     .reporter
-                    .record_request(method, name, "error", latency_ms);
+                    .record_request(method, name, "error", latency_ms, count);
                 state.monitor.record(name, false, latency_ms);
                 prev_failed = Some((name.clone(), "provider_error"));
             }
@@ -321,11 +362,15 @@ async fn broadcast(
     state: &ProxyState,
     config: &Config,
     providers: &[Arc<str>],
-    method: &str,
-    headers: &HeaderMap,
-    body: &Bytes,
-    request_id: Uuid,
+    ctx: RequestCtx<'_>,
 ) -> Response {
+    let RequestCtx {
+        method,
+        headers,
+        body,
+        request_id,
+        count,
+    } = ctx;
     if providers.is_empty() {
         return json_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -334,7 +379,7 @@ async fn broadcast(
         );
     }
 
-    let mut set: JoinSet<(Arc<str>, Result<Bytes, String>, f64)> = JoinSet::new();
+    let mut set: JoinSet<ForwardOutcome> = JoinSet::new();
 
     for name in providers {
         let Some(provider) = config
@@ -360,19 +405,16 @@ async fn broadcast(
         });
     }
 
-    let mut first_success: Option<Bytes> = None;
-
+    // Return on the FIRST 2xx success rather than draining the whole JoinSet —
+    // otherwise client latency tracks the slowest provider, defeating the entire
+    // point of broadcast/ParallelRace. Stragglers are handed to a detached task
+    // (below) so every provider's outcome still feeds metrics and health scoring.
     while let Some(res) = set.join_next().await {
         match res {
-            Ok((name, Ok(bytes), latency_ms)) => {
-                state
-                    .metrics
-                    .record_request(method, &name, "ok", latency_ms);
-                state
-                    .reporter
-                    .record_request(method, &name, "ok", latency_ms);
-                state.monitor.record(&name, true, latency_ms);
-                if first_success.is_none() {
+            Ok((name, Ok((status, bytes)), latency_ms)) => {
+                let success = (200..300).contains(&status);
+                record_broadcast_outcome(state, method, &name, success, latency_ms, count);
+                if success {
                     info!(
                         request_id = %request_id,
                         provider = %name,
@@ -380,18 +422,19 @@ async fn broadcast(
                         latency_ms = format!("{latency_ms:.1}"),
                         "broadcast first success"
                     );
-                    first_success = Some(bytes);
+                    spawn_straggler_drain(state, method, request_id, count, set);
+                    return (
+                        StatusCode::OK,
+                        [("content-type", "application/json")],
+                        bytes,
+                    )
+                        .into_response();
                 }
+                warn!(request_id = %request_id, provider = %name, method, status, "broadcast provider non-2xx");
             }
             Ok((name, Err(e), latency_ms)) => {
                 warn!(request_id = %request_id, provider = %name, method, error = %e, "broadcast provider failed");
-                state
-                    .metrics
-                    .record_request(method, &name, "error", latency_ms);
-                state
-                    .reporter
-                    .record_request(method, &name, "error", latency_ms);
-                state.monitor.record(&name, false, latency_ms);
+                record_broadcast_outcome(state, method, &name, false, latency_ms, count);
             }
             Err(e) => {
                 warn!(request_id = %request_id, error = %e, "broadcast task panicked");
@@ -399,18 +442,67 @@ async fn broadcast(
         }
     }
 
-    match first_success {
-        Some(bytes) => (
-            StatusCode::OK,
-            [("content-type", "application/json")],
-            bytes,
-        )
-            .into_response(),
-        None => {
-            error!(%request_id, method, "all broadcast providers failed");
-            json_error_response(StatusCode::BAD_GATEWAY, -32603, "all providers failed")
+    // Reached only when no provider produced a 2xx — every outcome was already
+    // recorded synchronously above.
+    error!(%request_id, method, "all broadcast providers failed");
+    json_error_response(StatusCode::BAD_GATEWAY, -32603, "all providers failed")
+}
+
+/// Record one broadcast provider outcome across metrics, telemetry, and health.
+fn record_broadcast_outcome(
+    state: &ProxyState,
+    method: &str,
+    name: &str,
+    success: bool,
+    latency_ms: f64,
+    count: u64,
+) {
+    let status = if success { "ok" } else { "error" };
+    state
+        .metrics
+        .record_request(method, name, status, latency_ms, count);
+    state
+        .reporter
+        .record_request(method, name, status, latency_ms, count);
+    state.monitor.record(name, success, latency_ms);
+}
+
+/// Drain the remaining in-flight broadcast tasks in the background after the
+/// client has already been answered, so late providers still feed metrics and
+/// health. Clones only the cheap Arc-backed handles off `ProxyState`; the
+/// JoinSet is moved in and owns everything it needs ('static).
+fn spawn_straggler_drain(
+    state: &ProxyState,
+    method: &str,
+    request_id: Uuid,
+    count: u64,
+    mut set: JoinSet<ForwardOutcome>,
+) {
+    let metrics = state.metrics.clone();
+    let reporter = state.reporter.clone();
+    let monitor = state.monitor.clone();
+    let method = method.to_string();
+    tokio::spawn(async move {
+        while let Some(res) = set.join_next().await {
+            let (name, success, latency_ms) = match res {
+                Ok((name, Ok((status, _)), latency_ms)) => {
+                    (name, (200..300).contains(&status), latency_ms)
+                }
+                Ok((name, Err(e), latency_ms)) => {
+                    warn!(request_id = %request_id, provider = %name, error = %e, "broadcast straggler failed");
+                    (name, false, latency_ms)
+                }
+                Err(e) => {
+                    warn!(request_id = %request_id, error = %e, "broadcast straggler task panicked");
+                    continue;
+                }
+            };
+            let status = if success { "ok" } else { "error" };
+            metrics.record_request(&method, &name, status, latency_ms, count);
+            reporter.record_request(&method, &name, status, latency_ms, count);
+            monitor.record(&name, success, latency_ms);
         }
-    }
+    });
 }
 
 // ── HTTP forwarding ───────────────────────────────────────────────────────────
@@ -420,7 +512,7 @@ async fn forward(
     provider: &ProviderConfig,
     incoming_headers: &HeaderMap,
     body: &Bytes,
-) -> anyhow::Result<Bytes> {
+) -> anyhow::Result<(u16, Bytes)> {
     let mut builder = client
         .post(&provider.url)
         .header("content-type", "application/json")
@@ -439,10 +531,14 @@ async fn forward(
     let resp = builder.body(body.clone()).send().await?;
     let status = resp.status().as_u16();
     let bytes = resp.bytes().await?;
+    // Retryable statuses (429/5xx) become an Err so the caller fails over to the
+    // next provider. Every other status — including non-retryable 4xx like a
+    // revoked-key 401 — is returned with its code so the caller can pass it
+    // through to the client and score it correctly, instead of masking it as 200.
     if is_retryable_http(status) {
         anyhow::bail!("provider returned HTTP {status}");
     }
-    Ok(bytes)
+    Ok((status, bytes))
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -454,20 +550,56 @@ struct MethodField<'a> {
     method: Option<&'a str>,
 }
 
-pub fn extract_method(body: &[u8]) -> Option<String> {
+/// Max distinct method names rendered into a batch label before the remainder is
+/// collapsed into a `+N` suffix.
+const MAX_BATCH_LABEL_METHODS: usize = 5;
+/// Hard ceiling on the rendered method label (a Prometheus label value and a
+/// telemetry-aggregator map key). Defensive against pathologically long names.
+const MAX_METHOD_LABEL_LEN: usize = 128;
+
+/// Returns the (bounded method label, JSON-RPC call count) for a request body.
+/// A single request is one call; a batch's call count is the number of
+/// method-bearing elements. The label is bounded so a large/varied batch can't
+/// mint a giant, unbounded-cardinality metrics label / aggregator key (the raw
+/// `join(",")` let a 1000-element batch produce a ~15 KB never-evicted key); the
+/// count weights metrics/telemetry so that batch is billed as its true volume.
+pub fn extract_method(body: &[u8]) -> Option<(String, u64)> {
     let first = body.iter().find(|&&b| !b.is_ascii_whitespace())?;
     if *first == b'{' {
         // Single request: parse only the method field, skip everything else.
         let req: MethodField<'_> = serde_json::from_slice(body).ok()?;
-        return req.method.map(|m| m.to_owned());
+        return req.method.map(|m| (m.to_owned(), 1));
     }
-    // Batch request.
+    // Batch request. Dedup method names (first-seen order), render up to
+    // MAX_BATCH_LABEL_METHODS distinct names, collapse the rest into `+N`. A
+    // homogeneous batch of 1000 `getTransaction` therefore labels as
+    // `getTransaction` — identical to the single request, so dashboards group
+    // them — while `count` carries the real 1000-call volume.
     let arr: Vec<MethodField<'_>> = serde_json::from_slice(body).ok()?;
-    let methods: Vec<&str> = arr.iter().filter_map(|r| r.method).collect();
-    if methods.is_empty() {
+    let mut uniques: Vec<&str> = Vec::new();
+    let mut calls: u64 = 0;
+    for m in arr.iter().filter_map(|r| r.method) {
+        calls += 1;
+        if !uniques.contains(&m) {
+            uniques.push(m);
+        }
+    }
+    if uniques.is_empty() {
         return None;
     }
-    Some(methods.join(","))
+    let shown = uniques.len().min(MAX_BATCH_LABEL_METHODS);
+    let mut label = uniques[..shown].join(",");
+    if uniques.len() > shown {
+        label.push_str(&format!("+{}", uniques.len() - shown));
+    }
+    if label.len() > MAX_METHOD_LABEL_LEN {
+        let mut end = MAX_METHOD_LABEL_LEN;
+        while !label.is_char_boundary(end) {
+            end -= 1;
+        }
+        label.truncate(end);
+    }
+    Some((label, calls))
 }
 
 fn json_error_response(status: StatusCode, code: i64, message: &str) -> Response {
@@ -490,7 +622,7 @@ mod tests {
     fn extract_method_works() {
         assert_eq!(
             extract_method(br#"{"jsonrpc":"2.0","id":1,"method":"getSlot"}"#),
-            Some("getSlot".to_string())
+            Some(("getSlot".to_string(), 1))
         );
     }
 
@@ -505,12 +637,55 @@ mod tests {
     }
 
     #[test]
-    fn extract_method_batch_array_joins_methods() {
+    fn extract_method_batch_distinct_methods_kept() {
         let batch = br#"[{"jsonrpc":"2.0","id":1,"method":"getSlot"},{"jsonrpc":"2.0","id":2,"method":"getBalance"}]"#;
         assert_eq!(
             extract_method(batch),
-            Some("getSlot,getBalance".to_string())
+            Some(("getSlot,getBalance".to_string(), 2))
         );
+    }
+
+    #[test]
+    fn extract_method_homogeneous_batch_collapses_to_single_label() {
+        // 1000× getTransaction: label collapses to the bare method (matching a
+        // single request so dashboards group them), count carries the volume.
+        let one = r#"{"jsonrpc":"2.0","id":1,"method":"getTransaction"}"#;
+        let batch = format!("[{}]", vec![one; 1000].join(","));
+        let (label, count) = extract_method(batch.as_bytes()).unwrap();
+        assert_eq!(label, "getTransaction");
+        assert_eq!(count, 1000);
+        // The label is bounded regardless of batch size.
+        assert!(label.len() <= MAX_METHOD_LABEL_LEN);
+    }
+
+    #[test]
+    fn extract_method_many_distinct_methods_capped_with_suffix() {
+        // 8 distinct methods → first 5 rendered, remainder collapsed to `+3`.
+        let methods = [
+            "getSlot",
+            "getBalance",
+            "getAccountInfo",
+            "getBlock",
+            "getTransaction",
+            "getSignatureStatuses",
+            "getEpochInfo",
+            "getVersion",
+        ];
+        let body = format!(
+            "[{}]",
+            methods
+                .iter()
+                .enumerate()
+                .map(|(i, m)| format!(r#"{{"jsonrpc":"2.0","id":{i},"method":"{m}"}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let (label, count) = extract_method(body.as_bytes()).unwrap();
+        assert_eq!(
+            label,
+            "getSlot,getBalance,getAccountInfo,getBlock,getTransaction+3"
+        );
+        assert_eq!(count, 8);
     }
 
     #[test]

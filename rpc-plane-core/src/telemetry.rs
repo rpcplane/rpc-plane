@@ -55,9 +55,20 @@ pub trait Reporter: Send + Sync {
     /// Emit a raw event (Failover, Divergence, ProviderHealth). Must never block.
     fn emit(&self, event: TelemetryEvent);
 
-    /// Record a single request outcome into the aggregate accumulator.
-    /// Default implementation is a no-op (used by NoopReporter).
-    fn record_request(&self, _method: &str, _provider: &str, _status: &str, _latency_ms: f64) {}
+    /// Record a single request outcome into the aggregate accumulator. `count`
+    /// is the number of JSON-RPC calls the request represents (1 for a single
+    /// request, the batch element count otherwise) so aggregate `count` reflects
+    /// provider-billed call volume, while latency stats use the one round-trip
+    /// sample. Default implementation is a no-op (used by NoopReporter).
+    fn record_request(
+        &self,
+        _method: &str,
+        _provider: &str,
+        _status: &str,
+        _latency_ms: f64,
+        _count: u64,
+    ) {
+    }
 
     /// Signal the reporter to flush any buffered events. Fire-and-forget.
     fn flush(&self);
@@ -83,8 +94,18 @@ struct Aggregator {
 
 struct AggState {
     // key: (method, provider, status)
-    buckets: HashMap<(String, String, String), Vec<f64>>,
+    buckets: HashMap<(String, String, String), Bucket>,
     window_start_ms: u64,
+}
+
+/// One aggregation bucket. `count` is provider-billed call volume (batch-weighted
+/// and may exceed `latencies.len()`); `latencies` holds one sample per round trip,
+/// so a 1000-call batch contributes 1000 to `count` but a single latency sample —
+/// keeping percentiles meaningful and the Vec bounded.
+#[derive(Default)]
+struct Bucket {
+    count: u64,
+    latencies: Vec<f64>,
 }
 
 impl Aggregator {
@@ -97,12 +118,14 @@ impl Aggregator {
         }
     }
 
-    fn record(&self, method: &str, provider: &str, status: &str, latency_ms: f64) {
+    fn record(&self, method: &str, provider: &str, status: &str, latency_ms: f64, count: u64) {
         let mut s = self.state.lock().unwrap();
-        s.buckets
+        let bucket = s
+            .buckets
             .entry((method.to_string(), provider.to_string(), status.to_string()))
-            .or_default()
-            .push(latency_ms);
+            .or_default();
+        bucket.count += count;
+        bucket.latencies.push(latency_ms);
     }
 
     /// Drain all buckets into `RequestAggregate` events and reset the window.
@@ -114,11 +137,16 @@ impl Aggregator {
         let events = s
             .buckets
             .drain()
-            .filter(|(_, v)| !v.is_empty())
-            .map(|((method, provider, status), mut latencies)| {
+            .filter(|(_, b)| !b.latencies.is_empty())
+            .map(|((method, provider, status), bucket)| {
+                let Bucket {
+                    count,
+                    mut latencies,
+                } = bucket;
                 let sum: f64 = latencies.iter().sum();
-                let count = latencies.len() as u64;
-                let latency_avg_ms = sum / count as f64;
+                // Average over latency samples (round trips), not the call-weighted
+                // `count`, so a batch's single sample isn't divided by its call volume.
+                let latency_avg_ms = sum / latencies.len() as f64;
                 latencies.sort_unstable_by(|a, b| a.total_cmp(b));
                 TelemetryEvent::RequestAggregate {
                     window_start_ms: window_start,
@@ -196,8 +224,16 @@ impl Reporter for RemoteReporter {
         let _ = self.tx.try_send(event);
     }
 
-    fn record_request(&self, method: &str, provider: &str, status: &str, latency_ms: f64) {
-        self.aggregator.record(method, provider, status, latency_ms);
+    fn record_request(
+        &self,
+        method: &str,
+        provider: &str,
+        status: &str,
+        latency_ms: f64,
+        count: u64,
+    ) {
+        self.aggregator
+            .record(method, provider, status, latency_ms, count);
     }
 
     fn flush(&self) {
@@ -298,7 +334,7 @@ mod tests {
         Mutex,
     };
 
-    type RequestLog = Arc<Mutex<Vec<(String, String, String, f64)>>>;
+    type RequestLog = Arc<Mutex<Vec<(String, String, String, f64, u64)>>>;
 
     struct RecordingReporter {
         events: Arc<Mutex<Vec<TelemetryEvent>>>,
@@ -329,12 +365,20 @@ mod tests {
         fn emit(&self, event: TelemetryEvent) {
             self.events.lock().unwrap().push(event);
         }
-        fn record_request(&self, method: &str, provider: &str, status: &str, latency_ms: f64) {
+        fn record_request(
+            &self,
+            method: &str,
+            provider: &str,
+            status: &str,
+            latency_ms: f64,
+            count: u64,
+        ) {
             self.requests.lock().unwrap().push((
                 method.to_string(),
                 provider.to_string(),
                 status.to_string(),
                 latency_ms,
+                count,
             ));
         }
         fn flush(&self) {
@@ -350,7 +394,7 @@ mod tests {
             to_provider: "b".into(),
             reason: "test".into(),
         });
-        r.record_request("getSlot", "helius", "ok", 1.0);
+        r.record_request("getSlot", "helius", "ok", 1.0, 1);
         r.flush();
         // no panic = pass
     }
@@ -363,7 +407,7 @@ mod tests {
             to_provider: "b".into(),
             reason: "test".into(),
         });
-        reporter.record_request("getSlot", "helius", "ok", 12.5);
+        reporter.record_request("getSlot", "helius", "ok", 12.5, 1);
         reporter.flush();
 
         assert_eq!(events.lock().unwrap().len(), 1);
@@ -407,7 +451,7 @@ mod tests {
         let agg = Aggregator::new();
         // 100 samples: 1.0, 2.0, ..., 100.0
         for i in 1..=100 {
-            agg.record("getSlot", "helius", "ok", i as f64);
+            agg.record("getSlot", "helius", "ok", i as f64, 1);
         }
         let events = agg.drain();
         assert_eq!(events.len(), 1);
@@ -432,9 +476,33 @@ mod tests {
     }
 
     #[test]
+    fn batch_weighted_count_keeps_single_latency_sample() {
+        let agg = Aggregator::new();
+        // One batch of 1000 getTransaction calls: 1000 to count, one 200ms sample.
+        agg.record("getTransaction", "helius", "ok", 200.0, 1000);
+        let events = agg.drain();
+        assert_eq!(events.len(), 1);
+        if let TelemetryEvent::RequestAggregate {
+            count,
+            latency_avg_ms,
+            latency_p50_ms,
+            ..
+        } = &events[0]
+        {
+            // Call volume is weighted by batch size...
+            assert_eq!(*count, 1000);
+            // ...but latency is the one round-trip sample, not 200/1000.
+            assert_eq!(*latency_avg_ms, 200.0);
+            assert_eq!(*latency_p50_ms, 200.0);
+        } else {
+            panic!("expected RequestAggregate");
+        }
+    }
+
+    #[test]
     fn aggregator_drain_resets_window() {
         let agg = Aggregator::new();
-        agg.record("getSlot", "helius", "ok", 10.0);
+        agg.record("getSlot", "helius", "ok", 10.0, 1);
         let first = agg.drain();
         assert_eq!(first.len(), 1);
         // second drain with no new data should be empty
@@ -445,10 +513,10 @@ mod tests {
     #[test]
     fn aggregator_buckets_by_key() {
         let agg = Aggregator::new();
-        agg.record("getSlot", "helius", "ok", 10.0);
-        agg.record("getSlot", "quicknode", "ok", 20.0);
-        agg.record("getBalance", "helius", "ok", 5.0);
-        agg.record("getSlot", "helius", "error", 100.0);
+        agg.record("getSlot", "helius", "ok", 10.0, 1);
+        agg.record("getSlot", "quicknode", "ok", 20.0, 1);
+        agg.record("getBalance", "helius", "ok", 5.0, 1);
+        agg.record("getSlot", "helius", "error", 100.0, 1);
         let events = agg.drain();
         assert_eq!(events.len(), 4);
     }
