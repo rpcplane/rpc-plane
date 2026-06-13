@@ -189,6 +189,22 @@ async fn run(config_path: PathBuf) -> Result<()> {
 }
 
 async fn check(config_path: PathBuf) -> Result<()> {
+    // Re-expand the raw file first so we can flag references to unset env vars
+    // (e.g. a typo'd `${HELIUS_API_KY}`) that silently collapse to empty and
+    // would otherwise show up only as runtime 401s.
+    if let Ok(raw) = std::fs::read_to_string(&config_path) {
+        let (_, unset_vars) = rpc_plane_core::config::expand_env_vars(&raw);
+        for var in &unset_vars {
+            println!(
+                "[WARN] environment variable `${var}` is unset — it expanded to an empty \
+                 string; any provider URL using it is missing that value"
+            );
+        }
+        if !unset_vars.is_empty() {
+            println!();
+        }
+    }
+
     let config = rpc_plane_core::config::Config::load(&config_path)?;
     println!(
         "Config OK — {} provider(s) configured\n",
@@ -361,13 +377,28 @@ async fn watch_config(
             }
         };
 
-        // Snapshot old provider map for diffing.
-        let old_providers: HashMap<String, String> = config
-            .read()
-            .providers
-            .iter()
-            .map(|p| (p.name.clone(), p.url.clone()))
-            .collect();
+        // Snapshot old config for diffing (clone out so we don't hold the lock).
+        let (old_providers, old_server) = {
+            let old = config.read();
+            let providers: HashMap<String, rpc_plane_core::config::ProviderConfig> = old
+                .providers
+                .iter()
+                .map(|p| (p.name.clone(), p.clone()))
+                .collect();
+            (providers, old.server.clone())
+        };
+
+        // pool_max_idle_per_host feeds every outbound client, so a change forces
+        // a full client rebuild — otherwise the new pool size never takes effect.
+        let pool_size_changed =
+            old_server.pool_max_idle_per_host != new_config.server.pool_max_idle_per_host;
+        if pool_size_changed {
+            info!(
+                old = old_server.pool_max_idle_per_host,
+                new = new_config.server.pool_max_idle_per_host,
+                "hot reload: pool_max_idle_per_host changed — rebuilding all provider clients"
+            );
+        }
 
         let new_providers: HashMap<String, _> = new_config
             .providers
@@ -384,43 +415,42 @@ async fn watch_config(
             }
         }
 
-        // Added providers + URL-changed providers (treat as remove then add).
+        // Added providers + providers whose client inputs changed. The reqwest
+        // client is rebuilt whenever its inputs change: the URL, the `http3`
+        // flag, or the global pool size. weight is routing-only and is picked up
+        // live when the config swaps below, so it needs no rebuild.
         for (name, new_p) in &new_providers {
-            match old_providers.get(name) {
-                Some(old_url) if old_url == &new_p.url => {
-                    // Unchanged — keep existing health state.
-                }
-                Some(_) => {
-                    clients.write().remove(name);
-                    monitor.remove_provider(name);
-                    let client = Arc::new(rpc_plane_core::proxy::build_client(
-                        new_p,
-                        new_config.server.pool_max_idle_per_host,
-                    ));
-                    clients.write().insert(name.clone(), client.clone());
-                    monitor.add_provider(client, new_p.clone());
-                    info!(provider = %name, "hot reload: provider URL updated");
-                }
-                None => {
-                    let client = Arc::new(rpc_plane_core::proxy::build_client(
-                        new_p,
-                        new_config.server.pool_max_idle_per_host,
-                    ));
-                    clients.write().insert(name.clone(), client.clone());
-                    monitor.add_provider(client, new_p.clone());
-                    info!(provider = %name, "hot reload: provider added");
-                }
+            let Some(reason) =
+                client_rebuild_reason(old_providers.get(name), new_p, pool_size_changed)
+            else {
+                continue; // client inputs unchanged — keep existing health state
+            };
+
+            // Rebuild = remove-then-add for an existing provider; plain add otherwise.
+            if old_providers.contains_key(name) {
+                clients.write().remove(name);
+                monitor.remove_provider(name);
             }
+            let client = Arc::new(rpc_plane_core::proxy::build_client(
+                new_p,
+                new_config.server.pool_max_idle_per_host,
+            ));
+            clients.write().insert(name.clone(), client.clone());
+            monitor.add_provider(client, new_p.clone());
+            info!(provider = %name, reason, "hot reload: provider client (re)built");
         }
 
-        // Warn about settings that require a restart.
+        // Warn about settings that need a restart to take effect (the runtime
+        // and listening sockets are already built).
+        if old_server.listen != new_config.server.listen
+            || old_server.metrics_listen != new_config.server.metrics_listen
+            || old_server.listen_backlog != new_config.server.listen_backlog
+            || old_server.worker_threads != new_config.server.worker_threads
         {
-            let old = config.read();
-            if old.server.listen != new_config.server.listen
-                || old.server.metrics_listen != new_config.server.metrics_listen
-            {
-                warn!("server.listen / metrics_listen changed — restart required to take effect");
-            }
+            warn!(
+                "a restart-only server setting changed (listen / metrics_listen / \
+                 listen_backlog / worker_threads) — restart required to take effect"
+            );
         }
 
         *config.write() = Arc::new(new_config);
@@ -430,6 +460,24 @@ async fn watch_config(
 
 fn mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Decide whether a provider's outbound reqwest client must be rebuilt on hot
+/// reload. Returns a short human-readable reason, or `None` when none of the
+/// client's inputs (URL, `http3`, or the global pool size) changed. `weight` is
+/// deliberately excluded: it only affects routing, which reads the live config.
+fn client_rebuild_reason(
+    old: Option<&rpc_plane_core::config::ProviderConfig>,
+    new: &rpc_plane_core::config::ProviderConfig,
+    pool_size_changed: bool,
+) -> Option<&'static str> {
+    match old {
+        None => Some("added"),
+        Some(_) if pool_size_changed => Some("pool size changed"),
+        Some(o) if o.url != new.url => Some("URL updated"),
+        Some(o) if o.http3 != new.http3 => Some("http3 toggled"),
+        Some(_) => None,
+    }
 }
 
 // ── Networking helpers ────────────────────────────────────────────────────────
@@ -539,5 +587,72 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => info!("received Ctrl+C"),
         _ = terminate => info!("received SIGTERM"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rpc_plane_core::config::ProviderConfig;
+
+    fn provider(url: &str, http3: bool) -> ProviderConfig {
+        ProviderConfig {
+            name: "p".to_string(),
+            url: url.to_string(),
+            weight: 1,
+            http3,
+        }
+    }
+
+    #[test]
+    fn rebuild_when_provider_added() {
+        let new = provider("http://a", false);
+        assert_eq!(client_rebuild_reason(None, &new, false), Some("added"));
+    }
+
+    #[test]
+    fn no_rebuild_when_inputs_unchanged() {
+        let old = provider("http://a", false);
+        let new = provider("http://a", false);
+        assert_eq!(client_rebuild_reason(Some(&old), &new, false), None);
+    }
+
+    #[test]
+    fn rebuild_when_http3_toggled() {
+        let old = provider("http://a", false);
+        let new = provider("http://a", true);
+        assert_eq!(
+            client_rebuild_reason(Some(&old), &new, false),
+            Some("http3 toggled")
+        );
+    }
+
+    #[test]
+    fn rebuild_when_url_changed() {
+        let old = provider("http://a", false);
+        let new = provider("http://b", false);
+        assert_eq!(
+            client_rebuild_reason(Some(&old), &new, false),
+            Some("URL updated")
+        );
+    }
+
+    #[test]
+    fn rebuild_all_when_pool_size_changed() {
+        // Identical provider, but a global pool-size change forces a rebuild.
+        let old = provider("http://a", false);
+        let new = provider("http://a", false);
+        assert_eq!(
+            client_rebuild_reason(Some(&old), &new, true),
+            Some("pool size changed")
+        );
+    }
+
+    #[test]
+    fn weight_change_alone_does_not_rebuild() {
+        let old = provider("http://a", false);
+        let mut new = provider("http://a", false);
+        new.weight = 99;
+        assert_eq!(client_rebuild_reason(Some(&old), &new, false), None);
     }
 }

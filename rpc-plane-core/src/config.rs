@@ -20,7 +20,13 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read config: {}", path.display()))?;
-        let expanded = expand_env_vars(&raw);
+        let (expanded, unset_vars) = expand_env_vars(&raw);
+        for var in &unset_vars {
+            tracing::warn!(
+                "config references unset environment variable `${{{var}}}`; it expanded \
+                 to an empty string — any provider URL using it is now missing that value"
+            );
+        }
         let config: Config = toml::from_str(&expanded)
             .with_context(|| format!("failed to parse config: {}", path.display()))?;
         config.validate()?;
@@ -32,8 +38,14 @@ impl Config {
             !self.providers.is_empty(),
             "config must have at least one [[providers]] entry"
         );
+        let mut seen = std::collections::HashSet::new();
         for p in &self.providers {
             anyhow::ensure!(!p.url.is_empty(), "provider '{}' has an empty url", p.name);
+            anyhow::ensure!(
+                seen.insert(p.name.as_str()),
+                "duplicate provider name '{}'; provider names must be unique",
+                p.name
+            );
         }
         if let Some(r) = &self.reporting {
             anyhow::ensure!(
@@ -51,13 +63,24 @@ impl Config {
     }
 }
 
-fn expand_env_vars(input: &str) -> String {
-    // shellexpand handles both ${VAR} and $VAR, leaving unset variables as
-    // empty strings rather than erroring (same behaviour as before).
-    shellexpand::env_with_context_no_errors(input, |var| {
-        Some(std::env::var(var).unwrap_or_default())
+/// Expand `${VAR}` / `$VAR` references against the process environment.
+///
+/// Unset variables expand to an empty string (preserving prior behaviour) but
+/// their names are collected and returned, sorted and de-duplicated, so callers
+/// can warn about likely typos that would otherwise silently produce a broken
+/// URL (e.g. `${HELIUS_API_KY}` → `...?api-key=`). Configs that hardcode the
+/// full URL+token reference no variables and so report nothing.
+pub fn expand_env_vars(input: &str) -> (String, Vec<String>) {
+    use std::cell::RefCell;
+    let unset: RefCell<std::collections::BTreeSet<String>> = RefCell::new(Default::default());
+    let expanded = shellexpand::env_with_context_no_errors(input, |var| {
+        Some(std::env::var(var).unwrap_or_else(|_| {
+            unset.borrow_mut().insert(var.to_string());
+            String::new()
+        }))
     })
-    .into_owned()
+    .into_owned();
+    (expanded, unset.into_inner().into_iter().collect())
 }
 
 // ── Server ─────────────────────────────────────────────────────────────────
@@ -353,6 +376,44 @@ url = ""
 "#,
         );
         assert!(Config::load(f.path()).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_provider_names() {
+        let f = write_config(
+            r#"
+[[providers]]
+name = "helius"
+url = "http://localhost:8899"
+
+[[providers]]
+name = "helius"
+url = "http://localhost:8900"
+"#,
+        );
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(err.contains("duplicate provider name"), "got: {err}");
+        assert!(err.contains("helius"), "got: {err}");
+    }
+
+    #[test]
+    fn expand_env_vars_reports_unset_references() {
+        let (expanded, unset) =
+            expand_env_vars("url = \"https://rpc.example/?api-key=${RPC_PLANE_DEFINITELY_UNSET}\"");
+        assert_eq!(expanded, "url = \"https://rpc.example/?api-key=\"");
+        assert_eq!(unset, vec!["RPC_PLANE_DEFINITELY_UNSET".to_string()]);
+    }
+
+    #[test]
+    fn expand_env_vars_reports_nothing_when_hardcoded() {
+        // A fully hardcoded URL+token references no variables → no warnings.
+        let (expanded, unset) =
+            expand_env_vars("url = \"https://rpc.example/?api-key=hardcoded-token\"");
+        assert_eq!(
+            expanded,
+            "url = \"https://rpc.example/?api-key=hardcoded-token\""
+        );
+        assert!(unset.is_empty());
     }
 
     #[test]
