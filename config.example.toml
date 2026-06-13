@@ -3,6 +3,7 @@ listen         = "127.0.0.1:9400"
 metrics_listen = "127.0.0.1:9401"
 # listen_backlog        = 4096   # OS TCP backlog; raise net.core.somaxconn too for 1000+ concurrency
 # pool_max_idle_per_host = 512   # idle outbound connections per provider; set >= peak concurrency
+# worker_threads        = 4      # Tokio worker threads; defaults to logical CPU count (restart to change)
 
 # ── Health scoring ─────────────────────────────────────────────────────────────
 [health]
@@ -33,7 +34,7 @@ max_retries      = 2               # retry on next-best provider on transient er
 name   = "helius"
 url    = "https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}"
 weight = 1
-http3  = true
+http3  = true   # experimental HTTP/3 (QUIC); falls back to HTTP/2 — see docs caveat
 
 [[providers]]
 name   = "quicknode"

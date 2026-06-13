@@ -27,3 +27,34 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: test
         run: cargo test --all
+
+  docs-coverage:
+    name: Docs coverage
+    runs-on: ubuntu-latest
+    # The docs live in the private rpcplane/docs repo. Checking it out needs a
+    # token with read access, exposed as the DOCS_REPO_TOKEN secret. That secret
+    # is unavailable to fork PRs (and may be unset), so this job skips cleanly
+    # rather than failing when it can't reach the docs.
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Detect docs token
+        id: docs
+        env:
+          DOCS_REPO_TOKEN: ${{ secrets.DOCS_REPO_TOKEN }}
+        run: |
+          if [ -n "$DOCS_REPO_TOKEN" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::DOCS_REPO_TOKEN not set — skipping config docs-coverage check"
+          fi
+      - name: Checkout docs
+        if: steps.docs.outputs.available == 'true'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: rpcplane/docs
+          token: ${{ secrets.DOCS_REPO_TOKEN }}
+          path: _docs
+      - name: Verify every config field is documented
+        if: steps.docs.outputs.available == 'true'
+        run: ./scripts/check-docs-coverage.sh _docs/docs/configuration.md
