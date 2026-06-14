@@ -88,6 +88,7 @@ fn test_config(
                 url: url.to_string(),
                 weight: 1,
                 http3: false,
+                methods: None,
             })
             .collect(),
         reporting: None,
@@ -465,12 +466,14 @@ async fn circuit_recovers_traffic_resumes() {
                 url: url_a,
                 weight: 1,
                 http3: false,
+                methods: None,
             },
             ProviderConfig {
                 name: "b".into(),
                 url: url_b,
                 weight: 1,
                 http3: false,
+                methods: None,
             },
         ],
         reporting: None,

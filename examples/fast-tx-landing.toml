@@ -1,0 +1,62 @@
+# Fast transaction landing
+#
+# Maximises the probability (and speed) of landing a transaction by racing
+# sendTransaction across general RPC providers AND a submission-only landing
+# service, returning the fastest valid success.
+#
+# How it works:
+#   - broadcast_writes = true fans every write method out to all healthy
+#     providers simultaneously; the first 2xx wins, stragglers are drained in
+#     the background for health/metrics. Duplicate sends are harmless — Solana
+#     deduplicates by signature.
+#   - The "landing-service" provider is scoped with `methods = ["sendTransaction"]`.
+#     It only ever receives sendTransaction, so the reads in your app still route
+#     to the general providers and never hit an endpoint that can't serve them.
+#   - Submission-only providers can't answer the getSlot health probe, so the
+#     proxy skips probing them and scores their health from live send outcomes
+#     (the circuit still opens if sends keep failing).
+#
+# simulateTransaction is read-only and NOT broadcast here — it routes like a
+# read. Fast landing skips preflight anyway (skipPreflight = true), so there's
+# no simulation in the hot path. If you do want it broadcast, add it to
+# write_methods below.
+#
+# Usage:
+#   export HELIUS_API_KEY=...
+#   export TRITON_API_KEY=...
+#   export LANDING_API_KEY=...
+#   rpc-plane -c examples/fast-tx-landing.toml run
+
+[server]
+listen         = "127.0.0.1:9400"
+metrics_listen = "127.0.0.1:9401"
+
+[health]
+interval_ms             = 500    # probe general providers often
+slot_drift_threshold    = 3      # never route reads to a stale node
+circuit_open_failures   = 3      # fail fast
+circuit_cooldown_secs   = 10     # recover quickly
+
+[routing]
+strategy         = "best_score"          # reads go to the freshest provider
+max_retries      = 3
+broadcast_writes = true                  # race writes across every provider that supports them
+# write_methods  = ["sendTransaction"]   # default; add "simulateTransaction" to broadcast it too
+
+# General-purpose providers — serve reads and participate in the send race.
+[[providers]]
+name   = "helius"
+url    = "https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}"
+weight = 1
+
+[[providers]]
+name   = "triton"
+url    = "https://your-pool.rpcpool.com/${TRITON_API_KEY}"
+weight = 1
+
+# Submission-only landing service — only ever receives sendTransaction.
+# (e.g. circular.fi / a staked-connection gateway — see https://docs.circular.fi)
+[[providers]]
+name    = "landing-service"
+url     = "https://fast.example/api/submit?api-key=${LANDING_API_KEY}"
+methods = ["sendTransaction"]

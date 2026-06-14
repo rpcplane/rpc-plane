@@ -13,10 +13,16 @@ pub enum MethodClass {
     Write,
 }
 
-pub fn classify(method: &str) -> MethodClass {
-    match method {
-        "sendTransaction" | "simulateTransaction" => MethodClass::Write,
-        _ => MethodClass::Read,
+/// Classify a method as a read or write given the configured write-method list.
+///
+/// The list is operator-controlled (`routing.write_methods`); it defaults to
+/// `sendTransaction` + `simulateTransaction` so simulations route on the fast
+/// write path, but it can be overridden to add or remove methods.
+pub fn classify(method: &str, write_methods: &[String]) -> MethodClass {
+    if write_methods.iter().any(|m| m == method) {
+        MethodClass::Write
+    } else {
+        MethodClass::Read
     }
 }
 
@@ -68,16 +74,34 @@ pub fn route(
     strategy: &RoutingStrategy,
     providers: &[ProviderConfig],
     broadcast_writes: bool,
+    write_methods: &[String],
 ) -> RouteDecision {
-    let class = classify(method);
+    let class = classify(method, write_methods);
 
-    let mut available: Vec<&HealthSnapshot> =
-        snapshots.iter().filter(|s| s.is_available()).collect();
+    // A provider serves this request only if its optional `methods` allowlist
+    // permits the method (unrestricted providers permit everything).
+    let supports = |name: &Arc<str>| {
+        providers
+            .iter()
+            .find(|p| p.name.as_str() == name.as_ref())
+            .is_none_or(|p| p.supports(method))
+    };
+
+    let mut available: Vec<&HealthSnapshot> = snapshots
+        .iter()
+        .filter(|s| s.is_available() && supports(&s.name))
+        .collect();
 
     if available.is_empty() {
-        // All circuits open: try every provider anyway — degraded but not dead.
+        // No healthy provider serves this method. Fall back to every provider
+        // that *supports* it, even circuit-open — degraded but not dead. If none
+        // support it (misconfiguration), the list is empty and the proxy errors.
         return RouteDecision {
-            providers: snapshots.iter().map(|s| s.name.clone()).collect(),
+            providers: snapshots
+                .iter()
+                .filter(|s| supports(&s.name))
+                .map(|s| s.name.clone())
+                .collect(),
             broadcast: broadcast_writes && class == MethodClass::Write,
         };
     }
@@ -223,12 +247,28 @@ mod tests {
                 url: "http://x".to_string(),
                 weight: 1,
                 http3: false,
+                methods: None,
             })
             .collect()
     }
 
     fn names(d: &RouteDecision) -> Vec<&str> {
         d.providers.iter().map(|p| p.as_ref()).collect()
+    }
+
+    /// Like `providers`, but restricts `name` to a single method (submit-only).
+    fn providers_scoped(names: &[&str], scoped: &str, method: &str) -> Vec<ProviderConfig> {
+        let mut p = providers(names);
+        for cfg in &mut p {
+            if cfg.name == scoped {
+                cfg.methods = Some(vec![method.to_string()]);
+            }
+        }
+        p
+    }
+
+    fn writes() -> Vec<String> {
+        vec!["sendTransaction".into(), "simulateTransaction".into()]
     }
 
     #[test]
@@ -240,6 +280,7 @@ mod tests {
             &RoutingStrategy::BestScore,
             &providers(&["a", "b", "c"]),
             false,
+            &writes(),
         );
         assert_eq!(&*d.providers[0], "a");
         assert_eq!(&*d.providers[1], "b");
@@ -255,6 +296,7 @@ mod tests {
             &RoutingStrategy::BestScore,
             &providers(&["a", "b"]),
             false,
+            &writes(),
         );
         assert!(!d.broadcast);
         assert_eq!(&*d.providers[0], "a");
@@ -269,6 +311,7 @@ mod tests {
             &RoutingStrategy::BestScore,
             &providers(&["a", "b"]),
             true,
+            &writes(),
         );
         assert!(d.broadcast);
         assert_eq!(d.providers.len(), 2);
@@ -283,6 +326,7 @@ mod tests {
             &RoutingStrategy::BestScore,
             &providers(&["a", "b", "c"]),
             false,
+            &writes(),
         );
         assert!(!d.providers.iter().any(|p| p.as_ref() == "b"));
     }
@@ -296,6 +340,7 @@ mod tests {
             &RoutingStrategy::BestScore,
             &providers(&["a", "b", "c"]),
             true,
+            &writes(),
         );
         assert!(!d.providers.iter().any(|p| p.as_ref() == "b"));
         assert_eq!(d.providers.len(), 2);
@@ -310,6 +355,7 @@ mod tests {
             &RoutingStrategy::BestScore,
             &providers(&["a", "b"]),
             false,
+            &writes(),
         );
         assert_eq!(d.providers.len(), 2);
     }
@@ -324,21 +370,32 @@ mod tests {
             &RoutingStrategy::FailoverOrdered,
             &cfg,
             false,
+            &writes(),
         );
         assert_eq!(names(&d), ["c", "a", "b"]);
     }
 
     #[test]
     fn classify_write_methods() {
-        assert_eq!(classify("sendTransaction"), MethodClass::Write);
-        assert_eq!(classify("simulateTransaction"), MethodClass::Write);
+        let w = writes();
+        assert_eq!(classify("sendTransaction", &w), MethodClass::Write);
+        assert_eq!(classify("simulateTransaction", &w), MethodClass::Write);
     }
 
     #[test]
     fn classify_read_methods() {
-        assert_eq!(classify("getSlot"), MethodClass::Read);
-        assert_eq!(classify("getAccountInfo"), MethodClass::Read);
-        assert_eq!(classify("getBalance"), MethodClass::Read);
+        let w = writes();
+        assert_eq!(classify("getSlot", &w), MethodClass::Read);
+        assert_eq!(classify("getAccountInfo", &w), MethodClass::Read);
+        assert_eq!(classify("getBalance", &w), MethodClass::Read);
+    }
+
+    #[test]
+    fn classify_honors_custom_write_list() {
+        // Drop simulateTransaction so simulations route like reads.
+        let w = vec!["sendTransaction".to_string()];
+        assert_eq!(classify("simulateTransaction", &w), MethodClass::Read);
+        assert_eq!(classify("sendTransaction", &w), MethodClass::Write);
     }
 
     #[test]
@@ -387,6 +444,7 @@ mod tests {
             &RoutingStrategy::ParallelRace,
             &providers(&["a", "b"]),
             false,
+            &writes(),
         );
         assert!(d.broadcast);
         assert_eq!(names(&d), ["a", "b"]);
@@ -401,9 +459,78 @@ mod tests {
             &RoutingStrategy::BestScore,
             &providers(&["a", "b"]),
             false,
+            &writes(),
         );
         assert_eq!(names(&d), ["b"]);
         assert!(!d.broadcast);
+    }
+
+    #[test]
+    fn submit_only_provider_excluded_from_reads() {
+        // "send" only supports sendTransaction; a read must not route to it.
+        let snaps = vec![snap("read", 0.9), snap("send", 0.95)];
+        let cfg = providers_scoped(&["read", "send"], "send", "sendTransaction");
+        let d = route(
+            "getSlot",
+            &snaps,
+            &RoutingStrategy::BestScore,
+            &cfg,
+            true,
+            &writes(),
+        );
+        assert_eq!(names(&d), ["read"]);
+        assert!(!d.broadcast);
+    }
+
+    #[test]
+    fn submit_only_provider_included_in_write_broadcast() {
+        let snaps = vec![snap("read", 0.9), snap("send", 0.95)];
+        let cfg = providers_scoped(&["read", "send"], "send", "sendTransaction");
+        let d = route(
+            "sendTransaction",
+            &snaps,
+            &RoutingStrategy::BestScore,
+            &cfg,
+            true,
+            &writes(),
+        );
+        assert!(d.broadcast);
+        let mut got = names(&d);
+        got.sort_unstable();
+        assert_eq!(got, ["read", "send"]);
+    }
+
+    #[test]
+    fn unsupported_method_yields_no_providers() {
+        // Only provider is submit-only; a read it can't serve routes nowhere.
+        let snaps = vec![snap("send", 0.95)];
+        let cfg = providers_scoped(&["send"], "send", "sendTransaction");
+        let d = route(
+            "getAccountInfo",
+            &snaps,
+            &RoutingStrategy::BestScore,
+            &cfg,
+            true,
+            &writes(),
+        );
+        assert!(d.providers.is_empty());
+    }
+
+    #[test]
+    fn submit_only_provider_used_when_others_open() {
+        // All circuits open: fall back to providers that support the method only.
+        let snaps = vec![snap_open("read"), snap_open("send")];
+        let cfg = providers_scoped(&["read", "send"], "send", "sendTransaction");
+        let d = route(
+            "getSlot",
+            &snaps,
+            &RoutingStrategy::BestScore,
+            &cfg,
+            true,
+            &writes(),
+        );
+        // getSlot can't go to the submit-only provider even in the degraded path.
+        assert_eq!(names(&d), ["read"]);
     }
 
     #[test]
