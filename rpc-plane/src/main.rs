@@ -601,6 +601,7 @@ mod tests {
             url: url.to_string(),
             weight: 1,
             http3,
+            methods: None,
         }
     }
 

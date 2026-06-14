@@ -27,7 +27,9 @@ w_success = 0.1
 # best_score | weighted_random | failover_ordered | parallel_race
 strategy         = "best_score"
 max_retries      = 2               # retry on next-best provider on transient errors
-# broadcast_writes = false         # fan out sendTransaction to all providers
+# broadcast_writes = false         # fan out write methods to all providers
+# write_methods    = ["sendTransaction"]  # methods routed as writes (default: sendTransaction
+                                          # only; add "simulateTransaction" to broadcast it too)
 
 # ── Providers ──────────────────────────────────────────────────────────────────
 [[providers]]
@@ -46,6 +48,15 @@ name   = "triton"
 url    = "https://your-pool.rpcpool.com/${TRITON_API_KEY}"
 weight = 1
 http3  = true
+
+# Submission-only provider (e.g. a transaction-landing service). `methods`
+# scopes it to the calls it supports, so it never receives reads it can't
+# answer. Such providers are health-tracked from live request outcomes, not
+# the getSlot probe. See examples/fast-tx-landing.toml.
+# [[providers]]
+# name    = "landing-service"
+# url     = "https://fast.example/api/submit"
+# methods = ["sendTransaction"]
 
 # ── Telemetry reporting ────────────────────────────────────────────────────────
 # Presence of this block enables RemoteReporter. Absence keeps Prometheus-only mode.

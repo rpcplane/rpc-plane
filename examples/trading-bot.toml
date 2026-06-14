@@ -3,14 +3,15 @@
 # Tuned for workloads that need to land transactions fast and reliably.
 #
 # Key differences from the default config:
-#   - All writes (sendTransaction) broadcast to every healthy provider
+#   - Writes (sendTransaction) broadcast to every healthy provider
 #   - Tighter health probe interval — faster detection of degraded providers
 #   - Tighter slot drift threshold — never route to a stale node
 #   - Faster circuit breaker — fail fast and failover
 #   - Reads use best_score — always go to the freshest provider
 #
-# This is the default write behaviour (broadcast is always on), but the
-# tighter health settings ensure you're broadcasting to only the best nodes.
+# Broadcasting writes is opt-in (off by default); broadcast_writes = true below
+# turns it on, and the tighter health settings keep the broadcast set to the
+# best nodes.
 #
 # Usage:
 #   export HELIUS_API_KEY=...
@@ -37,8 +38,9 @@ w_slot    = 0.4
 w_success = 0.1
 
 [routing]
-strategy    = "best_score"   # reads go to the freshest provider
-max_retries = 3              # retry aggressively on reads
+strategy         = "best_score"   # reads go to the freshest provider
+max_retries      = 3              # retry aggressively on reads
+broadcast_writes = true           # fan out sendTransaction to every healthy provider
 
 [[providers]]
 name   = "helius"

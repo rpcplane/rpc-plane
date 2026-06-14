@@ -181,6 +181,7 @@ async fn handle_rpc(State(state): State<ProxyState>, headers: HeaderMap, body: B
         &config.routing.strategy,
         &config.providers,
         config.routing.broadcast_writes,
+        &config.routing.write_methods,
     );
 
     let ctx = RequestCtx {

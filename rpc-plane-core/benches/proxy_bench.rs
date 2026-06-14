@@ -28,6 +28,7 @@ fn prov(name: &str) -> ProviderConfig {
         url: "http://localhost:9090".to_string(),
         weight: 1,
         http3: false,
+        methods: None,
     }
 }
 
@@ -50,6 +51,10 @@ fn bench_route(c: &mut Criterion) {
         snap("alchemy", 0.5),
     ];
     let providers = vec![prov("helius"), prov("quicknode"), prov("alchemy")];
+    let writes = vec![
+        "sendTransaction".to_string(),
+        "simulateTransaction".to_string(),
+    ];
 
     let mut g = c.benchmark_group("route");
     g.bench_function("best_score/3_providers", |b| {
@@ -60,6 +65,7 @@ fn bench_route(c: &mut Criterion) {
                 black_box(&RoutingStrategy::BestScore),
                 black_box(&providers),
                 false,
+                black_box(&writes),
             )
         })
     });
@@ -71,6 +77,7 @@ fn bench_route(c: &mut Criterion) {
                 black_box(&RoutingStrategy::WeightedRandom),
                 black_box(&providers),
                 false,
+                black_box(&writes),
             )
         })
     });
@@ -82,6 +89,7 @@ fn bench_route(c: &mut Criterion) {
                 black_box(&RoutingStrategy::BestScore),
                 black_box(&providers),
                 true,
+                black_box(&writes),
             )
         })
     });

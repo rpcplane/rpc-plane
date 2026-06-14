@@ -402,6 +402,19 @@ async fn health_loop(
     metrics: Metrics,
     stop: Arc<AtomicBool>,
 ) {
+    // Submit-only providers (e.g. a transaction-landing service scoped to
+    // `methods = ["sendTransaction"]`) can't answer the getSlot probe. Skip the
+    // probe loop for them; their health is driven entirely by real request
+    // outcomes recorded on the routing path.
+    if !provider.supports("getSlot") {
+        debug!(
+            provider = %provider.name,
+            "health probe skipped (provider does not support getSlot); \
+             health tracked via live request outcomes"
+        );
+        return;
+    }
+
     let interval = Duration::from_millis(cfg.interval_ms);
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -660,6 +673,7 @@ mod tests {
             url: "http://127.0.0.1:1".to_string(),
             weight: 1,
             http3: false,
+            methods: None,
         };
         let monitor = HealthMonitor::new(
             std::slice::from_ref(&provider),
@@ -690,6 +704,7 @@ mod tests {
             url: "http://localhost:8899".to_string(),
             weight: 1,
             http3: false,
+            methods: None,
         };
         // We don't call add_provider here (needs real HTTP) — just verify map ops
         {

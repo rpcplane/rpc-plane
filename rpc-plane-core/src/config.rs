@@ -46,7 +46,26 @@ impl Config {
                 "duplicate provider name '{}'; provider names must be unique",
                 p.name
             );
+            if let Some(methods) = &p.methods {
+                anyhow::ensure!(
+                    !methods.is_empty(),
+                    "provider '{}' has an empty methods list; omit the key to serve all methods",
+                    p.name
+                );
+                anyhow::ensure!(
+                    methods.iter().all(|m| !m.trim().is_empty()),
+                    "provider '{}' has an empty entry in methods",
+                    p.name
+                );
+            }
         }
+        anyhow::ensure!(
+            self.routing
+                .write_methods
+                .iter()
+                .all(|m| !m.trim().is_empty()),
+            "routing.write_methods must not contain empty entries"
+        );
         if let Some(r) = &self.reporting {
             anyhow::ensure!(
                 !r.endpoint.is_empty(),
@@ -234,10 +253,15 @@ pub struct RoutingConfig {
     /// Maximum provider retries on retryable errors (per request).
     #[serde(default = "default_max_retries")]
     pub max_retries: usize,
-    /// Broadcast sendTransaction / simulateTransaction to all healthy providers
-    /// simultaneously. Off by default — writes are routed like reads.
+    /// Broadcast write methods to all healthy providers simultaneously. Off by
+    /// default — writes are routed like reads (sequential failover).
     #[serde(default)]
     pub broadcast_writes: bool,
+    /// JSON-RPC methods treated as writes. Defaults to `sendTransaction` and
+    /// `simulateTransaction` so simulations route on the fast write path; override
+    /// to reclassify (e.g. drop `simulateTransaction` to route it like a read).
+    #[serde(default = "default_write_methods")]
+    pub write_methods: Vec<String>,
 }
 
 impl Default for RoutingConfig {
@@ -246,12 +270,20 @@ impl Default for RoutingConfig {
             strategy: RoutingStrategy::default(),
             max_retries: default_max_retries(),
             broadcast_writes: false,
+            write_methods: default_write_methods(),
         }
     }
 }
 
 fn default_max_retries() -> usize {
     2
+}
+
+fn default_write_methods() -> Vec<String> {
+    // simulateTransaction is read-only (no on-chain mutation) and is not in the
+    // fast-landing path, so it routes like a read by default. Add it here to have
+    // it broadcast under broadcast_writes.
+    vec!["sendTransaction".to_string()]
 }
 
 // ── Providers ───────────────────────────────────────────────────────────────
@@ -265,6 +297,25 @@ pub struct ProviderConfig {
     /// Use HTTP/3 (QUIC) for outbound connections to this provider.
     #[serde(default)]
     pub http3: bool,
+    /// Restrict this provider to a specific set of JSON-RPC methods. When unset
+    /// (the default) the provider serves every method. Set it to scope a
+    /// submission-only endpoint (e.g. a transaction-landing service that only
+    /// supports `sendTransaction`) so it never receives reads it can't answer —
+    /// `methods = ["sendTransaction"]`. Health-probed only if `getSlot` is in the
+    /// list; otherwise health is driven by real request outcomes.
+    #[serde(default)]
+    pub methods: Option<Vec<String>>,
+}
+
+impl ProviderConfig {
+    /// Whether this provider is allowed to serve `method`. Unrestricted
+    /// providers (no `methods` list) serve everything.
+    pub fn supports(&self, method: &str) -> bool {
+        match &self.methods {
+            Some(list) if !list.is_empty() => list.iter().any(|m| m == method),
+            _ => true,
+        }
+    }
 }
 
 fn default_weight() -> u32 {
@@ -394,6 +445,59 @@ url = "http://localhost:8900"
         let err = Config::load(f.path()).unwrap_err().to_string();
         assert!(err.contains("duplicate provider name"), "got: {err}");
         assert!(err.contains("helius"), "got: {err}");
+    }
+
+    #[test]
+    fn default_write_methods_is_send_only() {
+        let f = write_config(
+            r#"
+[[providers]]
+name = "p"
+url = "http://localhost:8899"
+"#,
+        );
+        let cfg = Config::load(f.path()).unwrap();
+        assert_eq!(
+            cfg.routing.write_methods,
+            vec!["sendTransaction".to_string()]
+        );
+    }
+
+    #[test]
+    fn parses_provider_methods_allowlist() {
+        let f = write_config(
+            r#"
+[[providers]]
+name = "general"
+url = "http://localhost:8899"
+
+[[providers]]
+name = "submit"
+url = "http://localhost:9000"
+methods = ["sendTransaction"]
+"#,
+        );
+        let cfg = Config::load(f.path()).unwrap();
+        let general = &cfg.providers[0];
+        let submit = &cfg.providers[1];
+        assert!(general.methods.is_none());
+        assert!(general.supports("getSlot"));
+        assert!(submit.supports("sendTransaction"));
+        assert!(!submit.supports("getSlot"));
+    }
+
+    #[test]
+    fn rejects_empty_methods_list() {
+        let f = write_config(
+            r#"
+[[providers]]
+name = "submit"
+url = "http://localhost:9000"
+methods = []
+"#,
+        );
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(err.contains("empty methods list"), "got: {err}");
     }
 
     #[test]
