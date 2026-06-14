@@ -90,10 +90,23 @@ impl Config {
 /// URL (e.g. `${HELIUS_API_KY}` → `...?api-key=`). Configs that hardcode the
 /// full URL+token reference no variables and so report nothing.
 pub fn expand_env_vars(input: &str) -> (String, Vec<String>) {
+    expand_env_vars_with(input, |var| std::env::var(var).ok())
+}
+
+/// Core of [`expand_env_vars`], parameterised over the variable lookup.
+///
+/// `lookup` resolves a variable name to its value (`None` = unset). Production
+/// passes a closure over the process environment; tests pass an in-memory map so
+/// they never mutate the shared process env (which would race under the parallel
+/// test runner).
+fn expand_env_vars_with(
+    input: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> (String, Vec<String>) {
     use std::cell::RefCell;
     let unset: RefCell<std::collections::BTreeSet<String>> = RefCell::new(Default::default());
     let expanded = shellexpand::env_with_context_no_errors(input, |var| {
-        Some(std::env::var(var).unwrap_or_else(|_| {
+        Some(lookup(var).unwrap_or_else(|| {
             unset.borrow_mut().insert(var.to_string());
             String::new()
         }))
@@ -538,18 +551,25 @@ methods = []
         }
     }
 
+    // The expansion logic is tested against an in-memory lookup rather than the
+    // process env: `std::env::set_var` mutates global state shared by every test
+    // in the binary, which races under the parallel runner.
+    fn lookup(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |var| map.get(var).cloned()
+    }
+
     #[test]
     fn expands_env_vars_braced() {
-        std::env::set_var("TEST_RPC_KEY", "abc123");
-        let f = write_config(
-            r#"
-[[providers]]
-name = "test"
-url = "https://rpc.example.com/?key=${TEST_RPC_KEY}"
-"#,
+        let (out, unset) = expand_env_vars_with(
+            "url = \"https://rpc.example.com/?key=${TEST_RPC_KEY}\"",
+            lookup(&[("TEST_RPC_KEY", "abc123")]),
         );
-        let cfg = Config::load(f.path()).unwrap();
-        assert_eq!(cfg.providers[0].url, "https://rpc.example.com/?key=abc123");
+        assert_eq!(out, "url = \"https://rpc.example.com/?key=abc123\"");
+        assert!(unset.is_empty());
     }
 
     #[test]
@@ -613,15 +633,34 @@ flush_interval_ms = 1000
 
     #[test]
     fn expands_env_vars_unbraced() {
-        std::env::set_var("TEST_UNBRACED_KEY", "xyz789");
+        let (out, unset) = expand_env_vars_with(
+            "url = \"https://rpc.example.com/?key=$TEST_UNBRACED_KEY\"",
+            lookup(&[("TEST_UNBRACED_KEY", "xyz789")]),
+        );
+        assert_eq!(out, "url = \"https://rpc.example.com/?key=xyz789\"");
+        assert!(unset.is_empty());
+    }
+
+    #[test]
+    fn unset_env_var_expands_empty_and_is_reported() {
+        let (out, unset) = expand_env_vars_with("url = \"http://x/${MISSING_VAR}\"", lookup(&[]));
+        assert_eq!(out, "url = \"http://x/\"");
+        assert_eq!(unset, vec!["MISSING_VAR".to_string()]);
+    }
+
+    // Proves the full load path applies env expansion. Uses a variable that is
+    // never set by any test (so it stays unset under parallel execution); the
+    // reference collapses to an empty string, leaving a valid non-empty URL.
+    #[test]
+    fn load_applies_env_expansion() {
         let f = write_config(
             r#"
 [[providers]]
 name = "test"
-url = "https://rpc.example.com/?key=$TEST_UNBRACED_KEY"
+url = "https://rpc.example.com/path${RPC_PLANE_UNSET_TEST_VAR}"
 "#,
         );
         let cfg = Config::load(f.path()).unwrap();
-        assert_eq!(cfg.providers[0].url, "https://rpc.example.com/?key=xyz789");
+        assert_eq!(cfg.providers[0].url, "https://rpc.example.com/path");
     }
 }

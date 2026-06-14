@@ -140,7 +140,7 @@ pub fn route(
                 .collect();
 
             let total: f64 = weights.iter().sum();
-            let roll = rand::thread_rng().gen::<f64>() * total;
+            let roll = rand::rng().random::<f64>() * total;
             let mut cum = 0.0;
             let mut primary = 0;
             for (i, w) in weights.iter().enumerate() {
