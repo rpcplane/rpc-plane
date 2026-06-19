@@ -88,7 +88,7 @@ url  = "https://your-pool.rpcpool.com/${TRITON_API_KEY}"
 
 Run `rpc-plane init` to generate a full config with all options and their defaults.
 
-See the [configuration reference](https://docs.rpcplane.dev/configuration) for every option.
+See the [configuration reference](https://docs.rpcplane.dev/configuration/) for every option.
 
 ## CLI
 
@@ -149,7 +149,7 @@ See the [`examples/`](examples/) directory:
 
 ## Architecture
 
-See the [architecture overview](https://docs.rpcplane.dev/architecture) for how routing decisions are made.
+See the [architecture overview](https://docs.rpcplane.dev/architecture/) for how routing decisions are made.
 
 ## License
 
