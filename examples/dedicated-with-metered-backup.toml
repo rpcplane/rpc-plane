@@ -1,0 +1,45 @@
+# Dedicated node + metered backup
+#
+# A dedicated node (self-hosted or reserved plan) handles all traffic.
+# A metered pay-per-call provider sits behind it as a safety net — it only
+# receives traffic when the primary circuit is open.
+#
+# Cost-control notes:
+#   - broadcast_writes is OFF (default). Writes go to the primary only.
+#     If the primary is down the backup receives them, but you won't be
+#     double-charged for every sendTransaction on a healthy day.
+#   - Tighten the circuit breaker so primary failures are detected in seconds,
+#     not the 30-second default. Faster failover = less error budget burned
+#     while the metered backup idles.
+#
+# Usage:
+#   export DEDICATED_URL=https://your-dedicated-node.example.com
+#   export QUICKNODE_API_KEY=...
+#   rpc-plane -c examples/dedicated-with-metered-backup.toml run
+
+[server]
+listen         = "127.0.0.1:9400"
+metrics_listen = "127.0.0.1:9401"
+
+[health]
+interval_ms             = 500   # probe twice per second — detect failure fast
+circuit_open_failures   = 3     # open after 3 consecutive failures (~1.5 s)
+circuit_error_threshold = 0.4   # or when error rate exceeds 40%
+circuit_cooldown_secs   = 15    # probe primary again after 15 s
+
+[routing]
+strategy         = "failover_ordered"  # primary first, always
+max_retries      = 1
+# broadcast_writes = false             # default — don't charge metered backup for writes
+
+# ── Tier 1: dedicated node ─────────────────────────────────────────────────────
+
+[[providers]]
+name = "dedicated"
+url  = "${DEDICATED_URL}"
+
+# ── Tier 2: metered backup ─────────────────────────────────────────────────────
+
+[[providers]]
+name = "quicknode-backup"
+url  = "https://your-endpoint.quiknode.pro/${QUICKNODE_API_KEY}"

@@ -1,0 +1,145 @@
+# RPC Plane — sidecar pattern over a Unix socket
+#
+# Runs the proxy as a sidecar container in your app's pod. The app and the
+# proxy share an emptyDir volume; the proxy listens on a Unix socket inside it,
+# so there is zero loopback TCP overhead and no network port for the proxy.
+#
+#   kubectl apply -f sidecar.yaml
+#
+# Socket permissions: both containers run as the same UID/GID (1000) via the
+# pod securityContext so the app can connect to the socket the proxy creates.
+# See https://docs.rpcplane.dev/guides/unix-socket/ for the full rationale.
+#
+# Heads up: many Solana client libraries can only dial a TCP URL, not an HTTP
+# Unix socket. If yours is one of them, switch to the in-pod TCP variant — set
+# listen = "127.0.0.1:9400" in the ConfigMap and point the app at
+# http://localhost:9400 (containers in a pod share localhost). See the commented
+# block at the bottom.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rpc-plane-keys
+type: Opaque
+stringData:
+  HELIUS_API_KEY: ""
+  QUICKNODE_API_KEY: ""
+  TRITON_API_KEY: ""
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rpc-plane-sidecar-config
+data:
+  rpc-plane.toml: |
+    [server]
+    listen         = "/run/rpc-plane/proxy.sock"   # Unix socket in the shared volume
+    metrics_listen = "0.0.0.0:9401"                # metrics always stay on TCP
+
+    [routing]
+    strategy    = "best_score"
+    max_retries = 2
+
+    [[providers]]
+    name   = "helius"
+    url    = "https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}"
+    weight = 1
+
+    [[providers]]
+    name   = "quicknode"
+    url    = "https://your-endpoint.quiknode.pro/${QUICKNODE_API_KEY}"
+    weight = 1
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+  labels:
+    app: my-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: my-app
+  template:
+    metadata:
+      labels:
+        app: my-app
+    spec:
+      # Same UID/GID for every container so the app can write to (connect to)
+      # the socket the proxy creates in the shared emptyDir.
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        # ── Your application ──────────────────────────────────────────────
+        - name: app
+          image: your-app:latest
+          # Point your Solana client at the socket. Exact form depends on your
+          # client/HTTP library (e.g. an http+unix URL, or socat-bridged).
+          env:
+            - name: RPC_SOCKET
+              value: /run/rpc-plane/proxy.sock
+          volumeMounts:
+            - name: rpc-plane-socket
+              mountPath: /run/rpc-plane
+
+        # ── RPC Plane sidecar ─────────────────────────────────────────────
+        - name: rpc-plane
+          image: ghcr.io/rpcplane/rpc-plane:latest
+          args: ["-c", "/etc/rpc-plane.toml", "run"]
+          envFrom:
+            - secretRef:
+                name: rpc-plane-keys
+          ports:
+            - name: metrics
+              containerPort: 9401
+          # The proxy is on a socket, which httpGet probes can't reach, so probe
+          # the metrics port (always TCP). The full /health JSON is on the socket.
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/rpc-plane.toml
+              subPath: rpc-plane.toml
+              readOnly: true
+            - name: rpc-plane-socket
+              mountPath: /run/rpc-plane
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true   # socket lives in the emptyDir, not rootfs
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+      volumes:
+        - name: config
+          configMap:
+            name: rpc-plane-sidecar-config
+        - name: rpc-plane-socket
+          emptyDir: {}
+
+# ── In-pod TCP variant (if your client can't speak Unix sockets) ──────────────
+# 1. In the ConfigMap, set:  listen = "127.0.0.1:9400"
+# 2. Drop the rpc-plane-socket volume + its two mounts.
+# 3. Add a containerPort 9400 to the sidecar and switch its probes to
+#    httpGet { path: /health, port: 9400 }.
+# 4. Point the app at http://localhost:9400.

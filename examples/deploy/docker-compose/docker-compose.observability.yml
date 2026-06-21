@@ -1,0 +1,40 @@
+# Observability overlay — Prometheus + Grafana, pre-wired to RPC Plane.
+#
+# Use together with the base file:
+#   docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d
+#
+# Then open:
+#   Grafana    http://localhost:3000   (anonymous admin, the RPC Plane dashboard
+#                                        is auto-provisioned)
+#   Prometheus http://localhost:9090
+#
+# The dashboard mounted here is the canonical one from the repo root
+# (../../../grafana/dashboard.json) so it stays in sync with releases.
+
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: rpc-plane-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - rpc-plane
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: rpc-plane-grafana
+    restart: unless-stopped
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../../../grafana/dashboard.json:/var/lib/grafana/dashboards/rpc-plane.json:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus

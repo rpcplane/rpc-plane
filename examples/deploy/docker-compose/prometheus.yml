@@ -1,0 +1,8 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: rpc-plane
+    # `rpc-plane` is the service name on the compose network; 9401 is metrics_listen.
+    static_configs:
+      - targets: ["rpc-plane:9401"]

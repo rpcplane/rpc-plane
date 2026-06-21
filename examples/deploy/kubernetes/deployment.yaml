@@ -1,0 +1,139 @@
+# RPC Plane — standalone Kubernetes Deployment (TCP)
+#
+# Runs the proxy as its own Deployment + ClusterIP Service. Apps in the cluster
+# point at http://rpc-plane:9400. Use this when several apps share one proxy.
+# For a per-pod sidecar (and a Unix socket), see sidecar.yaml.
+#
+#   kubectl apply -f deployment.yaml
+#
+# Keep the Service ClusterIP — RPC Plane is an internal component and should not
+# be exposed to the internet via a LoadBalancer or Ingress.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rpc-plane-keys
+type: Opaque
+stringData:
+  # Replace with real keys, or manage this Secret out-of-band (Sealed Secrets,
+  # External Secrets, SOPS, …) and drop it from this file.
+  HELIUS_API_KEY: ""
+  QUICKNODE_API_KEY: ""
+  TRITON_API_KEY: ""
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rpc-plane-config
+data:
+  rpc-plane.toml: |
+    [server]
+    listen         = "0.0.0.0:9400"
+    metrics_listen = "0.0.0.0:9401"
+
+    [routing]
+    strategy    = "best_score"
+    max_retries = 2
+
+    [[providers]]
+    name   = "helius"
+    url    = "https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}"
+    weight = 1
+
+    [[providers]]
+    name   = "quicknode"
+    url    = "https://your-endpoint.quiknode.pro/${QUICKNODE_API_KEY}"
+    weight = 1
+
+    [[providers]]
+    name   = "triton"
+    url    = "https://your-pool.rpcpool.com/${TRITON_API_KEY}"
+    weight = 1
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rpc-plane
+  labels:
+    app: rpc-plane
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: rpc-plane
+  template:
+    metadata:
+      labels:
+        app: rpc-plane
+    spec:
+      containers:
+        - name: rpc-plane
+          image: ghcr.io/rpcplane/rpc-plane:latest
+          args: ["-c", "/etc/rpc-plane.toml", "run"]
+          # Provider keys arrive as env vars; the ${VAR} refs in the config
+          # expand to them at startup.
+          envFrom:
+            - secretRef:
+                name: rpc-plane-keys
+          ports:
+            - name: rpc
+              containerPort: 9400
+            - name: metrics
+              containerPort: 9401
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: rpc
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: rpc
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/rpc-plane.toml
+              subPath: rpc-plane.toml
+              readOnly: true
+          # The proxy writes nothing to disk in TCP mode; relax these only if a
+          # future feature needs the filesystem.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+      volumes:
+        - name: config
+          configMap:
+            name: rpc-plane-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rpc-plane
+  labels:
+    app: rpc-plane
+spec:
+  type: ClusterIP
+  selector:
+    app: rpc-plane
+  ports:
+    - name: rpc
+      port: 9400
+      targetPort: rpc
+    - name: metrics
+      port: 9401
+      targetPort: metrics

@@ -147,6 +147,10 @@ See the [`examples/`](examples/) directory:
 - [`single-provider.toml`](examples/single-provider.toml) — single provider with health monitoring
 - [`trading-bot.toml`](examples/trading-bot.toml) — write-path optimized for transaction landing
 
+## Deployment
+
+Ready-to-apply manifests for Docker Compose, Kubernetes (shared Deployment and per-pod sidecar), Nomad, and systemd live in [`examples/deploy/`](examples/deploy/). The [deployment guide](https://docs.rpcplane.dev/guides/deployment/) walks through each, including when to listen on a TCP port vs a Unix socket.
+
 ## Architecture
 
 See the [architecture overview](https://docs.rpcplane.dev/architecture/) for how routing decisions are made.

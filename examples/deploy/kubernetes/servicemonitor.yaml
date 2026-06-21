@@ -1,0 +1,19 @@
+# Prometheus Operator ServiceMonitor for RPC Plane.
+#
+# Requires the Prometheus Operator (kube-prometheus-stack) in the cluster.
+# Scrapes the `metrics` port of the rpc-plane Service from deployment.yaml.
+# Adjust the namespace and the `release` label to match your Prometheus install.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: rpc-plane
+  labels:
+    release: kube-prometheus-stack   # must match your Prometheus serviceMonitorSelector
+spec:
+  selector:
+    matchLabels:
+      app: rpc-plane
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s

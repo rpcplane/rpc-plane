@@ -1,0 +1,36 @@
+# RPC Plane — Docker Compose (TCP)
+#
+# Runs the proxy as a single container, listening on a TCP port. Your app
+# points at http://<host>:9400 instead of its provider URL.
+#
+#   1. cp .env.example .env   # then fill in your provider API keys
+#   2. docker compose up -d
+#   3. curl http://localhost:9400/health | jq
+#
+# Add the observability stack (Prometheus + Grafana) with:
+#   docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d
+#
+# Listen mode: TCP port (see rpc-plane.toml). For a Unix socket instead, see
+# the deployment guide: https://docs.rpcplane.dev/guides/deployment/
+
+services:
+  rpc-plane:
+    image: ghcr.io/rpcplane/rpc-plane:latest
+    container_name: rpc-plane
+    restart: unless-stopped
+    # Provider API keys are read from .env and expanded by the ${VAR}
+    # references in rpc-plane.toml when the proxy loads its config.
+    env_file: .env
+    volumes:
+      - ./rpc-plane.toml:/etc/rpc-plane.toml:ro
+    ports:
+      - "9400:9400"   # proxy — point your app here
+      - "9401:9401"   # Prometheus metrics
+    # The runtime image ships only the rpc-plane binary (no curl/wget), so the
+    # healthcheck uses the built-in `status` command, which queries /health.
+    healthcheck:
+      test: ["CMD", "rpc-plane", "-c", "/etc/rpc-plane.toml", "status"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
