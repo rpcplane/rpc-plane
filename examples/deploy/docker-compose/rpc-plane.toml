@@ -1,0 +1,31 @@
+# RPC Plane config for the Docker Compose stack.
+#
+# Note the 0.0.0.0 binds: inside a container the proxy must listen on all
+# interfaces for the published port to work, and metrics must be reachable
+# from the Prometheus container on the compose network. Keep these ports
+# private — RPC Plane is an internal sidecar, not an internet-facing service.
+
+[server]
+listen         = "0.0.0.0:9400"
+metrics_listen = "0.0.0.0:9401"
+
+[routing]
+strategy    = "best_score"
+max_retries = 2
+# broadcast_writes = true   # fan out sendTransaction to every healthy provider
+
+# Fill in the providers you use. Keys come from .env via ${VAR} expansion.
+[[providers]]
+name   = "helius"
+url    = "https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}"
+weight = 1
+
+[[providers]]
+name   = "quicknode"
+url    = "https://your-endpoint.quiknode.pro/${QUICKNODE_API_KEY}"
+weight = 1
+
+[[providers]]
+name   = "triton"
+url    = "https://your-pool.rpcpool.com/${TRITON_API_KEY}"
+weight = 1

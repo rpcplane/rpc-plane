@@ -1,0 +1,57 @@
+# RPC Plane — systemd unit (bare metal / VM)
+#
+# Install:
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin rpc-plane
+#   sudo install -m 0755 rpc-plane /usr/local/bin/rpc-plane
+#   sudo mkdir -p /etc/rpc-plane
+#   sudo rpc-plane -c /etc/rpc-plane/rpc-plane.toml init   # then edit it
+#   sudo install -m 0640 -o rpc-plane -g rpc-plane rpc-plane.env.example /etc/rpc-plane/rpc-plane.env
+#   sudo cp rpc-plane.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now rpc-plane
+#
+# Listen mode: whatever your config says. For a Unix socket, set
+# listen = "/run/rpc-plane/proxy.sock" and uncomment RuntimeDirectory below —
+# systemd then creates /run/rpc-plane owned by the service user.
+
+[Unit]
+Description=RPC Plane — Solana RPC proxy
+Documentation=https://docs.rpcplane.dev
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rpc-plane
+Group=rpc-plane
+ExecStart=/usr/local/bin/rpc-plane -c /etc/rpc-plane/rpc-plane.toml run
+EnvironmentFile=/etc/rpc-plane/rpc-plane.env
+Restart=on-failure
+RestartSec=2
+
+# Unix socket mode: uncomment to have systemd create /run/rpc-plane (owned by
+# User/Group) for the socket file. ProtectSystem=strict already makes it the
+# only writable path the proxy needs.
+# RuntimeDirectory=rpc-plane
+# RuntimeDirectoryMode=0755
+
+# ── Hardening ────────────────────────────────────────────────────────────────
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target
