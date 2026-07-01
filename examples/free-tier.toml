@@ -51,7 +51,8 @@ weight = 1
 name   = "helius"
 url    = "https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}"
 weight = 1
-http3  = true
+# http3 = true   # opt-in QUIC. Can help on a lossy home/last-mile link, but there's no
+                 # HTTP/2 fallback — only enable if your endpoint serves QUIC. See docs.
 
 [[providers]]
 name   = "quicknode"
