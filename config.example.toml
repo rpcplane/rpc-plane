@@ -36,7 +36,9 @@ max_retries      = 2               # retry on next-best provider on transient er
 name   = "helius"
 url    = "https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}"
 weight = 1
-http3  = true   # experimental HTTP/3 (QUIC); falls back to HTTP/2 — see docs caveat
+http3  = true   # opt-in HTTP/3 (QUIC). No HTTP/2 fallback — only for endpoints you've
+                # confirmed serve QUIC. Rarely helps a warm DC pool; see docs "When to
+                # enable HTTP/3". Leave it off (the default) unless you're on a cold/lossy path.
 
 [[providers]]
 name   = "quicknode"
@@ -47,7 +49,7 @@ weight = 1
 name   = "triton"
 url    = "https://your-pool.rpcpool.com/${TRITON_API_KEY}"
 weight = 1
-http3  = true
+# http3 = true   # see the helius note above before enabling
 
 # Submission-only provider (e.g. a transaction-landing service). `methods`
 # scopes it to the calls it supports, so it never receives reads it can't
