@@ -713,6 +713,123 @@ async fn parallel_race_returns_first_success_not_slowest() {
     );
 }
 
+/// CONTRACT: on the broadcast path a leg is a success only on HTTP 2xx *and* a body
+/// with no JSON-RPC error. A `sendTransaction` that fails preflight returns HTTP 200
+/// with error -32002 and is the *fastest* leg precisely because it did no work — if
+/// that error won the race the client would see a failure, re-sign, and
+/// double-execute while a slower provider actually landed the tx. The slower real
+/// success must win.
+#[tokio::test]
+async fn broadcast_slower_success_beats_faster_preflight_error() {
+    // "err" answers immediately with a JSON-RPC preflight error (HTTP 200 + -32002).
+    // "ok" is slower but returns a real success.
+    let (url_err, _abort_err) = start_mock(Router::new().route(
+        "/",
+        post(|| async { rpc_error_response(-32002, "blockhash not found") }),
+    ))
+    .await;
+    let (url_ok, _abort_ok) = start_slow_mock(12345, Duration::from_millis(150)).await;
+
+    let mut cfg = test_config(
+        &[("err", &url_err), ("ok", &url_ok)],
+        RoutingStrategy::BestScore,
+        0,
+        5,
+    );
+    cfg.routing.broadcast_writes = true;
+    let state = ProxyState::new(cfg);
+    let router = build_router(state);
+
+    let (status, body) = proxy_request(router, SEND_TX).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body["error"].is_null(),
+        "must not return the fast preflight error — that causes re-sign/double-execute: {body}"
+    );
+    assert_eq!(
+        body["result"].as_u64(),
+        Some(12345),
+        "must return the landing provider's success"
+    );
+}
+
+/// CONTRACT: when every broadcast leg fails with a JSON-RPC error body, the proxy
+/// must surface a real upstream error (the -32002 preflight failure, which rides on
+/// HTTP 200) rather than masking it as a generic -32603 "all providers failed".
+#[tokio::test]
+async fn broadcast_all_error_bodies_passthrough_not_generic() {
+    let (url_a, _abort_a) = start_mock(Router::new().route(
+        "/",
+        post(|| async { rpc_error_response(-32002, "blockhash not found") }),
+    ))
+    .await;
+    let (url_b, _abort_b) = start_mock(Router::new().route(
+        "/",
+        post(|| async { rpc_error_response(-32002, "blockhash not found") }),
+    ))
+    .await;
+
+    let mut cfg = test_config(
+        &[("a", &url_a), ("b", &url_b)],
+        RoutingStrategy::BestScore,
+        0,
+        5,
+    );
+    cfg.routing.broadcast_writes = true;
+    let state = ProxyState::new(cfg);
+    let router = build_router(state);
+
+    let (status, body) = proxy_request(router, SEND_TX).await;
+
+    // Preflight errors are HTTP 200 with a JSON-RPC error body.
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["error"]["code"].as_i64(),
+        Some(-32002),
+        "should surface the upstream preflight error, not synthetic -32603: {body}"
+    );
+}
+
+/// CONTRACT: when no broadcast leg succeeds, the returned error prefers a
+/// deterministic client error (-32602 invalid params, identical across providers)
+/// over a transient one (-32005 node behind), regardless of arrival order.
+#[tokio::test]
+async fn broadcast_prefers_deterministic_error_over_transient() {
+    let (url_transient, _abort_t) = start_mock(Router::new().route(
+        "/",
+        post(|| async { rpc_error_response(-32005, "node is behind") }),
+    ))
+    .await;
+    let (url_deterministic, _abort_d) = start_mock(Router::new().route(
+        "/",
+        post(|| async { rpc_error_response(-32602, "invalid params") }),
+    ))
+    .await;
+
+    let mut cfg = test_config(
+        &[
+            ("transient", &url_transient),
+            ("deterministic", &url_deterministic),
+        ],
+        RoutingStrategy::BestScore,
+        0,
+        5,
+    );
+    cfg.routing.broadcast_writes = true;
+    let state = ProxyState::new(cfg);
+    let router = build_router(state);
+
+    let (status, body) = proxy_request(router, SEND_TX).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["error"]["code"].as_i64(),
+        Some(-32602),
+        "should prefer the deterministic invalid-params error: {body}"
+    );
+}
+
 /// CONTRACT: a non-retryable upstream 4xx (e.g. a revoked key → 401) must be
 /// surfaced to the client as that status, not masked as HTTP 200. Chosen
 /// semantics: pass the provider status code through to the client.
