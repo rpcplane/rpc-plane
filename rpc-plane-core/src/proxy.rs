@@ -1,5 +1,5 @@
 use crate::config::{Config, ProviderConfig};
-use crate::health::{CircuitState, HealthMonitor};
+use crate::health::{CircuitState, CommitmentHealth, HealthMonitor};
 use crate::metrics::Metrics;
 use crate::router::{extract_rpc_error_code, is_retryable_http, is_retryable_rpc_code, route};
 use crate::telemetry::{NoopReporter, Reporter, TelemetryEvent};
@@ -124,6 +124,13 @@ pub fn build_metrics_router(state: ProxyState) -> Router {
 
 async fn handle_health(State(state): State<ProxyState>) -> impl IntoResponse {
     let snaps = state.monitor.snapshots();
+    let commitment = |c: &CommitmentHealth| {
+        serde_json::json!({
+            "slot": c.slot,
+            "drift": c.drift,
+            "is_drifting": c.is_drifting,
+        })
+    };
     let providers: Vec<_> = snaps
         .iter()
         .map(|s| {
@@ -137,6 +144,11 @@ async fn handle_health(State(state): State<ProxyState>) -> impl IntoResponse {
                 "error_rate": (s.error_rate * 1000.0).round() / 1000.0,
                 "circuit": format!("{:?}", s.circuit).to_lowercase(),
                 "available": s.is_available(),
+                "commitments": {
+                    "processed": commitment(&s.processed),
+                    "confirmed": commitment(&s.confirmed),
+                    "finalized": commitment(&s.finalized),
+                },
             })
         })
         .collect();
@@ -157,6 +169,15 @@ async fn handle_metrics(State(state): State<ProxyState>) -> impl IntoResponse {
             s.slot_drift,
             s.circuit == CircuitState::Open,
         );
+        for (level, ch) in [
+            ("processed", &s.processed),
+            ("confirmed", &s.confirmed),
+            ("finalized", &s.finalized),
+        ] {
+            state
+                .metrics
+                .update_provider_commitment(s.name.as_ref(), level, ch.slot, ch.drift);
+        }
     }
     (
         [(

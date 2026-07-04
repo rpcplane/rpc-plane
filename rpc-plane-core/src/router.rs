@@ -212,7 +212,7 @@ pub fn route(
 mod tests {
     use super::*;
     use crate::config::ProviderConfig;
-    use crate::health::CircuitState;
+    use crate::health::{CircuitState, CommitmentHealth};
 
     fn snap(name: &str, score: f64) -> HealthSnapshot {
         HealthSnapshot {
@@ -224,6 +224,9 @@ mod tests {
             latency_ms: 50.0,
             error_rate: 0.0,
             circuit: CircuitState::Closed,
+            processed: CommitmentHealth::default(),
+            confirmed: CommitmentHealth::default(),
+            finalized: CommitmentHealth::default(),
         }
     }
 
@@ -237,6 +240,9 @@ mod tests {
             latency_ms: 0.0,
             error_rate: 1.0,
             circuit: CircuitState::Open,
+            processed: CommitmentHealth::default(),
+            confirmed: CommitmentHealth::default(),
+            finalized: CommitmentHealth::default(),
         }
     }
 

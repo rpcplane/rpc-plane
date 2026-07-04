@@ -1,7 +1,7 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use rpc_plane_core::{
     config::{ProviderConfig, RoutingStrategy},
-    health::{CircuitState, HealthSnapshot},
+    health::{CircuitState, CommitmentHealth, HealthSnapshot},
     proxy::extract_method,
     router::{extract_rpc_error_code, route},
 };
@@ -19,6 +19,9 @@ fn snap(name: &str, score: f64) -> HealthSnapshot {
         latency_ms: 10.0,
         error_rate: 0.0,
         circuit: CircuitState::Closed,
+        processed: CommitmentHealth::default(),
+        confirmed: CommitmentHealth::default(),
+        finalized: CommitmentHealth::default(),
     }
 }
 
