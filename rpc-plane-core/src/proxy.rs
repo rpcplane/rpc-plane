@@ -406,14 +406,25 @@ async fn broadcast(
         });
     }
 
-    // Return on the FIRST 2xx success rather than draining the whole JoinSet —
+    // Return on the FIRST real success rather than draining the whole JoinSet —
     // otherwise client latency tracks the slowest provider, defeating the entire
-    // point of broadcast/ParallelRace. Stragglers are handed to a detached task
-    // (below) so every provider's outcome still feeds metrics and health scoring.
+    // point of broadcast/ParallelRace. A leg succeeds only on HTTP 2xx *and* a body
+    // with no JSON-RPC `error` member: a `sendTransaction` that fails preflight
+    // returns HTTP 200 + error -32002 and is the *fastest* leg precisely because it
+    // did no work — if that won the race the client would see a failure, re-sign,
+    // and double-execute while a slower provider actually landed the tx. Stragglers
+    // are handed to a detached task (below) so every provider's outcome still feeds
+    // metrics and health scoring.
+    //
+    // `best_error` keeps the most informative failed-leg body so that, if no leg
+    // succeeds, the client gets a real upstream error (a deterministic -32602/-32002
+    // it can act on) instead of a generic "all providers failed".
+    let mut best_error: Option<(u16, Bytes, u8)> = None; // (status, body, rank)
+
     while let Some(res) = set.join_next().await {
         match res {
             Ok((name, Ok((status, bytes)), latency_ms)) => {
-                let success = (200..300).contains(&status);
+                let success = leg_succeeded(status, &bytes);
                 record_broadcast_outcome(state, method, &name, success, latency_ms, count);
                 if success {
                     info!(
@@ -431,7 +442,12 @@ async fn broadcast(
                     )
                         .into_response();
                 }
-                warn!(request_id = %request_id, provider = %name, method, status, "broadcast provider non-2xx");
+                let rpc_code = extract_rpc_error_code(&bytes);
+                warn!(request_id = %request_id, provider = %name, method, status, code = ?rpc_code, "broadcast leg failed");
+                let rank = broadcast_error_rank(status, rpc_code);
+                if best_error.as_ref().is_none_or(|(_, _, best)| rank > *best) {
+                    best_error = Some((status, bytes, rank));
+                }
             }
             Ok((name, Err(e), latency_ms)) => {
                 warn!(request_id = %request_id, provider = %name, method, error = %e, "broadcast provider failed");
@@ -443,8 +459,19 @@ async fn broadcast(
         }
     }
 
-    // Reached only when no provider produced a 2xx — every outcome was already
-    // recorded synchronously above.
+    // No provider returned a real success — every outcome was already recorded
+    // synchronously above. Surface a captured upstream error body (a preflight
+    // -32002 rides on HTTP 200; a non-retryable 4xx passes its status through)
+    // rather than masking it as a generic -32603.
+    if let Some((status, bytes, _)) = best_error {
+        error!(%request_id, method, "all broadcast providers failed; returning upstream error");
+        return (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+            [("content-type", "application/json")],
+            bytes,
+        )
+            .into_response();
+    }
     error!(%request_id, method, "all broadcast providers failed");
     json_error_response(StatusCode::BAD_GATEWAY, -32603, "all providers failed")
 }
@@ -468,6 +495,27 @@ fn record_broadcast_outcome(
     state.monitor.record(name, success, latency_ms);
 }
 
+/// A broadcast leg counts as a success only on HTTP 2xx *and* a body with no
+/// JSON-RPC `error` member. A 2xx carrying an error body — e.g. a `sendTransaction`
+/// preflight failure (-32002) — is a failed leg, not a success; see `broadcast()`.
+fn leg_succeeded(status: u16, bytes: &Bytes) -> bool {
+    (200..300).contains(&status) && extract_rpc_error_code(bytes).is_none()
+}
+
+/// Rank a failed broadcast leg for selection as the fallback error returned to the
+/// client when no leg succeeds. Higher wins. A non-retryable JSON-RPC error (bad
+/// params, failed preflight) is deterministic and identical across providers, so
+/// it's the most useful thing to hand back; a retryable RPC error is next; a bare
+/// HTTP error with no JSON-RPC body is last.
+fn broadcast_error_rank(status: u16, rpc_code: Option<i64>) -> u8 {
+    match rpc_code {
+        Some(code) if !is_retryable_rpc_code(code) => 3,
+        Some(_) => 2,
+        None if !(200..300).contains(&status) => 1,
+        None => 0,
+    }
+}
+
 /// Drain the remaining in-flight broadcast tasks in the background after the
 /// client has already been answered, so late providers still feed metrics and
 /// health. Clones only the cheap Arc-backed handles off `ProxyState`; the
@@ -486,8 +534,8 @@ fn spawn_straggler_drain(
     tokio::spawn(async move {
         while let Some(res) = set.join_next().await {
             let (name, success, latency_ms) = match res {
-                Ok((name, Ok((status, _)), latency_ms)) => {
-                    (name, (200..300).contains(&status), latency_ms)
+                Ok((name, Ok((status, bytes)), latency_ms)) => {
+                    (name, leg_succeeded(status, &bytes), latency_ms)
                 }
                 Ok((name, Err(e), latency_ms)) => {
                     warn!(request_id = %request_id, provider = %name, error = %e, "broadcast straggler failed");
