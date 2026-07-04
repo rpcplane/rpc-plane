@@ -7,9 +7,11 @@ metrics_listen = "127.0.0.1:9401"
 
 # ── Health scoring ─────────────────────────────────────────────────────────────
 [health]
+# Each cycle sends 3 concurrent getSlot calls (processed/confirmed/finalized),
+# so 1000ms ≈ 3 calls/provider/second (~260k/day). Raise on strictly metered plans.
 interval_ms = 1000            # how often to probe each provider
 window_secs = 60              # sliding window for error rate
-slot_drift_threshold = 10     # slots behind tip before deprioritised
+slot_drift_threshold = 10     # slots behind tip (worst of processed/confirmed) before deprioritised
 
 # Circuit breaker: opens when consecutive_failures >= N or error_rate >= threshold
 circuit_open_failures = 5

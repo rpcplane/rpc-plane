@@ -15,6 +15,8 @@ struct Inner {
     health_score: GaugeVec,
     slot_height: GaugeVec,
     slot_drift: GaugeVec,
+    slot_height_commitment: GaugeVec,
+    slot_drift_commitment: GaugeVec,
     circuit_state: GaugeVec,
 }
 
@@ -85,8 +87,29 @@ impl Metrics {
         .unwrap();
 
         let slot_drift = GaugeVec::new(
-            Opts::new("rpc_plane_slot_drift", "Slots behind the network tip"),
+            Opts::new(
+                "rpc_plane_slot_drift",
+                "Slots behind the network tip (worst of processed/confirmed)",
+            ),
             &["provider"],
+        )
+        .unwrap();
+
+        let slot_height_commitment = GaugeVec::new(
+            Opts::new(
+                "rpc_plane_provider_slot_height_commitment",
+                "Slot height reported by provider, per commitment level",
+            ),
+            &["provider", "commitment"],
+        )
+        .unwrap();
+
+        let slot_drift_commitment = GaugeVec::new(
+            Opts::new(
+                "rpc_plane_slot_drift_commitment",
+                "Slots behind the per-commitment network tip",
+            ),
+            &["provider", "commitment"],
         )
         .unwrap();
 
@@ -121,6 +144,8 @@ impl Metrics {
             Box::new(health_score.clone()),
             Box::new(slot_height.clone()),
             Box::new(slot_drift.clone()),
+            Box::new(slot_height_commitment.clone()),
+            Box::new(slot_drift_commitment.clone()),
             Box::new(circuit_state.clone()),
             Box::new(build_info.clone()),
         ] {
@@ -143,6 +168,8 @@ impl Metrics {
             health_score,
             slot_height,
             slot_drift,
+            slot_height_commitment,
+            slot_drift_commitment,
             circuit_state,
         }))
     }
@@ -210,6 +237,28 @@ impl Metrics {
             .circuit_state
             .with_label_values(&[provider])
             .set(if circuit_open { 1.0 } else { 0.0 });
+    }
+
+    /// Push per-commitment slot height and drift for one provider. Skipped for a
+    /// commitment with no observed slot yet (leaves the series absent rather than
+    /// emitting a misleading 0).
+    pub fn update_provider_commitment(
+        &self,
+        provider: &str,
+        commitment: &str,
+        slot: Option<u64>,
+        drift: u64,
+    ) {
+        if let Some(s) = slot {
+            self.0
+                .slot_height_commitment
+                .with_label_values(&[provider, commitment])
+                .set(s as f64);
+            self.0
+                .slot_drift_commitment
+                .with_label_values(&[provider, commitment])
+                .set(drift as f64);
+        }
     }
 
     /// Render all registered metrics in Prometheus text exposition format.
@@ -298,6 +347,26 @@ mod tests {
         let text = m.render();
         assert!(text.contains("rpc_plane_provider_health_score{provider=\"helius\"} 0.95"));
         assert!(text.contains("rpc_plane_circuit_breaker_state{provider=\"helius\"} 0"));
+    }
+
+    #[test]
+    fn per_commitment_gauges_update() {
+        let m = Metrics::new();
+        m.update_provider_commitment("helius", "confirmed", Some(300_000_000), 4);
+        // A commitment with no slot yet emits nothing.
+        m.update_provider_commitment("helius", "finalized", None, 0);
+
+        let text = m.render();
+        assert!(text.contains(
+            "rpc_plane_provider_slot_height_commitment{commitment=\"confirmed\",provider=\"helius\"} 300000000"
+        ));
+        assert!(text.contains(
+            "rpc_plane_slot_drift_commitment{commitment=\"confirmed\",provider=\"helius\"} 4"
+        ));
+        assert!(
+            !text.contains("commitment=\"finalized\""),
+            "no series should be emitted for a commitment without data"
+        );
     }
 
     #[test]
