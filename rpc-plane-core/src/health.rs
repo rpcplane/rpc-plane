@@ -225,16 +225,30 @@ impl Inner {
         hard as f64 / self.window.len() as f64
     }
 
-    fn push_sample(&mut self, sample: Sample, latency_ms: f64, window_secs: u64) {
+    /// Push one outcome into the window. `update_latency` gates whether a success
+    /// feeds the scoring EMA — only health probes do (see [`ProviderHealth::record`]).
+    fn push_sample(
+        &mut self,
+        sample: Sample,
+        latency_ms: f64,
+        update_latency: bool,
+        window_secs: u64,
+    ) {
         self.prune_window(window_secs);
         self.window.push_back((Instant::now(), sample));
         match sample {
             Sample::Success => {
-                if self.latency_ema_ms == 0.0 {
-                    self.latency_ema_ms = latency_ms;
-                } else {
-                    // α = 0.15 — stable EMA, not too slow to adapt
-                    self.latency_ema_ms = 0.85 * self.latency_ema_ms + 0.15 * latency_ms;
+                // Only probe successes move the scoring EMA. Live successes span a
+                // cheap getSlot to a 10k-account getProgramAccounts scan, so folding
+                // their latency in makes the score oscillate; live latency is still
+                // exported to the Prometheus histograms.
+                if update_latency {
+                    if self.latency_ema_ms == 0.0 {
+                        self.latency_ema_ms = latency_ms;
+                    } else {
+                        // α = 0.15 — stable EMA, not too slow to adapt
+                        self.latency_ema_ms = 0.85 * self.latency_ema_ms + 0.15 * latency_ms;
+                    }
                 }
                 self.consecutive_failures = 0;
             }
@@ -248,14 +262,21 @@ impl Inner {
         }
     }
 
-    /// Back-compat helper: push a boolean success/failure sample.
-    fn push_result(&mut self, success: bool, latency_ms: f64, window_secs: u64) {
+    /// Back-compat helper: push a boolean success/failure sample. `update_latency`
+    /// gates whether a success feeds the scoring EMA (probes only).
+    fn push_result(
+        &mut self,
+        success: bool,
+        latency_ms: f64,
+        update_latency: bool,
+        window_secs: u64,
+    ) {
         let sample = if success {
             Sample::Success
         } else {
             Sample::Failure
         };
-        self.push_sample(sample, latency_ms, window_secs);
+        self.push_sample(sample, latency_ms, update_latency, window_secs);
     }
 
     /// Worst drift across the read commitments (processed/confirmed), each
@@ -362,10 +383,14 @@ impl ProviderHealth {
         }
     }
 
-    /// Record the outcome of any request (probe or real).
-    pub fn record(&self, success: bool, latency_ms: f64, cfg: &HealthConfig) {
+    /// Record the outcome of a request. `is_probe` marks a health-probe outcome:
+    /// only probes feed the latency EMA that drives the score, because live calls
+    /// range from a cheap getSlot to a huge getProgramAccounts scan and would make
+    /// the score oscillate. Live successes/failures still feed the error window and
+    /// circuit breaker; live latency is tracked in the Prometheus histograms.
+    pub fn record(&self, success: bool, latency_ms: f64, is_probe: bool, cfg: &HealthConfig) {
         let mut g = self.inner.write();
-        g.push_result(success, latency_ms, cfg.window_secs);
+        g.push_result(success, latency_ms, is_probe, cfg.window_secs);
         apply_circuit_transitions(&mut g, &self.name, cfg);
     }
 
@@ -374,7 +399,9 @@ impl ProviderHealth {
     /// healthy, just capped, so opening it would only make the overload worse.
     pub fn record_throttled(&self, latency_ms: f64, cfg: &HealthConfig) {
         let mut g = self.inner.write();
-        g.push_sample(Sample::Throttle, latency_ms, cfg.window_secs);
+        // A throttle never moves the latency EMA (a fast 429 would flatter the
+        // provider), so `update_latency` is always false regardless of source.
+        g.push_sample(Sample::Throttle, latency_ms, false, cfg.window_secs);
         apply_circuit_transitions(&mut g, &self.name, cfg);
     }
 
@@ -582,15 +609,17 @@ impl HealthMonitor {
         }
     }
 
-    /// Record a real request outcome (feeds back into health score).
-    pub fn record(&self, provider_name: &str, success: bool, latency_ms: f64) {
+    /// Record a request outcome (feeds back into health score). `is_probe` marks a
+    /// health-probe outcome — only those feed the scoring latency EMA. Live outcomes
+    /// still feed the error window and circuit breaker. See [`ProviderHealth::record`].
+    pub fn record(&self, provider_name: &str, success: bool, latency_ms: f64, is_probe: bool) {
         if let Some(h) = self
             .entries
             .read()
             .get(provider_name)
             .map(|e| e.health.clone())
         {
-            h.record(success, latency_ms, &self.cfg);
+            h.record(success, latency_ms, is_probe, &self.cfg);
         }
     }
 
@@ -646,7 +675,7 @@ async fn health_loop(
                 let finalized = res.slots.finalized;
                 let processed = res.slots.processed.unwrap_or_default();
                 state.update_slots(res.slots);
-                state.record(true, ms, &cfg);
+                state.record(true, ms, /* is_probe */ true, &cfg);
                 metrics.record_probe(&provider.name, "health", "ok");
                 debug!(
                     provider = %provider.name,
@@ -666,7 +695,7 @@ async fn health_loop(
                     metrics.record_probe(&provider.name, "health", "rate_limited");
                     warn!(provider = %provider.name, "health probe rate limited (429)");
                 } else {
-                    state.record(false, ms, &cfg);
+                    state.record(false, ms, /* is_probe */ true, &cfg);
                     metrics.record_probe(&provider.name, "health", "error");
                     warn!(provider = %provider.name, error = %e, "health probe failed");
                 }
@@ -827,9 +856,9 @@ mod tests {
     fn error_rate_counts_failures() {
         let mut inner = Inner::new();
         let cfg = default_cfg();
-        inner.push_result(true, 50.0, cfg.window_secs);
-        inner.push_result(false, 0.0, cfg.window_secs);
-        inner.push_result(false, 0.0, cfg.window_secs);
+        inner.push_result(true, 50.0, true, cfg.window_secs);
+        inner.push_result(false, 0.0, true, cfg.window_secs);
+        inner.push_result(false, 0.0, true, cfg.window_secs);
         assert!((inner.error_rate() - 2.0 / 3.0).abs() < 1e-9);
     }
 
@@ -841,7 +870,7 @@ mod tests {
             ..Default::default()
         };
         for _ in 0..3 {
-            ph.record(false, 0.0, &cfg);
+            ph.record(false, 0.0, true, &cfg);
         }
         let snap = ph.snapshot(&tips(0), &cfg);
         assert_eq!(snap.circuit, CircuitState::Open);
@@ -866,15 +895,15 @@ mod tests {
     #[test]
     fn latency_ema_first_sample_sets_to_value() {
         let mut inner = Inner::new();
-        inner.push_result(true, 120.0, 60);
+        inner.push_result(true, 120.0, true, 60);
         assert_eq!(inner.latency_ema_ms, 120.0);
     }
 
     #[test]
     fn latency_ema_applies_smoothing() {
         let mut inner = Inner::new();
-        inner.push_result(true, 100.0, 60);
-        inner.push_result(true, 200.0, 60);
+        inner.push_result(true, 100.0, true, 60);
+        inner.push_result(true, 200.0, true, 60);
         let expected = 0.85 * 100.0 + 0.15 * 200.0;
         assert!((inner.latency_ema_ms - expected).abs() < 1e-9);
     }
@@ -882,9 +911,30 @@ mod tests {
     #[test]
     fn latency_ema_unchanged_on_failure() {
         let mut inner = Inner::new();
-        inner.push_result(true, 100.0, 60);
-        inner.push_result(false, 9999.0, 60);
+        inner.push_result(true, 100.0, true, 60);
+        inner.push_result(false, 9999.0, true, 60);
         assert_eq!(inner.latency_ema_ms, 100.0);
+    }
+
+    #[test]
+    fn latency_ema_ignores_live_outcomes() {
+        // A live outcome (update_latency = false) lands in the window but must not
+        // move the scoring EMA — a heavy getProgramAccounts scan should not make a
+        // provider look slow for routing. See `record`'s `is_probe` flag.
+        let mut inner = Inner::new();
+        inner.push_result(true, 100.0, true, 60); // probe seeds the EMA
+        inner.push_result(true, 900.0, false, 60); // heavy live success, ignored
+        assert_eq!(
+            inner.latency_ema_ms, 100.0,
+            "live latency must not move the EMA"
+        );
+        // ...but the live success is still in the window (error rate stays clean).
+        assert_eq!(inner.error_rate(), 0.0);
+        assert_eq!(
+            inner.window.len(),
+            2,
+            "live outcome still recorded in the window"
+        );
     }
 
     #[test]
@@ -892,11 +942,11 @@ mod tests {
         let cfg = HealthConfig::default();
         let mut bad = Inner::new();
         for _ in 0..10 {
-            bad.push_result(false, 0.0, cfg.window_secs);
+            bad.push_result(false, 0.0, true, cfg.window_secs);
         }
         let mut good = Inner::new();
         for _ in 0..10 {
-            good.push_result(true, 50.0, cfg.window_secs);
+            good.push_result(true, 50.0, true, cfg.window_secs);
         }
         assert!(good.score(&tips(100), &cfg) > bad.score(&tips(100), &cfg));
     }
@@ -921,7 +971,7 @@ mod tests {
             ..Default::default()
         };
         for _ in 0..4 {
-            ph.record(false, 0.0, &cfg);
+            ph.record(false, 0.0, true, &cfg);
         }
         let snap = ph.snapshot(&tips(0), &cfg);
         assert_eq!(snap.circuit, CircuitState::Closed);
@@ -937,15 +987,15 @@ mod tests {
             circuit_error_threshold: 1.1, // disable error-rate trigger
             ..Default::default()
         };
-        ph.record(false, 0.0, &cfg);
+        ph.record(false, 0.0, true, &cfg);
         assert_eq!(ph.snapshot(&tips(0), &cfg).circuit, CircuitState::Open);
 
         // record() with cooldown=0: Open → HalfOpen (elapsed ≥ 0 always true)
-        ph.record(true, 10.0, &cfg);
+        ph.record(true, 10.0, true, &cfg);
         assert_eq!(ph.snapshot(&tips(0), &cfg).circuit, CircuitState::HalfOpen);
 
         // Probe success → Closed
-        ph.record(true, 10.0, &cfg);
+        ph.record(true, 10.0, true, &cfg);
         assert_eq!(ph.snapshot(&tips(0), &cfg).circuit, CircuitState::Closed);
         assert!(ph.snapshot(&tips(0), &cfg).is_available());
     }
@@ -959,10 +1009,10 @@ mod tests {
             circuit_error_threshold: 1.1,
             ..Default::default()
         };
-        ph.record(false, 0.0, &cfg); // Closed → Open
-        ph.record(false, 0.0, &cfg); // Open → HalfOpen (cooldown=0)
+        ph.record(false, 0.0, true, &cfg); // Closed → Open
+        ph.record(false, 0.0, true, &cfg); // Open → HalfOpen (cooldown=0)
         assert_eq!(ph.snapshot(&tips(0), &cfg).circuit, CircuitState::HalfOpen);
-        ph.record(false, 0.0, &cfg); // HalfOpen → Open (probe failed)
+        ph.record(false, 0.0, true, &cfg); // HalfOpen → Open (probe failed)
         assert_eq!(ph.snapshot(&tips(0), &cfg).circuit, CircuitState::Open);
         assert!(!ph.snapshot(&tips(0), &cfg).is_available());
     }
@@ -991,7 +1041,7 @@ mod tests {
         // routing sheds traffic to peers.
         let clean = ProviderHealth::new("clean");
         for _ in 0..10 {
-            clean.record(true, 50.0, &cfg);
+            clean.record(true, 50.0, true, &cfg);
         }
         assert!(
             ts.score < clean.snapshot(&tips(0), &cfg).score,
@@ -1011,15 +1061,15 @@ mod tests {
             circuit_error_threshold: 1.1, // disable the rate trigger
             ..Default::default()
         };
-        ph.record(false, 0.0, &cfg); // hard #1
+        ph.record(false, 0.0, true, &cfg); // hard #1
         ph.record_throttled(0.0, &cfg); // neutral
-        ph.record(false, 0.0, &cfg); // hard #2
+        ph.record(false, 0.0, true, &cfg); // hard #2
         assert_eq!(
             ph.snapshot(&tips(0), &cfg).circuit,
             CircuitState::Closed,
             "two hard failures (throttle between) < threshold"
         );
-        ph.record(false, 0.0, &cfg); // hard #3 → open
+        ph.record(false, 0.0, true, &cfg); // hard #3 → open
         assert_eq!(ph.snapshot(&tips(0), &cfg).circuit, CircuitState::Open);
     }
 
@@ -1040,6 +1090,33 @@ mod tests {
         assert_eq!(snap.circuit, CircuitState::Closed);
         // Scoring error rate reflects the throttles (all non-success)...
         assert_eq!(snap.error_rate, 1.0);
+    }
+
+    #[test]
+    fn live_outcomes_feed_circuit_but_not_the_scoring_ema() {
+        let cfg = HealthConfig {
+            circuit_open_failures: 3,
+            ..Default::default()
+        };
+        let ph = ProviderHealth::new("t");
+        // A probe establishes the scoring EMA baseline.
+        ph.record(true, 40.0, /* is_probe */ true, &cfg);
+        // A slow live success must not drag the EMA up (probes-only EMA)...
+        ph.record(true, 5_000.0, /* is_probe */ false, &cfg);
+        assert_eq!(
+            ph.snapshot(&tips(0), &cfg).latency_ms,
+            40.0,
+            "live latency must not move the scoring EMA"
+        );
+        // ...but live failures still count toward the circuit breaker.
+        for _ in 0..3 {
+            ph.record(false, 0.0, /* is_probe */ false, &cfg);
+        }
+        assert_eq!(
+            ph.snapshot(&tips(0), &cfg).circuit,
+            CircuitState::Open,
+            "live failures must still open the circuit"
+        );
     }
 
     #[test]
@@ -1154,7 +1231,7 @@ mod tests {
         // At a real 1s probe interval only ~1 entry would accumulate per second,
         // but this verifies there is no panic or unbounded allocation under burst.
         for i in 0..1_000 {
-            inner.push_result(i % 2 == 0, 50.0, 60);
+            inner.push_result(i % 2 == 0, 50.0, true, 60);
         }
         // All 1 000 are within the window — they're all retained, but the important
         // property is that push_result always calls prune_window, so old entries

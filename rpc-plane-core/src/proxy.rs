@@ -194,9 +194,12 @@ impl OutcomeRecorder {
             .record_request(method, name, label, latency_ms, count);
         self.reporter
             .record_request(method, name, label, latency_ms, count);
+        // Live outcomes feed the error window and circuit breaker, but not the
+        // scoring latency EMA (`is_probe = false`) — that stays probe-only so heavy
+        // calls don't oscillate the score. Live latency lives in the histograms above.
         match outcome {
-            Outcome::Ok => self.monitor.record(name, true, latency_ms),
-            Outcome::ProviderError => self.monitor.record(name, false, latency_ms),
+            Outcome::Ok => self.monitor.record(name, true, latency_ms, false),
+            Outcome::ProviderError => self.monitor.record(name, false, latency_ms, false),
             Outcome::RateLimited => self.monitor.record_throttled(name, latency_ms),
             Outcome::ClientError => {}
         }
