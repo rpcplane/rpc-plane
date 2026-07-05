@@ -6,6 +6,7 @@
 use axum::{
     body::Body,
     http::{Method, Request, StatusCode},
+    response::IntoResponse,
     routing::{get, post},
     Router,
 };
@@ -854,5 +855,120 @@ async fn upstream_4xx_status_passed_through_not_200() {
         status,
         StatusCode::UNAUTHORIZED,
         "upstream 401 must pass through, not be masked as 200"
+    );
+}
+
+const GET_BALANCE: &str = r#"{"jsonrpc":"2.0","id":1,"method":"getBalance","params":["addr"]}"#;
+
+/// A mock that answers `getSlot` health probes normally (so probe failures don't
+/// muddy the health signal) but returns `status` for the real `getBalance` call.
+async fn start_status_on_get_balance(status: StatusCode) -> (String, tokio::task::AbortHandle) {
+    let router = Router::new().route(
+        "/",
+        post(move |body: axum::body::Bytes| async move {
+            if std::str::from_utf8(&body).is_ok_and(|s| s.contains("getBalance")) {
+                (
+                    status,
+                    r#"{"jsonrpc":"2.0","error":{"code":0,"message":"x"},"id":1}"#,
+                )
+                    .into_response()
+            } else {
+                slot_response(1).into_response()
+            }
+        }),
+    );
+    start_mock(router).await
+}
+
+/// CONTRACT: a client-attributable 4xx (400) is passed through to the caller but
+/// must NOT count against provider health — a buggy client loop that keeps
+/// tripping a 400 cannot open the circuit and paint the provider as down.
+#[tokio::test]
+async fn client_4xx_passed_through_without_touching_health() {
+    let (url, _abort) = start_status_on_get_balance(StatusCode::BAD_REQUEST).await;
+
+    // circuit_open_failures = 2: two *counted* failures would open the circuit.
+    let cfg = test_config(&[("a", &url)], RoutingStrategy::FailoverOrdered, 0, 2);
+    let state = ProxyState::new(cfg);
+    let router = build_router(state.clone());
+
+    for _ in 0..5 {
+        let (status, _body) = proxy_request(router.clone(), GET_BALANCE).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "400 must pass through");
+    }
+
+    let snap = state.monitor.snapshots().pop().unwrap();
+    assert_eq!(
+        snap.circuit,
+        rpc_plane_core::health::CircuitState::Closed,
+        "client 4xx must not open the circuit"
+    );
+    assert_eq!(snap.error_rate, 0.0, "client 4xx must not raise error rate");
+}
+
+/// CONTRACT: an auth 4xx (401) is a genuine provider problem (revoked key) — it
+/// must count against health and, with enough failures, open the circuit.
+#[tokio::test]
+async fn auth_4xx_counts_against_health_and_opens_circuit() {
+    let (url, _abort) = start_status_on_get_balance(StatusCode::UNAUTHORIZED).await;
+
+    let cfg = test_config(&[("a", &url)], RoutingStrategy::FailoverOrdered, 0, 2);
+    let state = ProxyState::new(cfg);
+    let router = build_router(state.clone());
+
+    for _ in 0..3 {
+        let (status, _body) = proxy_request(router.clone(), GET_BALANCE).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "401 must pass through");
+    }
+
+    let snap = state.monitor.snapshots().pop().unwrap();
+    assert_eq!(
+        snap.circuit,
+        rpc_plane_core::health::CircuitState::Open,
+        "auth 4xx must open the circuit"
+    );
+}
+
+/// CONTRACT (429 handling): a rate-limited provider fails over *and* is demoted
+/// so traffic sheds to peers, but its circuit stays CLOSED — a 429 is a load
+/// signal, not a fault. Provider A 429s every real call (its probes still 200);
+/// B serves. Even with `circuit_open_failures = 2`, A must never open.
+#[tokio::test]
+async fn rate_limited_provider_demoted_but_circuit_stays_closed() {
+    let (url_a, _abort_a) = start_status_on_get_balance(StatusCode::TOO_MANY_REQUESTS).await;
+    let mock_b = Router::new().route("/", post(|| async { slot_response(7) }));
+    let (url_b, _abort_b) = start_mock(mock_b).await;
+
+    // max_retries=1 so A→B failover happens; circuit_open_failures=2 would open A
+    // fast if 429s were counted as failures.
+    let cfg = test_config(
+        &[("a", &url_a), ("b", &url_b)],
+        RoutingStrategy::FailoverOrdered,
+        1,
+        2,
+    );
+    let state = ProxyState::new(cfg);
+    let router = build_router(state.clone());
+
+    for _ in 0..8 {
+        let (status, body) = proxy_request(router.clone(), GET_BALANCE).await;
+        assert_eq!(status, StatusCode::OK, "B must serve after A is throttled");
+        assert_eq!(body["result"].as_u64(), Some(7));
+    }
+
+    let snaps = state.monitor.snapshots();
+    let a = snaps.iter().find(|s| s.name.as_ref() == "a").unwrap();
+    let b = snaps.iter().find(|s| s.name.as_ref() == "b").unwrap();
+    assert_eq!(
+        a.circuit,
+        rpc_plane_core::health::CircuitState::Closed,
+        "429 must not open the circuit"
+    );
+    assert!(a.is_available(), "throttled provider stays eligible");
+    assert!(
+        a.score < b.score,
+        "throttled provider must be demoted (a={}, b={})",
+        a.score,
+        b.score
     );
 }

@@ -1,7 +1,9 @@
 use crate::config::{Config, ProviderConfig};
 use crate::health::{CircuitState, CommitmentHealth, HealthMonitor};
 use crate::metrics::Metrics;
-use crate::router::{extract_rpc_error_code, is_retryable_http, is_retryable_rpc_code, route};
+use crate::router::{
+    extract_rpc_error_code, is_client_error, is_retryable_http, is_retryable_rpc_code, route,
+};
 use crate::telemetry::{NoopReporter, Reporter, TelemetryEvent};
 use axum::{
     body::Bytes,
@@ -99,6 +101,105 @@ impl ProxyState {
     /// Cheaply snapshot the current config (clones an Arc, not the Config).
     fn current_config(&self) -> Arc<Config> {
         self.config.read().clone()
+    }
+
+    /// The cheap Arc-backed handles needed to record a request outcome, detached
+    /// from the rest of `ProxyState`. Built once per request and cloned into the
+    /// detached straggler drain, which must own its handles (`'static`).
+    fn recorder(&self) -> OutcomeRecorder {
+        OutcomeRecorder {
+            metrics: self.metrics.clone(),
+            reporter: self.reporter.clone(),
+            monitor: self.monitor.clone(),
+        }
+    }
+}
+
+/// How one forwarded leg is scored. Separates the metrics label from the health
+/// effect so a client-attributable 4xx is visible without counting against the
+/// provider, and a 429 demotes the score without opening the circuit.
+#[derive(Clone, Copy)]
+enum Outcome {
+    /// A real success — 2xx with no JSON-RPC `error` body. Feeds health as a
+    /// success and is the only outcome that ends a broadcast race.
+    Ok,
+    /// Provider-attributable failure — a 5xx, an auth 4xx, a 2xx carrying an
+    /// error body, an upstream `Err`, or a retryable JSON-RPC error. Feeds health
+    /// as a hard failure.
+    ProviderError,
+    /// HTTP 429 — a load signal, not a fault. Fails over like a 5xx, but demotes
+    /// the provider's score without opening its circuit (see [`HealthMonitor`]).
+    RateLimited,
+    /// Client-attributable 4xx — recorded for visibility, never fed to health.
+    ClientError,
+}
+
+impl Outcome {
+    /// Classify from the HTTP status alone (sequential path — the status has
+    /// already been separated from any 2xx error body by earlier branches).
+    fn from_status(status: u16) -> Self {
+        if (200..300).contains(&status) {
+            Outcome::Ok
+        } else if status == 429 {
+            Outcome::RateLimited
+        } else if is_client_error(status) {
+            Outcome::ClientError
+        } else {
+            Outcome::ProviderError
+        }
+    }
+
+    /// Classify a broadcast leg, which is a success only on a 2xx with no
+    /// JSON-RPC error body ([`leg_succeeded`]); a 2xx carrying an error body is a
+    /// provider failure (a preflight -32002), not a success.
+    fn from_leg(status: u16, bytes: &Bytes) -> Self {
+        if leg_succeeded(status, bytes) {
+            Outcome::Ok
+        } else if status == 429 {
+            Outcome::RateLimited
+        } else if is_client_error(status) {
+            Outcome::ClientError
+        } else {
+            Outcome::ProviderError
+        }
+    }
+
+    /// The `status` label written to metrics/telemetry.
+    fn label(self) -> &'static str {
+        match self {
+            Outcome::Ok => "ok",
+            Outcome::ProviderError => "error",
+            Outcome::RateLimited => "rate_limited",
+            Outcome::ClientError => "client_error",
+        }
+    }
+}
+
+/// Bundles the cheap Arc-backed handles a request outcome touches so both the
+/// hot path and the detached straggler drain record through one place.
+#[derive(Clone)]
+struct OutcomeRecorder {
+    metrics: Metrics,
+    reporter: Arc<dyn Reporter>,
+    monitor: HealthMonitor,
+}
+
+impl OutcomeRecorder {
+    /// Record one forwarded leg across metrics, telemetry, and provider health.
+    /// The health effect is per-outcome: success/failure feed the circuit, a 429
+    /// demotes the score only, and a client-attributable 4xx is health-neutral.
+    fn record(&self, method: &str, name: &str, outcome: Outcome, latency_ms: f64, count: u64) {
+        let label = outcome.label();
+        self.metrics
+            .record_request(method, name, label, latency_ms, count);
+        self.reporter
+            .record_request(method, name, label, latency_ms, count);
+        match outcome {
+            Outcome::Ok => self.monitor.record(name, true, latency_ms),
+            Outcome::ProviderError => self.monitor.record(name, false, latency_ms),
+            Outcome::RateLimited => self.monitor.record_throttled(name, latency_ms),
+            Outcome::ClientError => {}
+        }
     }
 }
 
@@ -251,6 +352,7 @@ async fn sequential(
     } = ctx;
     let max_attempts = (config.routing.max_retries + 1).min(providers.len());
     let mut prev_failed: Option<(Arc<str>, &'static str)> = None; // (name, reason)
+    let recorder = state.recorder();
 
     for (attempt, name) in providers.iter().enumerate().take(max_attempts) {
         if attempt > 0 {
@@ -281,27 +383,47 @@ async fn sequential(
 
         match result {
             Ok((status, bytes)) => {
-                // Non-2xx that wasn't retryable (retryable HTTP already became an
-                // Err above): a permanent provider error such as a revoked-key 401.
-                // Record it as an error so health scoring reflects real traffic, and
-                // pass the status through to the client instead of replying 200.
-                // Do not fail over — it is non-retryable by construction.
-                if !(200..300).contains(&status) {
+                // Retryable HTTP (429 or 5xx): fail over to the next provider. A
+                // 5xx is a provider fault (`ProviderError`); a 429 is a load signal
+                // (`RateLimited`) that demotes the provider's score so traffic
+                // sheds to peers but leaves its circuit closed. On exhaustion the
+                // loop falls through to the generic "all providers failed" 502.
+                if is_retryable_http(status) {
+                    let outcome = Outcome::from_status(status);
                     warn!(
                         request_id = %request_id,
                         provider = %name,
                         method,
                         attempt,
                         status,
+                        outcome = outcome.label(),
+                        "retryable upstream status, trying next provider"
+                    );
+                    recorder.record(method, name, outcome, latency_ms, count);
+                    prev_failed = Some((name.clone(), "retryable_http"));
+                    continue;
+                }
+
+                // Non-2xx that wasn't retryable. Pass the status through to the
+                // client instead of replying 200, and do not fail over — it is
+                // non-retryable by construction. A client-attributable 4xx
+                // (malformed body, unknown route, oversized payload …) is the
+                // caller's fault, so it is recorded as `client_error` and left out
+                // of provider health; otherwise a buggy client loop could open
+                // every circuit. Auth failures (401/403) still score as errors —
+                // a revoked key makes the provider genuinely unusable.
+                if !(200..300).contains(&status) {
+                    let outcome = Outcome::from_status(status);
+                    warn!(
+                        request_id = %request_id,
+                        provider = %name,
+                        method,
+                        attempt,
+                        status,
+                        outcome = outcome.label(),
                         "upstream non-2xx, passing status through"
                     );
-                    state
-                        .metrics
-                        .record_request(method, name, "error", latency_ms, count);
-                    state
-                        .reporter
-                        .record_request(method, name, "error", latency_ms, count);
-                    state.monitor.record(name, false, latency_ms);
+                    recorder.record(method, name, outcome, latency_ms, count);
                     return (
                         StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
                         [("content-type", "application/json")],
@@ -320,13 +442,7 @@ async fn sequential(
                             attempt,
                             "retryable RPC error, trying next provider"
                         );
-                        state
-                            .metrics
-                            .record_request(method, name, "error", latency_ms, count);
-                        state
-                            .reporter
-                            .record_request(method, name, "error", latency_ms, count);
-                        state.monitor.record(name, false, latency_ms);
+                        recorder.record(method, name, Outcome::ProviderError, latency_ms, count);
                         prev_failed = Some((name.clone(), "retryable_rpc_error"));
                         continue;
                     }
@@ -339,13 +455,7 @@ async fn sequential(
                     latency_ms = format!("{latency_ms:.1}"),
                     "request ok"
                 );
-                state
-                    .metrics
-                    .record_request(method, name, "ok", latency_ms, count);
-                state
-                    .reporter
-                    .record_request(method, name, "ok", latency_ms, count);
-                state.monitor.record(name, true, latency_ms);
+                recorder.record(method, name, Outcome::Ok, latency_ms, count);
                 return (
                     StatusCode::OK,
                     [("content-type", "application/json")],
@@ -362,13 +472,7 @@ async fn sequential(
                     error = %e,
                     "provider error, trying next"
                 );
-                state
-                    .metrics
-                    .record_request(method, name, "error", latency_ms, count);
-                state
-                    .reporter
-                    .record_request(method, name, "error", latency_ms, count);
-                state.monitor.record(name, false, latency_ms);
+                recorder.record(method, name, Outcome::ProviderError, latency_ms, count);
                 prev_failed = Some((name.clone(), "provider_error"));
             }
         }
@@ -441,13 +545,14 @@ async fn broadcast(
     // succeeds, the client gets a real upstream error (a deterministic -32602/-32002
     // it can act on) instead of a generic "all providers failed".
     let mut best_error: Option<(u16, Bytes, u8)> = None; // (status, body, rank)
+    let recorder = state.recorder();
 
     while let Some(res) = set.join_next().await {
         match res {
             Ok((name, Ok((status, bytes)), latency_ms)) => {
-                let success = leg_succeeded(status, &bytes);
-                record_broadcast_outcome(state, method, &name, success, latency_ms, count);
-                if success {
+                let outcome = Outcome::from_leg(status, &bytes);
+                recorder.record(method, &name, outcome, latency_ms, count);
+                if matches!(outcome, Outcome::Ok) {
                     info!(
                         request_id = %request_id,
                         provider = %name,
@@ -455,7 +560,7 @@ async fn broadcast(
                         latency_ms = format!("{latency_ms:.1}"),
                         "broadcast first success"
                     );
-                    spawn_straggler_drain(state, method, request_id, count, set);
+                    spawn_straggler_drain(recorder, method, request_id, count, set);
                     return (
                         StatusCode::OK,
                         [("content-type", "application/json")],
@@ -464,7 +569,7 @@ async fn broadcast(
                         .into_response();
                 }
                 let rpc_code = extract_rpc_error_code(&bytes);
-                warn!(request_id = %request_id, provider = %name, method, status, code = ?rpc_code, "broadcast leg failed");
+                warn!(request_id = %request_id, provider = %name, method, status, code = ?rpc_code, outcome = outcome.label(), "broadcast leg failed");
                 let rank = broadcast_error_rank(status, rpc_code);
                 if best_error.as_ref().is_none_or(|(_, _, best)| rank > *best) {
                     best_error = Some((status, bytes, rank));
@@ -472,7 +577,7 @@ async fn broadcast(
             }
             Ok((name, Err(e), latency_ms)) => {
                 warn!(request_id = %request_id, provider = %name, method, error = %e, "broadcast provider failed");
-                record_broadcast_outcome(state, method, &name, false, latency_ms, count);
+                recorder.record(method, &name, Outcome::ProviderError, latency_ms, count);
             }
             Err(e) => {
                 warn!(request_id = %request_id, error = %e, "broadcast task panicked");
@@ -495,25 +600,6 @@ async fn broadcast(
     }
     error!(%request_id, method, "all broadcast providers failed");
     json_error_response(StatusCode::BAD_GATEWAY, -32603, "all providers failed")
-}
-
-/// Record one broadcast provider outcome across metrics, telemetry, and health.
-fn record_broadcast_outcome(
-    state: &ProxyState,
-    method: &str,
-    name: &str,
-    success: bool,
-    latency_ms: f64,
-    count: u64,
-) {
-    let status = if success { "ok" } else { "error" };
-    state
-        .metrics
-        .record_request(method, name, status, latency_ms, count);
-    state
-        .reporter
-        .record_request(method, name, status, latency_ms, count);
-    state.monitor.record(name, success, latency_ms);
 }
 
 /// A broadcast leg counts as a success only on HTTP 2xx *and* a body with no
@@ -539,38 +625,32 @@ fn broadcast_error_rank(status: u16, rpc_code: Option<i64>) -> u8 {
 
 /// Drain the remaining in-flight broadcast tasks in the background after the
 /// client has already been answered, so late providers still feed metrics and
-/// health. Clones only the cheap Arc-backed handles off `ProxyState`; the
-/// JoinSet is moved in and owns everything it needs ('static).
+/// health. The `recorder` owns the cheap Arc-backed handles it needs; the
+/// JoinSet is moved in and owns everything else ('static).
 fn spawn_straggler_drain(
-    state: &ProxyState,
+    recorder: OutcomeRecorder,
     method: &str,
     request_id: Uuid,
     count: u64,
     mut set: JoinSet<ForwardOutcome>,
 ) {
-    let metrics = state.metrics.clone();
-    let reporter = state.reporter.clone();
-    let monitor = state.monitor.clone();
     let method = method.to_string();
     tokio::spawn(async move {
         while let Some(res) = set.join_next().await {
-            let (name, success, latency_ms) = match res {
+            let (name, outcome, latency_ms) = match res {
                 Ok((name, Ok((status, bytes)), latency_ms)) => {
-                    (name, leg_succeeded(status, &bytes), latency_ms)
+                    (name, Outcome::from_leg(status, &bytes), latency_ms)
                 }
                 Ok((name, Err(e), latency_ms)) => {
                     warn!(request_id = %request_id, provider = %name, error = %e, "broadcast straggler failed");
-                    (name, false, latency_ms)
+                    (name, Outcome::ProviderError, latency_ms)
                 }
                 Err(e) => {
                     warn!(request_id = %request_id, error = %e, "broadcast straggler task panicked");
                     continue;
                 }
             };
-            let status = if success { "ok" } else { "error" };
-            metrics.record_request(&method, &name, status, latency_ms, count);
-            reporter.record_request(&method, &name, status, latency_ms, count);
-            monitor.record(&name, success, latency_ms);
+            recorder.record(&method, &name, outcome, latency_ms, count);
         }
     });
 }
@@ -601,13 +681,11 @@ async fn forward(
     let resp = builder.body(body.clone()).send().await?;
     let status = resp.status().as_u16();
     let bytes = resp.bytes().await?;
-    // Retryable statuses (429/5xx) become an Err so the caller fails over to the
-    // next provider. Every other status — including non-retryable 4xx like a
-    // revoked-key 401 — is returned with its code so the caller can pass it
-    // through to the client and score it correctly, instead of masking it as 200.
-    if is_retryable_http(status) {
-        anyhow::bail!("provider returned HTTP {status}");
-    }
+    // Return the status and body for every HTTP response and let the caller
+    // decide: retryable statuses (429/5xx) fail over to the next provider,
+    // non-retryable 4xx pass through. Only a transport-level error (the `?`s
+    // above) is an `Err`. This keeps the 429 → rate-limit classification intact
+    // on both the sequential and broadcast paths.
     Ok((status, bytes))
 }
 
