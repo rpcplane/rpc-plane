@@ -15,10 +15,9 @@ pub enum MethodClass {
 
 /// Classify a method as a read or write given the configured write-method list.
 ///
-/// The list is operator-controlled (`routing.write_methods`) and defaults to
-/// `["sendTransaction"]` only — `simulateTransaction` is read-only and routes
-/// like a read unless explicitly added. It can be overridden to add or remove
-/// methods.
+/// The list is operator-controlled (`routing.write_methods`); it defaults to
+/// `sendTransaction` + `simulateTransaction` so simulations route on the fast
+/// write path, but it can be overridden to add or remove methods.
 pub fn classify(method: &str, write_methods: &[String]) -> MethodClass {
     if write_methods.iter().any(|m| m == method) {
         MethodClass::Write
@@ -32,6 +31,24 @@ pub fn classify(method: &str, write_methods: &[String]) -> MethodClass {
 /// HTTP-level errors worth retrying on the next provider.
 pub fn is_retryable_http(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503 | 504)
+}
+
+/// Non-retryable 4xx statuses attributable to the *client's* request rather than
+/// the provider: a malformed body (400), an unknown route (404), a wrong HTTP
+/// method (405), an oversized body (413), an unsupported media type (415), or an
+/// unprocessable request (422).
+///
+/// These are passed through to the caller but must **not** count against provider
+/// health. A buggy client loop hammering a request that 400s would otherwise
+/// drive every provider's error window up and serially open their circuits —
+/// painting the whole fleet as down when the fault is the caller's own code.
+///
+/// Auth failures (401/403) are deliberately excluded: a revoked or wrong key
+/// makes the provider genuinely unusable, so it should score as an error and its
+/// circuit should open. `429` is not here either — it is a retryable status
+/// (`is_retryable_http`) that fails over to the next provider.
+pub fn is_client_error(status: u16) -> bool {
+    matches!(status, 400 | 404 | 405 | 413 | 415 | 422)
 }
 
 /// JSON-RPC error codes that may succeed on a different provider.
@@ -418,6 +435,27 @@ mod tests {
             assert!(
                 !is_retryable_http(code),
                 "expected {code} to be non-retryable"
+            );
+        }
+    }
+
+    #[test]
+    fn client_attributable_4xx_recognised() {
+        for code in [400u16, 404, 405, 413, 415, 422] {
+            assert!(
+                is_client_error(code),
+                "expected {code} to be client-attributable"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_and_auth_statuses_are_not_client_errors() {
+        // Auth (401/403) → provider unusable; 429/5xx → retryable; 2xx → success.
+        for code in [200u16, 401, 403, 429, 500, 502, 503, 504] {
+            assert!(
+                !is_client_error(code),
+                "expected {code} to NOT be client-attributable"
             );
         }
     }

@@ -19,6 +19,20 @@ pub enum CircuitState {
     Open,
 }
 
+/// One outcome in a provider's sliding health window.
+///
+/// `Throttle` (HTTP 429) is deliberately distinct from `Failure`: a rate limit is
+/// a load signal, not a fault. It demotes the score (so traffic sheds to peers)
+/// but is neutral to the circuit breaker — a throttled-but-healthy provider stays
+/// eligible and reabsorbs load the instant the burst passes, instead of being
+/// excluded for a full cooldown and cascading its traffic onto everyone else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sample {
+    Success,
+    Failure,
+    Throttle,
+}
+
 // ── Commitment isolation ─────────────────────────────────────────────────────
 
 /// The three Solana commitment levels probed each cycle. `processed` is the hot
@@ -153,8 +167,8 @@ struct Inner {
     consecutive_failures: u32,
     circuit: CircuitState,
     circuit_opened_at: Option<Instant>,
-    // (timestamp, success) pairs for the sliding window
-    window: VecDeque<(Instant, bool)>,
+    // (timestamp, outcome) pairs for the sliding window
+    window: VecDeque<(Instant, Sample)>,
 }
 
 impl Inner {
@@ -181,28 +195,67 @@ impl Inner {
         }
     }
 
+    /// Fraction of non-successful outcomes in the window — hard failures **and**
+    /// throttles. Drives the health *score*, so a rate-limited provider is demoted
+    /// and best-score routing sheds its traffic to peers with headroom.
     fn error_rate(&self) -> f64 {
         if self.window.is_empty() {
             return 0.0;
         }
-        let failures = self.window.iter().filter(|(_, ok)| !ok).count();
-        failures as f64 / self.window.len() as f64
+        let bad = self
+            .window
+            .iter()
+            .filter(|(_, s)| *s != Sample::Success)
+            .count();
+        bad as f64 / self.window.len() as f64
     }
 
-    fn push_result(&mut self, success: bool, latency_ms: f64, window_secs: u64) {
-        self.prune_window(window_secs);
-        self.window.push_back((Instant::now(), success));
-        if success {
-            if self.latency_ema_ms == 0.0 {
-                self.latency_ema_ms = latency_ms;
-            } else {
-                // α = 0.15 — stable EMA, not too slow to adapt
-                self.latency_ema_ms = 0.85 * self.latency_ema_ms + 0.15 * latency_ms;
-            }
-            self.consecutive_failures = 0;
-        } else {
-            self.consecutive_failures += 1;
+    /// Fraction of *hard* failures in the window — throttles excluded. Drives the
+    /// circuit *breaker*, so a 429 storm never trips a healthy-but-capped provider
+    /// open (which would exclude it for the full cooldown and cascade load).
+    fn hard_error_rate(&self) -> f64 {
+        if self.window.is_empty() {
+            return 0.0;
         }
+        let hard = self
+            .window
+            .iter()
+            .filter(|(_, s)| *s == Sample::Failure)
+            .count();
+        hard as f64 / self.window.len() as f64
+    }
+
+    fn push_sample(&mut self, sample: Sample, latency_ms: f64, window_secs: u64) {
+        self.prune_window(window_secs);
+        self.window.push_back((Instant::now(), sample));
+        match sample {
+            Sample::Success => {
+                if self.latency_ema_ms == 0.0 {
+                    self.latency_ema_ms = latency_ms;
+                } else {
+                    // α = 0.15 — stable EMA, not too slow to adapt
+                    self.latency_ema_ms = 0.85 * self.latency_ema_ms + 0.15 * latency_ms;
+                }
+                self.consecutive_failures = 0;
+            }
+            // Hard failure: extend the consecutive-failure streak that trips the circuit.
+            Sample::Failure => self.consecutive_failures += 1,
+            // Throttle (429): neutral to the circuit — it neither extends nor resets
+            // the hard-failure streak, and does not move the latency EMA (a fast 429
+            // would otherwise flatter the provider). It only lands in the window,
+            // demoting the score via `error_rate`.
+            Sample::Throttle => {}
+        }
+    }
+
+    /// Back-compat helper: push a boolean success/failure sample.
+    fn push_result(&mut self, success: bool, latency_ms: f64, window_secs: u64) {
+        let sample = if success {
+            Sample::Success
+        } else {
+            Sample::Failure
+        };
+        self.push_sample(sample, latency_ms, window_secs);
     }
 
     /// Worst drift across the read commitments (processed/confirmed), each
@@ -316,6 +369,15 @@ impl ProviderHealth {
         apply_circuit_transitions(&mut g, &self.name, cfg);
     }
 
+    /// Record a rate-limit (HTTP 429) outcome. Demotes the score so traffic sheds
+    /// to peers, but stays neutral to the circuit breaker — the provider is
+    /// healthy, just capped, so opening it would only make the overload worse.
+    pub fn record_throttled(&self, latency_ms: f64, cfg: &HealthConfig) {
+        let mut g = self.inner.write();
+        g.push_sample(Sample::Throttle, latency_ms, cfg.window_secs);
+        apply_circuit_transitions(&mut g, &self.name, cfg);
+    }
+
     /// Convenience: set only the `processed` slot (single-commitment callers).
     pub fn update_slot(&self, slot: u64) {
         self.inner.write().slots.processed = Some(slot);
@@ -330,8 +392,10 @@ impl ProviderHealth {
 fn apply_circuit_transitions(g: &mut Inner, name: &str, cfg: &HealthConfig) {
     match &g.circuit {
         CircuitState::Closed => {
+            // Throttles are excluded from both triggers (`hard_error_rate`,
+            // `consecutive_failures`) so a rate limit never opens the circuit.
             let should_open = g.consecutive_failures >= cfg.circuit_open_failures
-                || g.error_rate() > cfg.circuit_error_threshold;
+                || g.hard_error_rate() > cfg.circuit_error_threshold;
             if should_open {
                 g.circuit = CircuitState::Open;
                 g.circuit_opened_at = Some(Instant::now());
@@ -348,17 +412,21 @@ fn apply_circuit_transitions(g: &mut Inner, name: &str, cfg: &HealthConfig) {
             }
         }
         CircuitState::HalfOpen => {
-            // The last push_result already updated consecutive_failures.
-            // Close on success, re-open on failure.
-            let last_success = g.window.back().map(|(_, ok)| *ok).unwrap_or(false);
-            if last_success {
-                g.circuit = CircuitState::Closed;
-                g.circuit_opened_at = None;
-                info!(provider = %name, "circuit CLOSED (recovered)");
-            } else {
-                g.circuit = CircuitState::Open;
-                g.circuit_opened_at = Some(Instant::now());
-                warn!(provider = %name, "circuit OPEN (probe failed)");
+            // Close on a genuine success, reopen on a hard failure. A throttle is
+            // neutral — it neither confirms recovery nor counts as a fault — so the
+            // circuit stays half-open awaiting a decisive next outcome.
+            match g.window.back().map(|(_, s)| *s) {
+                Some(Sample::Success) => {
+                    g.circuit = CircuitState::Closed;
+                    g.circuit_opened_at = None;
+                    info!(provider = %name, "circuit CLOSED (recovered)");
+                }
+                Some(Sample::Failure) => {
+                    g.circuit = CircuitState::Open;
+                    g.circuit_opened_at = Some(Instant::now());
+                    warn!(provider = %name, "circuit OPEN (probe failed)");
+                }
+                Some(Sample::Throttle) | None => {}
             }
         }
     }
@@ -525,6 +593,19 @@ impl HealthMonitor {
             h.record(success, latency_ms, &self.cfg);
         }
     }
+
+    /// Record a rate-limit (429) outcome for a named provider — demotes its score
+    /// without opening its circuit. See [`ProviderHealth::record_throttled`].
+    pub fn record_throttled(&self, provider_name: &str, latency_ms: f64) {
+        if let Some(h) = self
+            .entries
+            .read()
+            .get(provider_name)
+            .map(|e| e.health.clone())
+        {
+            h.record_throttled(latency_ms, &self.cfg);
+        }
+    }
 }
 
 // ── Background health loop ────────────────────────────────────────────────────
@@ -578,9 +659,17 @@ async fn health_loop(
             }
             Err(e) => {
                 let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                state.record(false, ms, &cfg);
-                metrics.record_probe(&provider.name, "health", "error");
-                warn!(provider = %provider.name, error = %e, "health probe failed");
+                if e.downcast_ref::<RateLimited>().is_some() {
+                    // The provider throttled even the cheap probe — a load signal,
+                    // not a fault. Demote the score but leave the circuit closed.
+                    state.record_throttled(ms, &cfg);
+                    metrics.record_probe(&provider.name, "health", "rate_limited");
+                    warn!(provider = %provider.name, "health probe rate limited (429)");
+                } else {
+                    state.record(false, ms, &cfg);
+                    metrics.record_probe(&provider.name, "health", "error");
+                    warn!(provider = %provider.name, error = %e, "health probe failed");
+                }
             }
         }
         if stop.load(Ordering::Relaxed) {
@@ -623,6 +712,20 @@ async fn probe(client: &Client, provider: &ProviderConfig) -> anyhow::Result<Pro
     })
 }
 
+/// Marker error: a probe leg received HTTP 429. Carried as a typed error (rather
+/// than flattened into a generic failure string) so the health loop can score it
+/// as a throttle — demoting the score without opening the circuit.
+#[derive(Debug)]
+struct RateLimited;
+
+impl std::fmt::Display for RateLimited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "provider returned HTTP 429 (rate limited)")
+    }
+}
+
+impl std::error::Error for RateLimited {}
+
 /// Single `getSlot` at one commitment. Returns the slot and its round-trip ms.
 async fn get_slot(
     client: &Client,
@@ -646,6 +749,11 @@ async fn get_slot(
     let t0 = Instant::now();
     let resp = req.send().await?;
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    // Surface a 429 as a typed error so the health loop scores it as a throttle
+    // (score demotion, no circuit trip) rather than a generic probe failure.
+    if resp.status().as_u16() == 429 {
+        return Err(anyhow::Error::new(RateLimited));
+    }
     anyhow::ensure!(resp.status().is_success(), "HTTP {}", resp.status());
     let json: Value = resp.json().await?;
     let slot = json["result"]
@@ -860,6 +968,81 @@ mod tests {
     }
 
     #[test]
+    fn throttle_demotes_score_without_opening_circuit() {
+        let cfg = HealthConfig {
+            circuit_open_failures: 3,
+            circuit_error_threshold: 0.5,
+            ..Default::default()
+        };
+        // 10 throttles — would trip both circuit triggers if counted as failures.
+        let throttled = ProviderHealth::new("throttled");
+        for _ in 0..10 {
+            throttled.record_throttled(0.0, &cfg);
+        }
+        let ts = throttled.snapshot(&tips(0), &cfg);
+        assert_eq!(
+            ts.circuit,
+            CircuitState::Closed,
+            "throttles must not open the circuit"
+        );
+        assert!(ts.is_available(), "throttled provider stays eligible");
+
+        // But the score is demoted relative to a clean provider, so best-score
+        // routing sheds traffic to peers.
+        let clean = ProviderHealth::new("clean");
+        for _ in 0..10 {
+            clean.record(true, 50.0, &cfg);
+        }
+        assert!(
+            ts.score < clean.snapshot(&tips(0), &cfg).score,
+            "throttles must demote the score (throttled={}, clean={})",
+            ts.score,
+            clean.snapshot(&tips(0), &cfg).score
+        );
+    }
+
+    #[test]
+    fn throttle_is_neutral_to_the_hard_failure_streak() {
+        // A throttle interleaved in a hard-failure run neither resets nor extends
+        // the streak: F, T, F, F must still reach circuit_open_failures = 3.
+        let ph = ProviderHealth::new("t");
+        let cfg = HealthConfig {
+            circuit_open_failures: 3,
+            circuit_error_threshold: 1.1, // disable the rate trigger
+            ..Default::default()
+        };
+        ph.record(false, 0.0, &cfg); // hard #1
+        ph.record_throttled(0.0, &cfg); // neutral
+        ph.record(false, 0.0, &cfg); // hard #2
+        assert_eq!(
+            ph.snapshot(&tips(0), &cfg).circuit,
+            CircuitState::Closed,
+            "two hard failures (throttle between) < threshold"
+        );
+        ph.record(false, 0.0, &cfg); // hard #3 → open
+        assert_eq!(ph.snapshot(&tips(0), &cfg).circuit, CircuitState::Open);
+    }
+
+    #[test]
+    fn throttle_storm_never_trips_error_rate_circuit() {
+        // Error-rate trigger at 0.5: an all-throttle window has hard_error_rate 0,
+        // so the circuit stays closed however high the throttle rate climbs.
+        let ph = ProviderHealth::new("t");
+        let cfg = HealthConfig {
+            circuit_open_failures: 100, // disable the consecutive trigger
+            circuit_error_threshold: 0.5,
+            ..Default::default()
+        };
+        for _ in 0..20 {
+            ph.record_throttled(0.0, &cfg);
+        }
+        let snap = ph.snapshot(&tips(0), &cfg);
+        assert_eq!(snap.circuit, CircuitState::Closed);
+        // Scoring error rate reflects the throttles (all non-success)...
+        assert_eq!(snap.error_rate, 1.0);
+    }
+
+    #[test]
     fn monitor_update_slot_propagates() {
         let provider = crate::config::ProviderConfig {
             name: "p".to_string(),
@@ -921,8 +1104,8 @@ mod tests {
         let mut inner = Inner::new();
         // Directly inject entries with timestamps 120 seconds in the past.
         let old = Instant::now() - Duration::from_secs(120);
-        inner.window.push_back((old, true));
-        inner.window.push_back((old, false));
+        inner.window.push_back((old, Sample::Success));
+        inner.window.push_back((old, Sample::Failure));
         assert_eq!(inner.window.len(), 2);
 
         // prune_window(60) should evict both entries (120s > 60s cutoff).
@@ -939,7 +1122,7 @@ mod tests {
         let mut inner = Inner::new();
         // Inject an entry 10 seconds old — within a 60-second window.
         let recent = Instant::now() - Duration::from_secs(10);
-        inner.window.push_back((recent, true));
+        inner.window.push_back((recent, Sample::Success));
 
         inner.prune_window(60);
         assert_eq!(inner.window.len(), 1, "recent entries must be retained");
@@ -950,15 +1133,16 @@ mod tests {
         let mut inner = Inner::new();
         let old = Instant::now() - Duration::from_secs(90);
         let recent = Instant::now() - Duration::from_secs(5);
-        inner.window.push_back((old, false));
-        inner.window.push_back((old, true));
-        inner.window.push_back((recent, true));
+        inner.window.push_back((old, Sample::Failure));
+        inner.window.push_back((old, Sample::Success));
+        inner.window.push_back((recent, Sample::Success));
 
         inner.prune_window(60);
         // Only the recent entry survives.
         assert_eq!(inner.window.len(), 1);
-        assert!(
+        assert_eq!(
             inner.window[0].1,
+            Sample::Success,
             "surviving entry should be the recent success"
         );
     }
