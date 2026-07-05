@@ -278,9 +278,9 @@ async fn circuit_open_provider_excluded_from_routing() {
     );
     let state = ProxyState::new(cfg);
 
-    // Pre-open A's circuit by recording 3 consecutive failures.
+    // Pre-open A's circuit by recording 3 consecutive live failures.
     for _ in 0..3 {
-        state.monitor.record("a", false, 1000.0);
+        state.monitor.record("a", false, 1000.0, false);
     }
 
     let router = build_router(state);
@@ -418,10 +418,11 @@ async fn slow_provider_deprioritized_by_latency_score() {
         5,
     );
     let state = ProxyState::new(cfg);
-    // Simulate provider A having been consistently slow (800ms average).
+    // Simulate provider A's probes having been consistently slow (800ms average).
+    // Only probe outcomes feed the scoring EMA, so these are recorded as probes.
     // latency_score(A) ≈ 0.2; latency_score(B) = 0.5 (no data) — B wins on latency.
     for _ in 0..10 {
-        state.monitor.record("a", true, 800.0);
+        state.monitor.record("a", true, 800.0, true);
     }
     let router = build_router(state);
 
@@ -481,9 +482,9 @@ async fn circuit_recovers_traffic_resumes() {
     };
     let state = ProxyState::new(cfg);
 
-    // Open A's circuit with 2 consecutive failures.
-    state.monitor.record("a", false, 100.0);
-    state.monitor.record("a", false, 100.0);
+    // Open A's circuit with 2 consecutive live failures.
+    state.monitor.record("a", false, 100.0, false);
+    state.monitor.record("a", false, 100.0, false);
 
     // Verify A is excluded: FailoverOrdered with A first, but A's circuit is open.
     // Traffic must go to B.
@@ -499,8 +500,8 @@ async fn circuit_recovers_traffic_resumes() {
 
     // Simulate A recovering: cooldown=0, so Open→HalfOpen on first record(),
     // then HalfOpen→Closed on the next success.
-    state.monitor.record("a", true, 10.0); // Open → HalfOpen
-    state.monitor.record("a", true, 10.0); // HalfOpen → Closed
+    state.monitor.record("a", true, 10.0, false); // Open → HalfOpen
+    state.monitor.record("a", true, 10.0, false); // HalfOpen → Closed
 
     // Now A's circuit is Closed again. FailoverOrdered picks A first.
     {
