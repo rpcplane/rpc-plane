@@ -238,6 +238,30 @@ async fn check(config_path: PathBuf) -> Result<()> {
         }
     }
 
+    // Opt-in external reference (probe-only, never routed) — verify it answers
+    // getSlot so a typo'd URL surfaces here instead of silently doing nothing.
+    if let Some(ref_url) = &config.health.reference_url {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSlot",
+            "params": [{"commitment": "processed"}],
+        });
+        match client.post(ref_url).json(&body).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                println!("[OK  ] reference ({ref_url}) — HTTP {}", resp.status());
+            }
+            Ok(resp) => {
+                println!("[WARN] reference ({ref_url}) — HTTP {}", resp.status());
+                all_ok = false;
+            }
+            Err(e) => {
+                println!("[FAIL] reference ({ref_url}) — {e}");
+                all_ok = false;
+            }
+        }
+    }
+
     if all_ok {
         println!("\nAll providers reachable.");
     } else {

@@ -17,6 +17,10 @@ metrics_listen = "127.0.0.1:9401"
 [health]
 interval_ms          = 1000
 slot_drift_threshold = 10
+# With one provider there's no peer to compare against — the node is its own tip,
+# so drift always reads 0 and a stall is invisible. An external reference gives it
+# a checkpoint: probed for its slot but never routed to. Use the matching cluster.
+# reference_url      = "https://api.mainnet-beta.solana.com"
 
 [routing]
 max_retries = 1   # only one provider, but still retry on 429/timeout

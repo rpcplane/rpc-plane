@@ -13,6 +13,14 @@ interval_ms = 1000            # how often to probe each provider
 window_secs = 60              # sliding window for error rate
 slot_drift_threshold = 10     # slots behind tip (worst of processed/confirmed) before deprioritised
 
+# Optional external slot reference: probed for its slot but NEVER routed to. Its
+# slot is folded into the network tip, so a stall shared by every provider — or a
+# single-provider / own-node deploy that is otherwise its own tip — still shows as
+# drift instead of the tip sliding down with them. Default-off (keeps the "zero
+# outbound beyond configured providers" promise). Point it at the MATCHING cluster
+# (devnet/testnet need their own reference), or a mainnet ref reports false drift.
+# reference_url = "https://api.mainnet-beta.solana.com"
+
 # Circuit breaker: opens when consecutive_failures >= N or error_rate >= threshold
 circuit_open_failures = 5
 circuit_error_threshold = 0.5

@@ -467,10 +467,22 @@ struct ProviderEntry {
     stop: Arc<AtomicBool>,
 }
 
+/// Metric `provider` label used for the external reference probe. Distinguished
+/// from real providers by the `type="reference"` label on the probe counter.
+const REFERENCE_LABEL: &str = "reference";
+
 /// Shared health state for all providers. Cheap to clone (all Arcs inside).
 #[derive(Clone)]
 pub struct HealthMonitor {
     entries: Arc<RwLock<HashMap<String, ProviderEntry>>>,
+    /// Last slots observed from the optional external reference (`[health]
+    /// reference_url`). Probed but never in `entries`, so never routed to; its
+    /// slots are folded into the tips so an all-providers-stale stall surfaces
+    /// as drift. All-`None` (a no-op for the tip) until the first reference
+    /// probe, and forever when no reference is configured.
+    reference_slots: Arc<RwLock<CommitmentSlots>>,
+    /// Set to true to stop the reference probe loop.
+    reference_stop: Arc<AtomicBool>,
     pub cfg: Arc<HealthConfig>,
     metrics: Metrics,
 }
@@ -491,6 +503,8 @@ impl HealthMonitor {
             .collect();
         Self {
             entries: Arc::new(RwLock::new(entries)),
+            reference_slots: Arc::new(RwLock::new(CommitmentSlots::default())),
+            reference_stop: Arc::new(AtomicBool::new(false)),
             cfg: Arc::new(cfg),
             metrics,
         }
@@ -518,6 +532,19 @@ impl HealthMonitor {
                 stop,
                 client,
                 provider,
+                self.cfg.clone(),
+                self.metrics.clone(),
+            );
+        }
+        // Opt-in external reference: probed for its slot but never added to
+        // `entries`, so the router never sees it. Spawned once (a reference-URL
+        // change needs a restart, like the other [health] knobs).
+        if let Some(url) = self.cfg.reference_url.clone() {
+            self.reference_stop.store(false, Ordering::Relaxed);
+            spawn_reference_loop(
+                self.reference_slots.clone(),
+                self.reference_stop.clone(),
+                url,
                 self.cfg.clone(),
                 self.metrics.clone(),
             );
@@ -561,13 +588,23 @@ impl HealthMonitor {
         });
     }
 
-    /// Per-commitment network tips = max slot across all providers at each level.
+    /// Per-commitment network tips = max slot across all providers at each level,
+    /// plus the external reference (a no-op when unconfigured / not yet probed).
     pub fn slot_tips(&self) -> SlotTips {
         let mut tips = SlotTips::default();
         for e in self.entries.read().values() {
             tips.observe(&e.health.inner.read().slots);
         }
+        tips.observe(&self.reference_slots.read());
         tips
+    }
+
+    /// The external reference's last observed slots, or `None` when no
+    /// `[health] reference_url` is configured. Exposed on `/health` so operators
+    /// can see the checkpoint the tips are pinned to.
+    pub fn reference_tip(&self) -> Option<CommitmentSlots> {
+        self.cfg.reference_url.as_ref()?;
+        Some(*self.reference_slots.read())
     }
 
     /// Network tip at `processed` = max processed slot across all providers.
@@ -591,6 +628,7 @@ impl HealthMonitor {
         for h in &healths {
             tips.observe(&h.inner.read().slots);
         }
+        tips.observe(&self.reference_slots.read());
         healths
             .iter()
             .map(|h| h.snapshot(&tips, &self.cfg))
@@ -698,6 +736,89 @@ async fn health_loop(
                     state.record(false, ms, /* is_probe */ true, &cfg);
                     metrics.record_probe(&provider.name, "health", "error");
                     warn!(provider = %provider.name, error = %e, "health probe failed");
+                }
+            }
+        }
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+// ── External reference probe ──────────────────────────────────────────────────
+
+fn spawn_reference_loop(
+    slots: Arc<RwLock<CommitmentSlots>>,
+    stop: Arc<AtomicBool>,
+    url: String,
+    cfg: Arc<HealthConfig>,
+    metrics: Metrics,
+) {
+    tokio::spawn(async move { reference_loop(slots, stop, url, cfg, metrics).await });
+}
+
+/// Probe the opt-in external reference (`[health] reference_url`) on the same
+/// cadence as provider health probes, recording only its slot. The reference is
+/// never in `entries`, so it is never routed to; its slot feeds the network tip
+/// (via `SlotTips::observe`) so a stall shared by every configured provider — or
+/// a single-provider / own-node deploy that is otherwise its own tip — still
+/// surfaces as drift.
+async fn reference_loop(
+    slots: Arc<RwLock<CommitmentSlots>>,
+    stop: Arc<AtomicBool>,
+    url: String,
+    cfg: Arc<HealthConfig>,
+    metrics: Metrics,
+) {
+    // A dedicated client — the reference is not in the routed provider pool.
+    // Plain HTTP (no http3): the reference is a public cluster RPC.
+    let client = match Client::builder()
+        .timeout(Duration::from_secs(10))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "could not build reference HTTP client; external reference disabled");
+            return;
+        }
+    };
+    // A synthetic provider lets the reference reuse the getSlot probe path.
+    let reference = ProviderConfig {
+        name: REFERENCE_LABEL.to_string(),
+        url,
+        weight: 0,
+        http3: false,
+        methods: None,
+    };
+    info!(reference = %reference.url, "external slot reference enabled (probe-only, never routed)");
+
+    let interval = Duration::from_millis(cfg.interval_ms);
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        match probe(&client, &reference).await {
+            Ok(res) => {
+                let processed = res.slots.processed.unwrap_or_default();
+                // Merge (not replace) so a commitment whose leg failed this cycle
+                // keeps its last-known slot, exactly like a provider probe.
+                slots.write().merge(res.slots);
+                metrics.record_probe(REFERENCE_LABEL, "reference", "ok");
+                debug!(reference = %reference.url, processed, "reference probe ok");
+            }
+            Err(e) => {
+                // A stale or unreachable reference is safe by construction: the tip
+                // folds it in with a per-commitment `max` against every provider, so
+                // a reference that falls behind (or never answers) simply stops
+                // pinning the tip — it can never raise a provider's drift falsely.
+                if e.downcast_ref::<RateLimited>().is_some() {
+                    metrics.record_probe(REFERENCE_LABEL, "reference", "rate_limited");
+                    warn!(reference = %reference.url, "reference probe rate limited (429)");
+                } else {
+                    metrics.record_probe(REFERENCE_LABEL, "reference", "error");
+                    warn!(reference = %reference.url, error = %e, "reference probe failed");
                 }
             }
         }
@@ -1345,6 +1466,154 @@ mod tests {
         assert_eq!(tips.confirmed, 995, "max confirmed from b");
         assert_eq!(tips.finalized, 970, "max finalized from b");
         assert_eq!(monitor.slot_tip(), 1000);
+    }
+
+    // ── External slot reference ────────────────────────────────────────────────
+
+    /// Insert a provider with a fixed set of slots, bypassing the background loop.
+    fn insert_provider(monitor: &HealthMonitor, name: &str, slots: CommitmentSlots) {
+        let health = ProviderHealth::new(name);
+        health.update_slots(slots);
+        monitor.entries.write().insert(
+            name.to_string(),
+            ProviderEntry {
+                health,
+                stop: Arc::new(AtomicBool::new(false)),
+            },
+        );
+    }
+
+    fn monitor_with_reference(url: Option<&str>) -> HealthMonitor {
+        let cfg = HealthConfig {
+            reference_url: url.map(str::to_string),
+            ..Default::default()
+        };
+        HealthMonitor::new(&[], cfg, Metrics::new())
+    }
+
+    #[test]
+    fn reference_tip_none_when_unconfigured() {
+        let monitor = monitor_with_reference(None);
+        assert!(monitor.reference_tip().is_none());
+    }
+
+    #[test]
+    fn reference_tip_some_when_configured() {
+        let monitor = monitor_with_reference(Some("https://api.mainnet-beta.solana.com"));
+        // Configured but not yet probed → Some with all-None slots.
+        let tip = monitor
+            .reference_tip()
+            .expect("configured reference reports a tip");
+        assert!(tip.processed.is_none());
+    }
+
+    #[test]
+    fn reference_ahead_pins_tip_and_reveals_all_stale_drift() {
+        // Two providers frozen together at 1000; the reference has advanced to
+        // 1100. Without the reference the tip would be 1000 and neither provider
+        // would show drift (the failure C6 describes). With it, both drift 100.
+        let monitor = monitor_with_reference(Some("https://ref.example"));
+        insert_provider(
+            &monitor,
+            "a",
+            CommitmentSlots {
+                processed: Some(1000),
+                confirmed: Some(1000),
+                finalized: Some(968),
+            },
+        );
+        insert_provider(
+            &monitor,
+            "b",
+            CommitmentSlots {
+                processed: Some(1000),
+                confirmed: Some(1000),
+                finalized: Some(968),
+            },
+        );
+        *monitor.reference_slots.write() = CommitmentSlots {
+            processed: Some(1100),
+            confirmed: Some(1100),
+            finalized: Some(1068),
+        };
+
+        assert_eq!(monitor.slot_tip(), 1100, "reference pins the processed tip");
+        for snap in monitor.snapshots() {
+            assert_eq!(snap.slot_drift, 100, "{} should show 100 drift", snap.name);
+            assert!(snap.is_drifting, "{} should be flagged drifting", snap.name);
+        }
+    }
+
+    #[test]
+    fn single_provider_gets_a_checkpoint_from_the_reference() {
+        // An own-node / single-provider deploy is otherwise its own tip and can
+        // never show drift. The reference gives it the missing checkpoint.
+        let monitor = monitor_with_reference(Some("https://ref.example"));
+        insert_provider(
+            &monitor,
+            "own-node",
+            CommitmentSlots {
+                processed: Some(500),
+                confirmed: Some(500),
+                finalized: Some(468),
+            },
+        );
+        *monitor.reference_slots.write() = CommitmentSlots {
+            processed: Some(550),
+            confirmed: Some(550),
+            finalized: Some(518),
+        };
+        let snap = &monitor.snapshots()[0];
+        assert_eq!(snap.slot_drift, 50);
+        assert!(snap.is_drifting);
+    }
+
+    #[test]
+    fn stale_reference_never_raises_drift_falsely() {
+        // A reference that has fallen behind the providers must not pin the tip
+        // below them — the fold is a per-commitment max, so the providers win and
+        // no false drift appears.
+        let monitor = monitor_with_reference(Some("https://ref.example"));
+        insert_provider(
+            &monitor,
+            "fresh",
+            CommitmentSlots {
+                processed: Some(2000),
+                confirmed: Some(2000),
+                finalized: Some(1968),
+            },
+        );
+        *monitor.reference_slots.write() = CommitmentSlots {
+            processed: Some(1000), // reference lagging far behind the provider
+            confirmed: Some(1000),
+            finalized: Some(968),
+        };
+        assert_eq!(
+            monitor.slot_tip(),
+            2000,
+            "provider outruns a stale reference"
+        );
+        let snap = &monitor.snapshots()[0];
+        assert_eq!(snap.slot_drift, 0);
+        assert!(!snap.is_drifting);
+    }
+
+    #[test]
+    fn unconfigured_reference_is_a_noop_for_the_tip() {
+        // With no reference, the all-None store contributes nothing to the tip.
+        let monitor = monitor_with_reference(None);
+        insert_provider(
+            &monitor,
+            "a",
+            CommitmentSlots {
+                processed: Some(1000),
+                confirmed: Some(1000),
+                finalized: Some(968),
+            },
+        );
+        assert_eq!(monitor.slot_tip(), 1000);
+        let snap = &monitor.snapshots()[0];
+        assert_eq!(snap.slot_drift, 0, "own tip → no drift without a reference");
     }
 
     #[test]

@@ -66,6 +66,12 @@ impl Config {
                 .all(|m| !m.trim().is_empty()),
             "routing.write_methods must not contain empty entries"
         );
+        if let Some(url) = &self.health.reference_url {
+            anyhow::ensure!(
+                !url.trim().is_empty(),
+                "health.reference_url must not be empty; omit the key to disable the external reference"
+            );
+        }
         if let Some(r) = &self.reporting {
             anyhow::ensure!(
                 !r.endpoint.is_empty(),
@@ -175,6 +181,18 @@ pub struct HealthConfig {
     /// Slots behind network tip before a provider is considered drifting.
     #[serde(default = "default_slot_drift_threshold")]
     pub slot_drift_threshold: u64,
+    /// Optional external reference endpoint (e.g. a public cluster RPC) probed
+    /// for its slot but **never routed to**. Its slot is folded into the network
+    /// tip, so an all-providers-stale stall — or a single-provider / own-node
+    /// deploy that is otherwise its own tip — still surfaces as drift instead of
+    /// the tip moving in lockstep with the providers.
+    ///
+    /// Default-off (`None`): leaving it unset keeps the proxy's promise of zero
+    /// outbound connections beyond the providers you configure. On devnet/testnet
+    /// set it to the *matching* cluster's RPC URL — a mainnet reference against a
+    /// devnet provider set (or vice versa) would report false drift.
+    #[serde(default)]
+    pub reference_url: Option<String>,
     /// Consecutive probe failures before the circuit opens.
     #[serde(default = "default_circuit_open_failures")]
     pub circuit_open_failures: u32,
@@ -201,6 +219,7 @@ impl Default for HealthConfig {
             interval_ms: default_interval_ms(),
             window_secs: default_window_secs(),
             slot_drift_threshold: default_slot_drift_threshold(),
+            reference_url: None,
             circuit_open_failures: default_circuit_open_failures(),
             circuit_error_threshold: default_circuit_error_threshold(),
             circuit_cooldown_secs: default_circuit_cooldown_secs(),
@@ -531,6 +550,54 @@ methods = []
             "url = \"https://rpc.example/?api-key=hardcoded-token\""
         );
         assert!(unset.is_empty());
+    }
+
+    #[test]
+    fn reference_url_defaults_to_none() {
+        let f = write_config(
+            r#"
+[[providers]]
+name = "p"
+url = "http://localhost:8899"
+"#,
+        );
+        let cfg = Config::load(f.path()).unwrap();
+        assert!(cfg.health.reference_url.is_none());
+    }
+
+    #[test]
+    fn parses_reference_url() {
+        let f = write_config(
+            r#"
+[health]
+reference_url = "https://api.mainnet-beta.solana.com"
+
+[[providers]]
+name = "p"
+url = "http://localhost:8899"
+"#,
+        );
+        let cfg = Config::load(f.path()).unwrap();
+        assert_eq!(
+            cfg.health.reference_url.as_deref(),
+            Some("https://api.mainnet-beta.solana.com")
+        );
+    }
+
+    #[test]
+    fn rejects_empty_reference_url() {
+        let f = write_config(
+            r#"
+[health]
+reference_url = "  "
+
+[[providers]]
+name = "p"
+url = "http://localhost:8899"
+"#,
+        );
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(err.contains("reference_url"), "got: {err}");
     }
 
     #[test]
