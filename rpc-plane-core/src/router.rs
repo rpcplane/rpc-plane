@@ -79,6 +79,12 @@ pub struct RouteDecision {
     /// For broadcasts all are contacted concurrently.
     pub providers: Vec<Arc<str>>,
     pub broadcast: bool,
+    /// True when no provider was routable (all circuit-open and/or at their
+    /// `max_rps` cap) and this list is the degraded last-resort fallback of every
+    /// provider that *supports* the method. The dispatch path bypasses the
+    /// per-provider rate gate for a degraded decision so a lone or fully-capped
+    /// fleet still serves rather than self-inflicting a 502.
+    pub degraded: bool,
 }
 
 /// Select providers given current health snapshots.
@@ -121,6 +127,7 @@ pub fn route(
                 .map(|s| s.name.clone())
                 .collect(),
             broadcast: broadcast_writes && class == MethodClass::Write,
+            degraded: true,
         };
     }
 
@@ -128,6 +135,7 @@ pub fn route(
         return RouteDecision {
             providers: available.iter().map(|s| s.name.clone()).collect(),
             broadcast: true,
+            degraded: false,
         };
     }
 
@@ -142,6 +150,7 @@ pub fn route(
             RouteDecision {
                 providers: available.iter().map(|s| s.name.clone()).collect(),
                 broadcast: false,
+                degraded: false,
             }
         }
 
@@ -182,6 +191,7 @@ pub fn route(
             RouteDecision {
                 providers: result,
                 broadcast: false,
+                degraded: false,
             }
         }
 
@@ -205,6 +215,7 @@ pub fn route(
             RouteDecision {
                 providers: ordered.iter().map(|s| s.name.clone()).collect(),
                 broadcast: false,
+                degraded: false,
             }
         }
 
@@ -218,6 +229,7 @@ pub fn route(
             RouteDecision {
                 providers: available.iter().map(|s| s.name.clone()).collect(),
                 broadcast: true, // use broadcast path but return on first success
+                degraded: false,
             }
         }
     }
@@ -244,6 +256,7 @@ mod tests {
             processed: CommitmentHealth::default(),
             confirmed: CommitmentHealth::default(),
             finalized: CommitmentHealth::default(),
+            rate_limited: false,
         }
     }
 
@@ -260,6 +273,15 @@ mod tests {
             processed: CommitmentHealth::default(),
             confirmed: CommitmentHealth::default(),
             finalized: CommitmentHealth::default(),
+            rate_limited: false,
+        }
+    }
+
+    /// A healthy provider whose `max_rps` bucket is currently empty.
+    fn snap_rate_limited(name: &str, score: f64) -> HealthSnapshot {
+        HealthSnapshot {
+            rate_limited: true,
+            ..snap(name, score)
         }
     }
 
@@ -272,6 +294,7 @@ mod tests {
                 weight: 1,
                 http3: false,
                 methods: None,
+                max_rps: None,
             })
             .collect()
     }
@@ -576,6 +599,58 @@ mod tests {
         );
         // getSlot can't go to the submit-only provider even in the degraded path.
         assert_eq!(names(&d), ["read"]);
+    }
+
+    #[test]
+    fn rate_limited_provider_excluded_from_reads() {
+        // "b" is at its max_rps cap → routed around, even with the best score.
+        let snaps = vec![snap("a", 0.6), snap_rate_limited("b", 0.9), snap("c", 0.5)];
+        let d = route(
+            "getSlot",
+            &snaps,
+            &RoutingStrategy::BestScore,
+            &providers(&["a", "b", "c"]),
+            false,
+            &writes(),
+        );
+        assert!(!d.providers.iter().any(|p| p.as_ref() == "b"));
+        assert_eq!(&*d.providers[0], "a");
+        assert!(!d.degraded);
+    }
+
+    #[test]
+    fn all_rate_limited_returns_degraded_fallback() {
+        // Every provider is at capacity: the router still returns them all, but
+        // marks the decision degraded so dispatch bypasses the rate gate and
+        // serves rather than 502-ing.
+        let snaps = vec![snap_rate_limited("a", 0.9), snap_rate_limited("b", 0.7)];
+        let d = route(
+            "getSlot",
+            &snaps,
+            &RoutingStrategy::BestScore,
+            &providers(&["a", "b"]),
+            false,
+            &writes(),
+        );
+        assert_eq!(d.providers.len(), 2);
+        assert!(
+            d.degraded,
+            "all-capped fleet must degrade, not drop requests"
+        );
+    }
+
+    #[test]
+    fn normal_decision_is_not_degraded() {
+        let snaps = vec![snap("a", 0.9), snap("b", 0.7)];
+        let d = route(
+            "getSlot",
+            &snaps,
+            &RoutingStrategy::BestScore,
+            &providers(&["a", "b"]),
+            false,
+            &writes(),
+        );
+        assert!(!d.degraded);
     }
 
     #[test]

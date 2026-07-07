@@ -90,6 +90,7 @@ fn test_config(
                 weight: 1,
                 http3: false,
                 methods: None,
+                max_rps: None,
             })
             .collect(),
         reporting: None,
@@ -469,6 +470,7 @@ async fn circuit_recovers_traffic_resumes() {
                 weight: 1,
                 http3: false,
                 methods: None,
+                max_rps: None,
             },
             ProviderConfig {
                 name: "b".into(),
@@ -476,6 +478,7 @@ async fn circuit_recovers_traffic_resumes() {
                 weight: 1,
                 http3: false,
                 methods: None,
+                max_rps: None,
             },
         ],
         reporting: None,
@@ -971,5 +974,99 @@ async fn rate_limited_provider_demoted_but_circuit_stays_closed() {
         "throttled provider must be demoted (a={}, b={})",
         a.score,
         b.score
+    );
+}
+
+// ── Per-provider max_rps rate limiting ──────────────────────────────────────────
+
+/// A mock answering every POST with `slot`, counting only the POSTs whose body
+/// contains `needle`. Reads use `getBalance` as the needle so the background
+/// `getSlot` health probe (which never touches the rate bucket) isn't counted.
+async fn start_counting_mock(
+    slot: u64,
+    needle: &'static str,
+) -> (String, Arc<AtomicUsize>, tokio::task::AbortHandle) {
+    let count = Arc::new(AtomicUsize::new(0));
+    let c = count.clone();
+    let router = Router::new().route(
+        "/",
+        post(move |body: axum::body::Bytes| {
+            let c = c.clone();
+            async move {
+                if std::str::from_utf8(&body).is_ok_and(|s| s.contains(needle)) {
+                    c.fetch_add(1, Ordering::Relaxed);
+                }
+                slot_response(slot)
+            }
+        }),
+    );
+    let (url, abort) = start_mock(router).await;
+    (url, count, abort)
+}
+
+/// A provider at its `max_rps` cap is treated as unavailable: once its one-token
+/// bucket drains, the next read sheds to an uncapped peer rather than hammering
+/// the capped provider. FailoverOrdered keeps A preferred while it has capacity.
+#[tokio::test]
+async fn max_rps_sheds_request_to_uncapped_peer() {
+    let (url_a, count_a, _aa) = start_counting_mock(1, "getBalance").await;
+    let (url_b, count_b, _ab) = start_counting_mock(2, "getBalance").await;
+
+    let mut cfg = test_config(
+        &[("a", &url_a), ("b", &url_b)],
+        RoutingStrategy::FailoverOrdered,
+        2, // allow a retry to the peer
+        5,
+    );
+    cfg.providers[0].max_rps = Some(1);
+    let state = ProxyState::new(cfg);
+    let router = build_router(state);
+
+    // Request 1: A has its starting token → served by A.
+    let (s1, _) = proxy_request(router.clone(), GET_BALANCE).await;
+    assert_eq!(s1, StatusCode::OK);
+    // Request 2: A's bucket is empty → A is unavailable, the read sheds to B.
+    let (s2, _) = proxy_request(router.clone(), GET_BALANCE).await;
+    assert_eq!(s2, StatusCode::OK);
+
+    assert_eq!(
+        count_a.load(Ordering::Relaxed),
+        1,
+        "A serves exactly one read before its cap"
+    );
+    assert_eq!(
+        count_b.load(Ordering::Relaxed),
+        1,
+        "the second read sheds to the uncapped peer"
+    );
+}
+
+/// With only one provider, its `max_rps` cap must never hard-fail a request:
+/// there is no peer to shed to, so the degraded path forwards it anyway rather
+/// than returning 502. The cap is a load-shedding hint, not a hard throttle.
+#[tokio::test]
+async fn max_rps_lone_provider_still_serves_when_capped() {
+    let (url_a, count_a, _aa) = start_counting_mock(9, "getBalance").await;
+
+    let mut cfg = test_config(&[("a", &url_a)], RoutingStrategy::FailoverOrdered, 2, 5);
+    cfg.providers[0].max_rps = Some(1);
+    let state = ProxyState::new(cfg);
+    let router = build_router(state);
+
+    // Two reads back to back: the second finds an empty bucket but, with no peer,
+    // the router degrades and serves it anyway.
+    let (s1, _) = proxy_request(router.clone(), GET_BALANCE).await;
+    let (s2, b2) = proxy_request(router.clone(), GET_BALANCE).await;
+    assert_eq!(s1, StatusCode::OK);
+    assert_eq!(
+        s2,
+        StatusCode::OK,
+        "a lone capped provider must still serve, not 502"
+    );
+    assert_eq!(b2["result"].as_u64(), Some(9));
+    assert_eq!(
+        count_a.load(Ordering::Relaxed),
+        2,
+        "both reads reach the lone provider"
     );
 }

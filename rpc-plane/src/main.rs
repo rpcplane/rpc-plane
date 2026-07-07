@@ -464,6 +464,24 @@ async fn watch_config(
             info!(provider = %name, reason, "hot reload: provider client (re)built");
         }
 
+        // max_rps is a routing-only knob (like weight): it needs no client
+        // rebuild, but the token bucket lives on the monitor, so push any change
+        // in place — updating the bucket without disturbing the provider's health
+        // state. Added/rebuilt providers already got their limiter above; this
+        // catches a standalone cap change on an otherwise-unchanged provider.
+        for (name, new_p) in &new_providers {
+            let old_rps = old_providers.get(name).and_then(|p| p.max_rps);
+            if old_rps != new_p.max_rps {
+                monitor.apply_rate_limit(name, new_p.max_rps);
+                info!(
+                    provider = %name,
+                    old = ?old_rps,
+                    new = ?new_p.max_rps,
+                    "hot reload: max_rps changed"
+                );
+            }
+        }
+
         // Warn about settings that need a restart to take effect (the runtime
         // and listening sockets are already built).
         if old_server.listen != new_config.server.listen
@@ -626,6 +644,7 @@ mod tests {
             weight: 1,
             http3,
             methods: None,
+            max_rps: None,
         }
     }
 

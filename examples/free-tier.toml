@@ -1,16 +1,20 @@
 # Free-tier maxxing
 #
-# Spreads load across five free or no-cost endpoints so no single provider
-# sees enough traffic to hit its rate limit.
+# Spreads load across four free or no-cost endpoints so no single provider
+# sees enough traffic to hit its rate limit. The optional `max_rps` cap on each
+# provider makes that explicit: once a provider is dispatching at its plan's
+# per-second limit it's treated as unavailable and load sheds to the others, so
+# you stop hitting a free key's 429s before they happen. Set each cap to the
+# limit your plan actually documents — the values below are illustrative.
 #
-# Two providers need no sign-up at all:
+# One provider needs no sign-up at all:
 #   - api.mainnet-beta.solana.com  (Solana Foundation public RPC)
-#   - rpc.ankr.com/solana          (Ankr public RPC)
 #
-# The remaining three require a free account:
-#   - Helius   https://helius.dev       (Developer plan)
-#   - QuickNode https://quicknode.com   (Free starter endpoint)
-#   - Alchemy  https://alchemy.com      (Free tier)
+# The other three require a free account:
+#   - Helius    https://helius.dev       (Developer plan)
+#   - QuickNode https://quicknode.com    (Free endpoint — note: the free tier
+#                                         only lasts ~1 month, then it's paid)
+#   - Alchemy   https://alchemy.com       (Free tier)
 #
 # Usage:
 #   export HELIUS_API_KEY=...
@@ -31,35 +35,34 @@ circuit_cooldown_secs   = 2     # RPS windows reset per-second; recover fast
 
 [routing]
 strategy    = "weighted_random"  # spread load evenly — avoid hammering one key
-max_retries = 4                  # try all five before giving up
+max_retries = 3                  # try all four before giving up
 
 # ── No sign-up required ────────────────────────────────────────────────────────
 
 [[providers]]
-name   = "solana-foundation"
-url    = "https://api.mainnet-beta.solana.com"
-weight = 1
-
-[[providers]]
-name   = "ankr"
-url    = "https://rpc.ankr.com/solana"
-weight = 1
+name    = "solana-foundation"
+url     = "https://api.mainnet-beta.solana.com"
+weight  = 1
+max_rps = 10   # illustrative — set to your plan's documented per-second limit
 
 # ── Free-tier accounts ─────────────────────────────────────────────────────────
 
 [[providers]]
-name   = "helius"
-url    = "https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}"
-weight = 1
+name    = "helius"
+url     = "https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}"
+weight  = 1
+max_rps = 10
 # http3 = true   # opt-in QUIC. Can help on a lossy home/last-mile link, but there's no
                  # HTTP/2 fallback — only enable if your endpoint serves QUIC. See docs.
 
 [[providers]]
-name   = "quicknode"
-url    = "https://your-endpoint.quiknode.pro/${QUICKNODE_API_KEY}"
-weight = 1
+name    = "quicknode"
+url     = "https://your-endpoint.quiknode.pro/${QUICKNODE_API_KEY}"
+weight  = 1
+max_rps = 15   # heads up: QuickNode's free endpoint only lasts ~1 month, then it's paid
 
 [[providers]]
-name   = "alchemy"
-url    = "https://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}"
-weight = 1
+name    = "alchemy"
+url     = "https://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}"
+weight  = 1
+max_rps = 15

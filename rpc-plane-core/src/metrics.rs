@@ -11,6 +11,7 @@ struct Inner {
     requests: CounterVec,
     duration: HistogramVec,
     failovers: CounterVec,
+    rate_limited: CounterVec,
     probe_requests: CounterVec,
     health_score: GaugeVec,
     slot_height: GaugeVec,
@@ -56,6 +57,15 @@ impl Metrics {
                 "Requests retried on a different provider",
             ),
             &["from_provider", "to_provider"],
+        )
+        .unwrap();
+
+        let rate_limited = CounterVec::new(
+            Opts::new(
+                "rpc_plane_rate_limited_total",
+                "Requests shed from a provider because its max_rps token bucket was empty",
+            ),
+            &["provider"],
         )
         .unwrap();
 
@@ -140,6 +150,7 @@ impl Metrics {
             Box::new(requests.clone()) as Box<dyn prometheus::core::Collector>,
             Box::new(duration.clone()),
             Box::new(failovers.clone()),
+            Box::new(rate_limited.clone()),
             Box::new(probe_requests.clone()),
             Box::new(health_score.clone()),
             Box::new(slot_height.clone()),
@@ -164,6 +175,7 @@ impl Metrics {
             requests,
             duration,
             failovers,
+            rate_limited,
             probe_requests,
             health_score,
             slot_height,
@@ -201,6 +213,12 @@ impl Metrics {
 
     pub fn record_failover(&self, from: &str, to: &str) {
         self.0.failovers.with_label_values(&[from, to]).inc();
+    }
+
+    /// Count one request shed from `provider` because its `max_rps` bucket was
+    /// empty (the request routes to a peer, or serves anyway when degraded).
+    pub fn record_rate_limited(&self, provider: &str) {
+        self.0.rate_limited.with_label_values(&[provider]).inc();
     }
 
     pub fn record_probe(&self, provider: &str, probe_type: &str, status: &str) {
@@ -337,6 +355,18 @@ mod tests {
         assert!(text.contains(
             "rpc_plane_failover_total{from_provider=\"helius\",to_provider=\"triton\"} 2"
         ));
+    }
+
+    #[test]
+    fn rate_limited_counter() {
+        let m = Metrics::new();
+        m.record_rate_limited("helius");
+        m.record_rate_limited("helius");
+        m.record_rate_limited("triton");
+
+        let text = m.render();
+        assert!(text.contains("rpc_plane_rate_limited_total{provider=\"helius\"} 2"));
+        assert!(text.contains("rpc_plane_rate_limited_total{provider=\"triton\"} 1"));
     }
 
     #[test]

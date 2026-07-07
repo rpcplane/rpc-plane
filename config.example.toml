@@ -51,9 +51,13 @@ http3  = true   # opt-in HTTP/3 (QUIC). No HTTP/2 fallback — only for endpoint
                 # enable HTTP/3". Leave it off (the default) unless you're on a cold/lossy path.
 
 [[providers]]
-name   = "quicknode"
-url    = "https://your-endpoint.quiknode.pro/${QUICKNODE_API_KEY}"
-weight = 1
+name    = "quicknode"
+url     = "https://your-endpoint.quiknode.pro/${QUICKNODE_API_KEY}"
+weight  = 1
+# max_rps = 50   # optional per-provider rate cap (requests/sec). Once a provider is
+                 # dispatching at its cap it's treated as unavailable so load sheds to
+                 # peers with headroom. Load-shedding hint, not a hard throttle: with no
+                 # other provider free the request is still forwarded. Omit for no limit.
 
 [[providers]]
 name   = "triton"

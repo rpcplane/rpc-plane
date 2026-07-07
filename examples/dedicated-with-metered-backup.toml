@@ -43,3 +43,7 @@ url  = "${DEDICATED_URL}"
 [[providers]]
 name = "quicknode-backup"
 url  = "https://your-endpoint.quiknode.pro/${QUICKNODE_API_KEY}"
+# max_rps = 100   # optional cost guardrail: cap how fast the metered backup can be
+                  # billed while the primary is down. At the cap it's treated as
+                  # unavailable — but as the only provider left it still serves
+                  # (load-shedding hint, not a hard throttle).
