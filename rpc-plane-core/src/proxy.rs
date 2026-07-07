@@ -256,10 +256,20 @@ async fn handle_health(State(state): State<ProxyState>) -> impl IntoResponse {
             })
         })
         .collect();
+    // External reference tip (opt-in `[health] reference_url`) — the checkpoint
+    // the slot tips are pinned to. `null` when no reference is configured.
+    let reference = state.monitor.reference_tip().map(|s| {
+        serde_json::json!({
+            "processed": s.processed,
+            "confirmed": s.confirmed,
+            "finalized": s.finalized,
+        })
+    });
     axum::Json(serde_json::json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
         "providers": providers,
+        "reference": reference,
     }))
 }
 
