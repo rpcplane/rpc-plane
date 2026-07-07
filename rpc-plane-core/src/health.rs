@@ -1,7 +1,7 @@
 use crate::config::{HealthConfig, ProviderConfig};
 use crate::metrics::Metrics;
 use crate::proxy::Clients;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use reqwest::Client;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
@@ -31,6 +31,100 @@ enum Sample {
     Success,
     Failure,
     Throttle,
+}
+
+// ── Per-provider rate limiting ────────────────────────────────────────────────
+
+/// A simple token bucket. The capacity is one second's worth of tokens (`rate`),
+/// so a provider can burst up to `max_rps` and then sustains `max_rps`/s as the
+/// bucket refills continuously. Fractional tokens keep the refill smooth between
+/// sub-millisecond dispatches. All state is behind a [`RateLimiter`] mutex.
+#[derive(Debug)]
+struct TokenBucket {
+    /// Tokens available right now (fractional).
+    tokens: f64,
+    /// Ceiling the bucket refills to — one second of `rate` (the burst size).
+    capacity: f64,
+    /// Refill rate in tokens/second (= configured `max_rps`).
+    rate: f64,
+    /// When the bucket was last refilled.
+    last: Instant,
+}
+
+impl TokenBucket {
+    fn new(max_rps: u32) -> Self {
+        let cap = f64::from(max_rps);
+        // Start full so a freshly (re)configured provider can serve immediately.
+        Self {
+            tokens: cap,
+            capacity: cap,
+            rate: cap,
+            last: Instant::now(),
+        }
+    }
+
+    /// Add the tokens accrued since the last refill, capped at `capacity`.
+    fn refill(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        if elapsed > 0.0 {
+            self.tokens = (self.tokens + elapsed * self.rate).min(self.capacity);
+            self.last = now;
+        }
+    }
+
+    /// Spend one token if available. Returns whether a token was taken.
+    fn try_acquire(&mut self) -> bool {
+        self.refill(Instant::now());
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Whether a token is available, *without* spending it — the routing peek.
+    fn has_capacity(&mut self) -> bool {
+        self.refill(Instant::now());
+        self.tokens >= 1.0
+    }
+
+    /// Reconfigure the rate/capacity in place (hot reload), keeping the current
+    /// token level (clamped to the new ceiling) so a rate tweak doesn't reset the
+    /// bucket or hand out a fresh burst.
+    fn reconfigure(&mut self, max_rps: u32) {
+        self.refill(Instant::now());
+        let cap = f64::from(max_rps);
+        self.capacity = cap;
+        self.rate = cap;
+        self.tokens = self.tokens.min(cap);
+    }
+}
+
+/// Per-provider rate limiter guarding a [`TokenBucket`]. Present only for
+/// providers with a `max_rps` cap configured; unlimited providers hold `None`
+/// and never touch this lock on the hot path.
+#[derive(Debug)]
+pub struct RateLimiter(Mutex<TokenBucket>);
+
+impl RateLimiter {
+    fn new(max_rps: u32) -> Arc<Self> {
+        Arc::new(Self(Mutex::new(TokenBucket::new(max_rps))))
+    }
+
+    /// Spend one token — called once per dispatch to a capped provider.
+    fn try_acquire(&self) -> bool {
+        self.0.lock().try_acquire()
+    }
+
+    /// Peek at remaining capacity for a routing snapshot (no token spent).
+    fn has_capacity(&self) -> bool {
+        self.0.lock().has_capacity()
+    }
+
+    fn reconfigure(&self, max_rps: u32) {
+        self.0.lock().reconfigure(max_rps);
+    }
 }
 
 // ── Commitment isolation ─────────────────────────────────────────────────────
@@ -151,11 +245,20 @@ pub struct HealthSnapshot {
     pub processed: CommitmentHealth,
     pub confirmed: CommitmentHealth,
     pub finalized: CommitmentHealth,
+    /// True when the provider's per-provider `max_rps` token bucket is empty —
+    /// it is at its configured cap and should shed to peers. Always false for a
+    /// provider with no cap. Set by [`HealthMonitor::snapshots`], which peeks the
+    /// bucket without spending a token.
+    pub rate_limited: bool,
 }
 
 impl HealthSnapshot {
+    /// Eligible for normal routing. An open circuit (broken) or an empty rate
+    /// bucket (at its configured cap) both make a provider unavailable so the
+    /// router shifts load to peers; the all-unavailable fallback in `route` still
+    /// reaches these as a last resort.
     pub fn is_available(&self) -> bool {
-        self.circuit != CircuitState::Open
+        self.circuit != CircuitState::Open && !self.rate_limited
     }
 }
 
@@ -380,6 +483,10 @@ impl ProviderHealth {
             processed,
             confirmed,
             finalized,
+            // The bucket lives on the monitor's `ProviderEntry`, not here;
+            // `HealthMonitor::snapshots` overlays the peek. A bare per-provider
+            // snapshot (unit tests) has no cap and so is never rate-limited.
+            rate_limited: false,
         }
     }
 
@@ -463,8 +570,16 @@ fn apply_circuit_transitions(g: &mut Inner, name: &str, cfg: &HealthConfig) {
 
 struct ProviderEntry {
     health: Arc<ProviderHealth>,
+    /// Per-provider rate limiter, or `None` when the provider has no `max_rps`
+    /// cap (unlimited — the hot path never locks a bucket).
+    limiter: Option<Arc<RateLimiter>>,
     /// Set to true to signal the background loops for this provider to exit.
     stop: Arc<AtomicBool>,
+}
+
+/// Build a provider's rate limiter from its optional `max_rps` cap.
+fn build_limiter(max_rps: Option<u32>) -> Option<Arc<RateLimiter>> {
+    max_rps.map(RateLimiter::new)
 }
 
 /// Metric `provider` label used for the external reference probe. Distinguished
@@ -496,6 +611,7 @@ impl HealthMonitor {
                     p.name.clone(),
                     ProviderEntry {
                         health: ProviderHealth::new(p.name.as_str()),
+                        limiter: build_limiter(p.max_rps),
                         stop: Arc::new(AtomicBool::new(false)),
                     },
                 )
@@ -555,6 +671,7 @@ impl HealthMonitor {
     pub fn add_provider(&self, client: Arc<Client>, provider: ProviderConfig) {
         let stop = Arc::new(AtomicBool::new(false));
         let health = ProviderHealth::new(provider.name.as_str());
+        let limiter = build_limiter(provider.max_rps);
         Self::spawn_loops(
             health.clone(),
             stop.clone(),
@@ -563,9 +680,49 @@ impl HealthMonitor {
             self.cfg.clone(),
             self.metrics.clone(),
         );
-        self.entries
-            .write()
-            .insert(provider.name.clone(), ProviderEntry { health, stop });
+        self.entries.write().insert(
+            provider.name.clone(),
+            ProviderEntry {
+                health,
+                limiter,
+                stop,
+            },
+        );
+    }
+
+    /// Reconcile a provider's rate cap on hot reload without disturbing its
+    /// health state. Installs, updates in place, or removes the limiter to match
+    /// the new `max_rps`. A no-op for a provider not currently tracked.
+    pub fn apply_rate_limit(&self, name: &str, max_rps: Option<u32>) {
+        let mut entries = self.entries.write();
+        let Some(entry) = entries.get_mut(name) else {
+            return;
+        };
+        match (max_rps, &entry.limiter) {
+            // Update the existing bucket in place (keeps its current tokens).
+            (Some(rps), Some(limiter)) => limiter.reconfigure(rps),
+            // Newly capped, or cap removed.
+            (Some(rps), None) => entry.limiter = Some(RateLimiter::new(rps)),
+            (None, Some(_)) => entry.limiter = None,
+            (None, None) => {}
+        }
+    }
+
+    /// Try to spend one rate-limit token before dispatching to `name`. Returns
+    /// `true` when the forward may proceed — always `true` for a provider with no
+    /// `max_rps` cap. A `false` means the bucket is empty (provider at capacity).
+    pub fn try_acquire(&self, name: &str) -> bool {
+        // Clone the Arc out under the entries read lock, then release it before
+        // taking the bucket lock — never hold two locks at once on the hot path.
+        let limiter = self
+            .entries
+            .read()
+            .get(name)
+            .and_then(|e| e.limiter.clone());
+        match limiter {
+            Some(l) => l.try_acquire(),
+            None => true,
+        }
     }
 
     /// Signal the background loops for this provider to exit and remove it.
@@ -618,20 +775,26 @@ impl HealthMonitor {
     /// score computation), so 1000s of concurrent requests proceed without
     /// queuing on each other.
     pub fn snapshots(&self) -> Vec<HealthSnapshot> {
-        let healths: Vec<Arc<ProviderHealth>> = self
+        let entries: Vec<(Arc<ProviderHealth>, Option<Arc<RateLimiter>>)> = self
             .entries
             .read()
             .values()
-            .map(|e| e.health.clone())
+            .map(|e| (e.health.clone(), e.limiter.clone()))
             .collect();
         let mut tips = SlotTips::default();
-        for h in &healths {
+        for (h, _) in &entries {
             tips.observe(&h.inner.read().slots);
         }
         tips.observe(&self.reference_slots.read());
-        healths
+        entries
             .iter()
-            .map(|h| h.snapshot(&tips, &self.cfg))
+            .map(|(h, limiter)| {
+                let mut snap = h.snapshot(&tips, &self.cfg);
+                // Peek the bucket (no token spent): an empty bucket marks the
+                // provider rate-limited so `is_available` sheds it from routing.
+                snap.rate_limited = limiter.as_ref().is_some_and(|l| !l.has_capacity());
+                snap
+            })
             .collect()
     }
 
@@ -791,6 +954,7 @@ async fn reference_loop(
         weight: 0,
         http3: false,
         methods: None,
+        max_rps: None,
     };
     info!(reference = %reference.url, "external slot reference enabled (probe-only, never routed)");
 
@@ -1248,6 +1412,7 @@ mod tests {
             weight: 1,
             http3: false,
             methods: None,
+            max_rps: None,
         };
         let monitor = HealthMonitor::new(
             std::slice::from_ref(&provider),
@@ -1259,10 +1424,14 @@ mod tests {
         {
             let stop = Arc::new(AtomicBool::new(false));
             let health = ProviderHealth::new("p");
-            monitor
-                .entries
-                .write()
-                .insert("p".to_string(), ProviderEntry { health, stop });
+            monitor.entries.write().insert(
+                "p".to_string(),
+                ProviderEntry {
+                    health,
+                    limiter: None,
+                    stop,
+                },
+            );
         }
         monitor.update_slot("p", 42_000);
         assert_eq!(monitor.slot_tip(), 42_000);
@@ -1279,15 +1448,20 @@ mod tests {
             weight: 1,
             http3: false,
             methods: None,
+            max_rps: None,
         };
         // We don't call add_provider here (needs real HTTP) — just verify map ops
         {
             let stop = Arc::new(AtomicBool::new(false));
             let health = ProviderHealth::new(provider.name.as_str());
-            monitor
-                .entries
-                .write()
-                .insert(provider.name.clone(), ProviderEntry { health, stop });
+            monitor.entries.write().insert(
+                provider.name.clone(),
+                ProviderEntry {
+                    health,
+                    limiter: None,
+                    stop,
+                },
+            );
         }
         assert_eq!(monitor.snapshots().len(), 1);
 
@@ -1441,6 +1615,7 @@ mod tests {
                 name.to_string(),
                 ProviderEntry {
                     health,
+                    limiter: None,
                     stop: Arc::new(AtomicBool::new(false)),
                 },
             );
@@ -1478,6 +1653,7 @@ mod tests {
             name.to_string(),
             ProviderEntry {
                 health,
+                limiter: None,
                 stop: Arc::new(AtomicBool::new(false)),
             },
         );
@@ -1642,5 +1818,131 @@ mod tests {
             "prior confirmed retained across a partial probe"
         );
         assert_eq!(snap.finalized.slot, Some(950));
+    }
+
+    // ── Per-provider rate limiting ─────────────────────────────────────────────
+
+    #[test]
+    fn token_bucket_drains_then_blocks() {
+        let mut b = TokenBucket::new(2); // capacity 2, starts full
+        assert!(b.try_acquire());
+        assert!(b.try_acquire());
+        // No time has passed, so nothing has refilled — the bucket is empty.
+        assert!(!b.try_acquire());
+        assert!(!b.has_capacity());
+    }
+
+    #[test]
+    fn token_bucket_refills_over_time() {
+        let mut b = TokenBucket::new(10); // 10 tokens/sec
+        b.tokens = 0.0;
+        // Pretend 200 ms elapsed → +2 tokens on the next refill.
+        b.last = Instant::now() - Duration::from_millis(200);
+        assert!(b.try_acquire(), "refill should have added ~2 tokens");
+        assert!(b.has_capacity(), "~1 token should remain");
+    }
+
+    #[test]
+    fn token_bucket_refill_capped_at_capacity() {
+        let mut b = TokenBucket::new(5);
+        b.tokens = 0.0;
+        b.last = Instant::now() - Duration::from_secs(100); // long idle
+        b.refill(Instant::now());
+        assert_eq!(b.tokens, 5.0, "refill must never exceed capacity");
+    }
+
+    #[test]
+    fn has_capacity_does_not_spend_a_token() {
+        let mut b = TokenBucket::new(1);
+        assert!(b.has_capacity());
+        assert!(b.has_capacity(), "peeking twice must not consume the token");
+        assert!(b.try_acquire(), "the token is still there to spend");
+        assert!(!b.try_acquire());
+    }
+
+    #[test]
+    fn reconfigure_clamps_tokens_to_new_capacity() {
+        let mut b = TokenBucket::new(100); // starts full at 100
+        b.reconfigure(10);
+        assert_eq!(b.capacity, 10.0);
+        assert_eq!(b.rate, 10.0);
+        assert!(b.tokens <= 10.0, "tokens clamped to the smaller ceiling");
+    }
+
+    /// Insert a provider with a fixed cap, bypassing the background loops.
+    fn insert_capped(monitor: &HealthMonitor, name: &str, max_rps: Option<u32>) {
+        let health = ProviderHealth::new(name);
+        monitor.entries.write().insert(
+            name.to_string(),
+            ProviderEntry {
+                health,
+                limiter: build_limiter(max_rps),
+                stop: Arc::new(AtomicBool::new(false)),
+            },
+        );
+    }
+
+    #[test]
+    fn snapshot_marks_exhausted_bucket_rate_limited() {
+        let monitor = HealthMonitor::new(&[], HealthConfig::default(), Metrics::new());
+        insert_capped(&monitor, "capped", Some(1));
+        // Fresh bucket holds a token → available, not rate-limited.
+        let snap = monitor.snapshots().into_iter().next().unwrap();
+        assert!(!snap.rate_limited);
+        assert!(snap.is_available());
+        // Spend the only token.
+        assert!(monitor.try_acquire("capped"));
+        // Empty bucket → snapshot marks it rate-limited and hence unavailable.
+        let snap = monitor.snapshots().into_iter().next().unwrap();
+        assert!(snap.rate_limited);
+        assert!(!snap.is_available());
+    }
+
+    #[test]
+    fn try_acquire_unlimited_provider_always_true() {
+        let monitor = HealthMonitor::new(&[], HealthConfig::default(), Metrics::new());
+        insert_capped(&monitor, "unlimited", None);
+        for _ in 0..1_000 {
+            assert!(monitor.try_acquire("unlimited"));
+        }
+        assert!(!monitor.snapshots()[0].rate_limited);
+    }
+
+    #[test]
+    fn try_acquire_unknown_provider_is_true() {
+        // A name with no entry (e.g. racing a removal) must never block dispatch.
+        let monitor = HealthMonitor::new(&[], HealthConfig::default(), Metrics::new());
+        assert!(monitor.try_acquire("ghost"));
+    }
+
+    #[test]
+    fn apply_rate_limit_installs_updates_and_removes() {
+        let monitor = HealthMonitor::new(&[], HealthConfig::default(), Metrics::new());
+        insert_capped(&monitor, "p", None);
+        // Unlimited to start.
+        for _ in 0..10 {
+            assert!(monitor.try_acquire("p"));
+        }
+        // Install a 1 rps cap.
+        monitor.apply_rate_limit("p", Some(1));
+        assert!(monitor.try_acquire("p"), "spend the starting token");
+        assert!(!monitor.try_acquire("p"), "now capped at 1 rps");
+        // Remove the cap → unlimited again.
+        monitor.apply_rate_limit("p", None);
+        for _ in 0..10 {
+            assert!(monitor.try_acquire("p"));
+        }
+    }
+
+    #[test]
+    fn apply_rate_limit_reconfigures_bucket_in_place() {
+        let monitor = HealthMonitor::new(&[], HealthConfig::default(), Metrics::new());
+        insert_capped(&monitor, "p", Some(100));
+        assert!(monitor.try_acquire("p")); // ~99 tokens left
+                                           // Shrink to 2 rps: the bucket is updated in place and its level clamped.
+        monitor.apply_rate_limit("p", Some(2));
+        assert!(monitor.try_acquire("p"));
+        assert!(monitor.try_acquire("p"));
+        assert!(!monitor.try_acquire("p"), "cap of 2 exhausted");
     }
 }

@@ -58,6 +58,11 @@ impl Config {
                     p.name
                 );
             }
+            anyhow::ensure!(
+                p.max_rps.is_none_or(|r| r >= 1),
+                "provider '{}' has max_rps = 0; use a positive value or omit the key for no limit",
+                p.name
+            );
         }
         anyhow::ensure!(
             self.routing
@@ -337,6 +342,16 @@ pub struct ProviderConfig {
     /// list; otherwise health is driven by real request outcomes.
     #[serde(default)]
     pub methods: Option<Vec<String>>,
+    /// Optional per-provider rate cap in requests per second. When set, a token
+    /// bucket (capacity = one second of tokens, refilled at `max_rps`/s) sheds
+    /// load once the provider is dispatching at its cap: an empty bucket makes
+    /// the provider *unavailable* for routing so traffic shifts to peers with
+    /// headroom, exactly like a demoted health score. It is a load-shedding cap,
+    /// not a hard throttle — if every eligible provider is at capacity the proxy
+    /// still forwards (degraded) rather than failing the request. Unset (the
+    /// default) means unlimited, with zero per-request overhead.
+    #[serde(default)]
+    pub max_rps: Option<u32>,
 }
 
 impl ProviderConfig {
@@ -516,6 +531,39 @@ methods = ["sendTransaction"]
         assert!(general.supports("getSlot"));
         assert!(submit.supports("sendTransaction"));
         assert!(!submit.supports("getSlot"));
+    }
+
+    #[test]
+    fn parses_provider_max_rps() {
+        let f = write_config(
+            r#"
+[[providers]]
+name = "capped"
+url = "http://localhost:8899"
+max_rps = 50
+
+[[providers]]
+name = "uncapped"
+url = "http://localhost:9000"
+"#,
+        );
+        let cfg = Config::load(f.path()).unwrap();
+        assert_eq!(cfg.providers[0].max_rps, Some(50));
+        assert_eq!(cfg.providers[1].max_rps, None);
+    }
+
+    #[test]
+    fn rejects_zero_max_rps() {
+        let f = write_config(
+            r#"
+[[providers]]
+name = "capped"
+url = "http://localhost:8899"
+max_rps = 0
+"#,
+        );
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(err.contains("max_rps = 0"), "got: {err}");
     }
 
     #[test]

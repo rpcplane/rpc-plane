@@ -248,6 +248,7 @@ async fn handle_health(State(state): State<ProxyState>) -> impl IntoResponse {
                 "error_rate": (s.error_rate * 1000.0).round() / 1000.0,
                 "circuit": format!("{:?}", s.circuit).to_lowercase(),
                 "available": s.is_available(),
+                "rate_limited": s.rate_limited,
                 "commitments": {
                     "processed": commitment(&s.processed),
                     "confirmed": commitment(&s.confirmed),
@@ -327,10 +328,16 @@ async fn handle_rpc(State(state): State<ProxyState>, headers: HeaderMap, body: B
         count: call_count,
     };
 
+    // A degraded decision means no provider was routable (all circuit-open
+    // and/or at their max_rps cap); the fallback lists every provider that
+    // supports the method. Bypass the per-provider rate gate for it so a lone or
+    // fully-capped fleet still serves rather than self-inflicting a 502; the
+    // normal path keeps the gate, shedding a capped provider's load to peers.
+    let rate_gate = !decision.degraded;
     if decision.broadcast {
-        broadcast(&state, &config, &decision.providers, ctx).await
+        broadcast(&state, &config, &decision.providers, ctx, rate_gate).await
     } else {
-        sequential(&state, &config, &decision.providers, ctx).await
+        sequential(&state, &config, &decision.providers, ctx, rate_gate).await
     }
 }
 
@@ -355,6 +362,7 @@ async fn sequential(
     config: &Config,
     providers: &[Arc<str>],
     ctx: RequestCtx<'_>,
+    rate_gate: bool,
 ) -> Response {
     let RequestCtx {
         method,
@@ -364,19 +372,16 @@ async fn sequential(
         count,
     } = ctx;
     let max_attempts = (config.routing.max_retries + 1).min(providers.len());
+    // Count of real forwards issued. Providers skipped before dispatch (missing
+    // client, or shed by the rate gate) do not consume an attempt, so a capped
+    // provider at the front of the list can't starve a healthy one behind it.
+    let mut attempt = 0usize;
     let mut prev_failed: Option<(Arc<str>, &'static str)> = None; // (name, reason)
     let recorder = state.recorder();
 
-    for (attempt, name) in providers.iter().enumerate().take(max_attempts) {
-        if attempt > 0 {
-            if let Some((ref from, reason)) = prev_failed {
-                state.metrics.record_failover(from, name);
-                state.reporter.emit(TelemetryEvent::Failover {
-                    from_provider: from.to_string(),
-                    to_provider: name.to_string(),
-                    reason: reason.to_string(),
-                });
-            }
+    for name in providers {
+        if attempt >= max_attempts {
+            break;
         }
 
         let Some(provider) = config
@@ -390,6 +395,39 @@ async fn sequential(
         let Some(client) = state.client_for(name) else {
             continue;
         };
+
+        // Per-provider rate cap. Only capped providers touch the bucket — the
+        // `max_rps.is_some()` guard short-circuits so an uncapped fleet takes no
+        // lock here (the default path pays one Option check). On the normal path
+        // an empty bucket sheds this request to the next provider without spending
+        // an attempt; a degraded decision (`rate_gate = false`) still drains the
+        // token but serves anyway.
+        if provider.max_rps.is_some() && !state.monitor.try_acquire(name) && rate_gate {
+            state.metrics.record_rate_limited(name);
+            warn!(
+                request_id = %request_id,
+                provider = %name,
+                method,
+                "provider at max_rps cap, shedding to next provider"
+            );
+            continue;
+        }
+
+        if attempt > 0 {
+            if let Some((ref from, reason)) = prev_failed {
+                state.metrics.record_failover(from, name);
+                state.reporter.emit(TelemetryEvent::Failover {
+                    from_provider: from.to_string(),
+                    to_provider: name.to_string(),
+                    reason: reason.to_string(),
+                });
+            }
+        }
+        // 0-based index of this forward; increment now so the retry `continue`s
+        // below carry the next attempt number.
+        let idx = attempt;
+        attempt += 1;
+
         let t0 = Instant::now();
         let result = forward(&client, provider, headers, body).await;
         let latency_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -407,7 +445,7 @@ async fn sequential(
                         request_id = %request_id,
                         provider = %name,
                         method,
-                        attempt,
+                        attempt = idx,
                         status,
                         outcome = outcome.label(),
                         "retryable upstream status, trying next provider"
@@ -431,7 +469,7 @@ async fn sequential(
                         request_id = %request_id,
                         provider = %name,
                         method,
-                        attempt,
+                        attempt = idx,
                         status,
                         outcome = outcome.label(),
                         "upstream non-2xx, passing status through"
@@ -446,13 +484,13 @@ async fn sequential(
                 }
 
                 if let Some(code) = extract_rpc_error_code(&bytes) {
-                    if is_retryable_rpc_code(code) && attempt + 1 < max_attempts {
+                    if is_retryable_rpc_code(code) && attempt < max_attempts {
                         warn!(
                             request_id = %request_id,
                             provider = %name,
                             method,
                             code,
-                            attempt,
+                            attempt = idx,
                             "retryable RPC error, trying next provider"
                         );
                         recorder.record(method, name, Outcome::ProviderError, latency_ms, count);
@@ -464,7 +502,7 @@ async fn sequential(
                     request_id = %request_id,
                     provider = %name,
                     method,
-                    attempt,
+                    attempt = idx,
                     latency_ms = format!("{latency_ms:.1}"),
                     "request ok"
                 );
@@ -481,7 +519,7 @@ async fn sequential(
                     request_id = %request_id,
                     provider = %name,
                     method,
-                    attempt,
+                    attempt = idx,
                     error = %e,
                     "provider error, trying next"
                 );
@@ -502,6 +540,7 @@ async fn broadcast(
     config: &Config,
     providers: &[Arc<str>],
     ctx: RequestCtx<'_>,
+    rate_gate: bool,
 ) -> Response {
     let RequestCtx {
         method,
@@ -531,6 +570,20 @@ async fn broadcast(
         let Some(client) = state.client_for(name) else {
             continue;
         };
+        // Per-provider rate cap: a capped provider's leg is dropped from the fan-out
+        // on the normal path (a degraded decision bypasses the gate). The write still
+        // lands on every provider with headroom. The `max_rps.is_some()` guard keeps
+        // an uncapped fleet off the bucket lock entirely.
+        if provider.max_rps.is_some() && !state.monitor.try_acquire(name) && rate_gate {
+            state.metrics.record_rate_limited(name);
+            warn!(
+                request_id = %request_id,
+                provider = %name,
+                method,
+                "provider at max_rps cap, dropping broadcast leg"
+            );
+            continue;
+        }
         let provider = provider.clone();
         let headers = headers.clone();
         let body = body.clone();

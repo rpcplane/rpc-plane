@@ -22,6 +22,7 @@ fn snap(name: &str, score: f64) -> HealthSnapshot {
         processed: CommitmentHealth::default(),
         confirmed: CommitmentHealth::default(),
         finalized: CommitmentHealth::default(),
+        rate_limited: false,
     }
 }
 
@@ -32,6 +33,7 @@ fn prov(name: &str) -> ProviderConfig {
         weight: 1,
         http3: false,
         methods: None,
+        max_rps: None,
     }
 }
 
