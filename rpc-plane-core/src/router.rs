@@ -16,8 +16,9 @@ pub enum MethodClass {
 /// Classify a method as a read or write given the configured write-method list.
 ///
 /// The list is operator-controlled (`routing.write_methods`); it defaults to
-/// `sendTransaction` + `simulateTransaction` so simulations route on the fast
-/// write path, but it can be overridden to add or remove methods.
+/// just `sendTransaction` — `simulateTransaction` is read-only and routes like a
+/// read unless explicitly added — but it can be overridden to add or remove
+/// methods.
 pub fn classify(method: &str, write_methods: &[String]) -> MethodClass {
     if write_methods.iter().any(|m| m == method) {
         MethodClass::Write

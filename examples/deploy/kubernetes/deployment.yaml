@@ -7,7 +7,9 @@
 #   kubectl apply -f deployment.yaml
 #
 # Keep the Service ClusterIP — RPC Plane is an internal component and should not
-# be exposed to the internet via a LoadBalancer or Ingress.
+# be exposed to the internet via a LoadBalancer or Ingress. The proxy has no
+# auth of its own, so the NetworkPolicy at the bottom gates the port at the
+# network layer: only pods you label rpc-plane-client="true" may reach it.
 ---
 apiVersion: v1
 kind: Secret
@@ -137,3 +139,35 @@ spec:
     - name: metrics
       port: 9401
       targetPort: metrics
+---
+# The proxy port is unauthenticated by design, so gate it at the network layer:
+# only pods explicitly labelled rpc-plane-client="true" may reach 9400, and only
+# the monitoring namespace may scrape 9401. Requires a CNI that enforces
+# NetworkPolicy (Calico, Cilium, most managed clusters). Delete this document if
+# your cluster gates traffic another way.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rpc-plane
+spec:
+  podSelector:
+    matchLabels:
+      app: rpc-plane
+  policyTypes: [Ingress]
+  ingress:
+    # App pods that may use the proxy — label them rpc-plane-client: "true".
+    - from:
+        - podSelector:
+            matchLabels:
+              rpc-plane-client: "true"
+      ports:
+        - { protocol: TCP, port: 9400 }
+    # Metrics scraping — allow 9401 from the namespace where Prometheus runs.
+    # kubernetes.io/metadata.name is the automatic namespace label (k8s ≥ 1.21);
+    # change "monitoring" to match your setup.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - { protocol: TCP, port: 9401 }
