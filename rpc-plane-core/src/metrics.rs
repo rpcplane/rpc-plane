@@ -13,6 +13,11 @@ struct Inner {
     failovers: CounterVec,
     rate_limited: CounterVec,
     probe_requests: CounterVec,
+    tx_submissions: CounterVec,
+    tx_decode: CounterVec,
+    tx_priority_fee: HistogramVec,
+    tx_compute_unit_limit: HistogramVec,
+    tx_compute_unit_price: HistogramVec,
     health_score: GaugeVec,
     slot_height: GaugeVec,
     slot_drift: GaugeVec,
@@ -75,6 +80,80 @@ impl Metrics {
                 "Health and slot probe requests sent to providers",
             ),
             &["provider", "type", "status"],
+        )
+        .unwrap();
+
+        let tx_submissions = CounterVec::new(
+            Opts::new(
+                "rpc_plane_tx_submissions_total",
+                "Transaction submissions by RPC acceptance outcome",
+            ),
+            &["provider", "outcome"],
+        )
+        .unwrap();
+        let tx_decode = CounterVec::new(
+            Opts::new(
+                "rpc_plane_tx_decode_total",
+                "Transaction analytics decode results",
+            ),
+            &["provider", "result"],
+        )
+        .unwrap();
+        let tx_priority_fee = HistogramVec::new(
+            HistogramOpts::new(
+                "rpc_plane_tx_requested_priority_fee_lamports",
+                "Requested transaction priority fee in lamports",
+            )
+            .buckets(vec![
+                1.0,
+                10.0,
+                100.0,
+                1_000.0,
+                10_000.0,
+                100_000.0,
+                1_000_000.0,
+                10_000_000.0,
+            ]),
+            &["provider"],
+        )
+        .unwrap();
+        let tx_compute_unit_limit = HistogramVec::new(
+            HistogramOpts::new(
+                "rpc_plane_tx_compute_unit_limit",
+                "Submitted transaction compute unit limit",
+            )
+            .buckets(vec![
+                50_000.0,
+                100_000.0,
+                200_000.0,
+                300_000.0,
+                400_000.0,
+                600_000.0,
+                800_000.0,
+                1_000_000.0,
+                1_200_000.0,
+                1_400_000.0,
+            ]),
+            &["provider"],
+        )
+        .unwrap();
+        let tx_compute_unit_price = HistogramVec::new(
+            HistogramOpts::new(
+                "rpc_plane_tx_compute_unit_price_micro_lamports",
+                "Requested transaction compute unit price in micro-lamports",
+            )
+            .buckets(vec![
+                1.0,
+                10.0,
+                100.0,
+                1_000.0,
+                10_000.0,
+                100_000.0,
+                1_000_000.0,
+                10_000_000.0,
+                100_000_000.0,
+            ]),
+            &["provider"],
         )
         .unwrap();
 
@@ -152,6 +231,11 @@ impl Metrics {
             Box::new(failovers.clone()),
             Box::new(rate_limited.clone()),
             Box::new(probe_requests.clone()),
+            Box::new(tx_submissions.clone()),
+            Box::new(tx_decode.clone()),
+            Box::new(tx_priority_fee.clone()),
+            Box::new(tx_compute_unit_limit.clone()),
+            Box::new(tx_compute_unit_price.clone()),
             Box::new(health_score.clone()),
             Box::new(slot_height.clone()),
             Box::new(slot_drift.clone()),
@@ -177,6 +261,11 @@ impl Metrics {
             failovers,
             rate_limited,
             probe_requests,
+            tx_submissions,
+            tx_decode,
+            tx_priority_fee,
+            tx_compute_unit_limit,
+            tx_compute_unit_price,
             health_score,
             slot_height,
             slot_drift,
@@ -226,6 +315,39 @@ impl Metrics {
             .probe_requests
             .with_label_values(&[provider, probe_type, status])
             .inc();
+    }
+
+    pub fn record_transaction_submission(&self, provider: &str, accepted: bool) {
+        self.0
+            .tx_submissions
+            .with_label_values(&[provider, if accepted { "accepted" } else { "rejected" }])
+            .inc();
+    }
+
+    pub fn record_transaction_decode(
+        &self,
+        provider: &str,
+        result: &str,
+        sample: Option<&crate::tx::TransactionInfo>,
+    ) {
+        self.0
+            .tx_decode
+            .with_label_values(&[provider, result])
+            .inc();
+        if let Some(info) = sample {
+            self.0
+                .tx_compute_unit_limit
+                .with_label_values(&[provider])
+                .observe(info.cu_limit as f64);
+            self.0
+                .tx_compute_unit_price
+                .with_label_values(&[provider])
+                .observe(info.cu_price_micro_lamports.unwrap_or(0) as f64);
+            self.0
+                .tx_priority_fee
+                .with_label_values(&[provider])
+                .observe(info.requested_priority_fee_lamports.unwrap_or(0) as f64);
+        }
     }
 
     /// Called at scrape time to push live health data into the gauge family.
@@ -307,6 +429,37 @@ mod tests {
         assert!(text.contains(
             "rpc_plane_requests_total{method=\"getSlot\",provider=\"triton\",status=\"error\"} 1"
         ));
+    }
+
+    #[test]
+    fn transaction_metrics_record_outcomes_and_accepted_samples() {
+        let m = Metrics::new();
+        let info = crate::tx::TransactionInfo {
+            cu_limit: 300_000,
+            cu_limit_defaulted: false,
+            cu_price_micro_lamports: Some(10_000),
+            requested_priority_fee_lamports: Some(3_000),
+            num_instructions: 3,
+            num_signatures: 1,
+            is_versioned: true,
+        };
+        m.record_transaction_submission("helius", true);
+        m.record_transaction_submission("none", false);
+        m.record_transaction_decode("helius", "parsed", Some(&info));
+        m.record_transaction_decode("none", "unparsed", None);
+        let text = m.render();
+        assert!(text.contains(
+            "rpc_plane_tx_submissions_total{outcome=\"accepted\",provider=\"helius\"} 1"
+        ));
+        assert!(text
+            .contains("rpc_plane_tx_submissions_total{outcome=\"rejected\",provider=\"none\"} 1"));
+        assert!(text.contains("rpc_plane_tx_decode_total{provider=\"helius\",result=\"parsed\"} 1"));
+        assert!(text.contains("rpc_plane_tx_compute_unit_limit_count{provider=\"helius\"} 1"));
+        assert!(text.contains(
+            "rpc_plane_tx_compute_unit_price_micro_lamports_count{provider=\"helius\"} 1"
+        ));
+        assert!(text
+            .contains("rpc_plane_tx_requested_priority_fee_lamports_count{provider=\"helius\"} 1"));
     }
 
     #[test]

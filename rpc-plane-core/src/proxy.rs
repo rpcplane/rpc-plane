@@ -5,6 +5,7 @@ use crate::router::{
     extract_rpc_error_code, is_client_error, is_retryable_http, is_retryable_rpc_code, route,
 };
 use crate::telemetry::{NoopReporter, Reporter, TelemetryEvent};
+use crate::tx::{decode_request, DecodeError};
 use axum::{
     body::Bytes,
     extract::State,
@@ -20,6 +21,7 @@ use tower_http::catch_panic::CatchPanicLayer;
 
 pub type Clients = Arc<parking_lot::RwLock<HashMap<String, Arc<Client>>>>;
 use std::time::Instant;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -60,6 +62,7 @@ pub struct ProxyState {
     pub monitor: HealthMonitor,
     pub metrics: Metrics,
     pub reporter: Arc<dyn Reporter>,
+    tx_analytics: TransactionAnalytics,
 }
 
 impl ProxyState {
@@ -74,12 +77,14 @@ impl ProxyState {
         let metrics = Metrics::new();
         let monitor = HealthMonitor::new(&config.providers, config.health.clone(), metrics.clone());
         monitor.start(clients.clone(), config.providers.clone());
+        let tx_analytics = TransactionAnalytics::new(metrics.clone(), reporter.clone());
         Self {
             config: Arc::new(parking_lot::RwLock::new(Arc::new(config))),
             clients,
             monitor,
             metrics,
             reporter,
+            tx_analytics,
         }
     }
 
@@ -92,6 +97,12 @@ impl ProxyState {
     /// insert/remove per-provider clients on config changes.
     pub fn clients_handle(&self) -> Clients {
         self.clients.clone()
+    }
+
+    /// Wait until all transaction analytics jobs enqueued before this call have
+    /// been processed. Used during graceful shutdown before flushing telemetry.
+    pub async fn flush_transaction_analytics(&self) {
+        self.tx_analytics.flush().await;
     }
 
     fn client_for(&self, name: &str) -> Option<Arc<Client>> {
@@ -111,6 +122,116 @@ impl ProxyState {
             metrics: self.metrics.clone(),
             reporter: self.reporter.clone(),
             monitor: self.monitor.clone(),
+        }
+    }
+}
+
+const TX_DECODE_QUEUE_CAPACITY: usize = 1024;
+
+#[derive(Clone)]
+struct TransactionAnalytics {
+    sender: mpsc::Sender<TransactionMessage>,
+    metrics: Metrics,
+    reporter: Arc<dyn Reporter>,
+}
+
+struct TransactionJob {
+    body: Bytes,
+    provider: Arc<str>,
+    accepted: bool,
+}
+
+enum TransactionMessage {
+    Decode(TransactionJob),
+    Flush(oneshot::Sender<()>),
+}
+
+impl TransactionAnalytics {
+    fn new(metrics: Metrics, reporter: Arc<dyn Reporter>) -> Self {
+        let (sender, mut receiver) = mpsc::channel::<TransactionMessage>(TX_DECODE_QUEUE_CAPACITY);
+        let worker_metrics = metrics.clone();
+        let worker_reporter = reporter.clone();
+        tokio::spawn(async move {
+            while let Some(message) = receiver.recv().await {
+                let job = match message {
+                    TransactionMessage::Decode(job) => job,
+                    TransactionMessage::Flush(done) => {
+                        let _ = done.send(());
+                        continue;
+                    }
+                };
+                let decoded = decode_request(&job.body);
+                let (result, info) = match &decoded {
+                    Ok(info) => ("parsed", Some(info)),
+                    Err(DecodeError::Unparsed) => ("unparsed", None),
+                    Err(DecodeError::Unsupported) => ("unsupported", None),
+                    Err(DecodeError::InvalidBudget) => ("invalid_budget", None),
+                };
+                // Rejected submissions remain decode-visible but never enter fee distributions.
+                let sample = if job.accepted { info } else { None };
+                worker_metrics.record_transaction_decode(&job.provider, result, sample);
+                worker_reporter.record_transaction_result(
+                    &job.provider,
+                    job.accepted,
+                    result,
+                    sample,
+                );
+            }
+        });
+        Self {
+            sender,
+            metrics,
+            reporter,
+        }
+    }
+
+    fn finish(
+        &self,
+        class: TransactionRequest,
+        body: &Bytes,
+        acknowledging_provider: Option<Arc<str>>,
+    ) {
+        if class == TransactionRequest::None {
+            return;
+        }
+        if class == TransactionRequest::Batch {
+            let provider = acknowledging_provider.unwrap_or_else(|| Arc::from("none"));
+            self.metrics
+                .record_transaction_decode(&provider, "batch_unsupported", None);
+            self.reporter
+                .record_transaction_decode(&provider, "batch_unsupported", None);
+            return;
+        }
+        let accepted = acknowledging_provider.is_some();
+        let provider = acknowledging_provider.unwrap_or_else(|| Arc::from("none"));
+        self.metrics
+            .record_transaction_submission(&provider, accepted);
+        let job = TransactionJob {
+            body: body.clone(),
+            provider: provider.clone(),
+            accepted,
+        };
+        if self
+            .sender
+            .try_send(TransactionMessage::Decode(job))
+            .is_err()
+        {
+            self.metrics
+                .record_transaction_decode(&provider, "queue_dropped", None);
+            self.reporter
+                .record_transaction_result(&provider, accepted, "queue_dropped", None);
+        }
+    }
+
+    async fn flush(&self) {
+        let (done, receiver) = oneshot::channel();
+        if self
+            .sender
+            .send(TransactionMessage::Flush(done))
+            .await
+            .is_ok()
+        {
+            let _ = receiver.await;
         }
     }
 }
@@ -307,7 +428,8 @@ async fn handle_rpc(State(state): State<ProxyState>, headers: HeaderMap, body: B
     let request_id = Uuid::new_v4();
     // `call_count` is the number of JSON-RPC calls (batch size) — used to weight
     // metrics/telemetry so a 1000-call batch is billed as 1000, not 1.
-    let (method, call_count) = extract_method(&body).unwrap_or_else(|| ("unknown".to_string(), 1));
+    let (method, call_count, transaction_request) = classify_request(&body)
+        .unwrap_or_else(|| ("unknown".to_string(), 1, TransactionRequest::None));
 
     let config = state.current_config();
     let snapshots = state.monitor.snapshots();
@@ -326,6 +448,7 @@ async fn handle_rpc(State(state): State<ProxyState>, headers: HeaderMap, body: B
         body: &body,
         request_id,
         count: call_count,
+        transaction_request,
     };
 
     // A degraded decision means no provider was routable (all circuit-open
@@ -350,6 +473,7 @@ struct RequestCtx<'a> {
     request_id: Uuid,
     /// JSON-RPC call count (batch size) — weights metrics/telemetry.
     count: u64,
+    transaction_request: TransactionRequest,
 }
 
 /// Result of one provider forward: (provider name, Ok(status, body) | Err(msg), latency_ms).
@@ -370,6 +494,7 @@ async fn sequential(
         body,
         request_id,
         count,
+        transaction_request,
     } = ctx;
     let max_attempts = (config.routing.max_retries + 1).min(providers.len());
     // Count of real forwards issued. Providers skipped before dispatch (missing
@@ -475,12 +600,14 @@ async fn sequential(
                         "upstream non-2xx, passing status through"
                     );
                     recorder.record(method, name, outcome, latency_ms, count);
-                    return (
+                    let response = (
                         StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
                         [("content-type", "application/json")],
                         bytes,
                     )
                         .into_response();
+                    state.tx_analytics.finish(transaction_request, body, None);
+                    return response;
                 }
 
                 if let Some(code) = extract_rpc_error_code(&bytes) {
@@ -498,6 +625,17 @@ async fn sequential(
                         continue;
                     }
                 }
+                if has_rpc_error(&bytes) {
+                    recorder.record(method, name, Outcome::ProviderError, latency_ms, count);
+                    let response = (
+                        StatusCode::OK,
+                        [("content-type", "application/json")],
+                        bytes,
+                    )
+                        .into_response();
+                    state.tx_analytics.finish(transaction_request, body, None);
+                    return response;
+                }
                 info!(
                     request_id = %request_id,
                     provider = %name,
@@ -507,12 +645,16 @@ async fn sequential(
                     "request ok"
                 );
                 recorder.record(method, name, Outcome::Ok, latency_ms, count);
-                return (
+                let response = (
                     StatusCode::OK,
                     [("content-type", "application/json")],
                     bytes,
                 )
                     .into_response();
+                state
+                    .tx_analytics
+                    .finish(transaction_request, body, Some(name.clone()));
+                return response;
             }
             Err(e) => {
                 warn!(
@@ -530,6 +672,7 @@ async fn sequential(
     }
 
     error!(%request_id, method, "all providers failed");
+    state.tx_analytics.finish(transaction_request, body, None);
     json_error_response(StatusCode::BAD_GATEWAY, -32603, "all providers failed")
 }
 
@@ -548,8 +691,10 @@ async fn broadcast(
         body,
         request_id,
         count,
+        transaction_request,
     } = ctx;
     if providers.is_empty() {
+        state.tx_analytics.finish(transaction_request, body, None);
         return json_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             -32603,
@@ -627,12 +772,16 @@ async fn broadcast(
                         "broadcast first success"
                     );
                     spawn_straggler_drain(recorder, method, request_id, count, set);
-                    return (
+                    let response = (
                         StatusCode::OK,
                         [("content-type", "application/json")],
                         bytes,
                     )
                         .into_response();
+                    state
+                        .tx_analytics
+                        .finish(transaction_request, body, Some(name));
+                    return response;
                 }
                 let rpc_code = extract_rpc_error_code(&bytes);
                 warn!(request_id = %request_id, provider = %name, method, status, code = ?rpc_code, outcome = outcome.label(), "broadcast leg failed");
@@ -657,14 +806,17 @@ async fn broadcast(
     // rather than masking it as a generic -32603.
     if let Some((status, bytes, _)) = best_error {
         error!(%request_id, method, "all broadcast providers failed; returning upstream error");
-        return (
+        let response = (
             StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
             [("content-type", "application/json")],
             bytes,
         )
             .into_response();
+        state.tx_analytics.finish(transaction_request, body, None);
+        return response;
     }
     error!(%request_id, method, "all broadcast providers failed");
+    state.tx_analytics.finish(transaction_request, body, None);
     json_error_response(StatusCode::BAD_GATEWAY, -32603, "all providers failed")
 }
 
@@ -672,7 +824,15 @@ async fn broadcast(
 /// JSON-RPC `error` member. A 2xx carrying an error body — e.g. a `sendTransaction`
 /// preflight failure (-32002) — is a failed leg, not a success; see `broadcast()`.
 fn leg_succeeded(status: u16, bytes: &Bytes) -> bool {
-    (200..300).contains(&status) && extract_rpc_error_code(bytes).is_none()
+    (200..300).contains(&status) && !has_rpc_error(bytes)
+}
+
+fn has_rpc_error(bytes: &[u8]) -> bool {
+    #[derive(serde::Deserialize)]
+    struct ErrorField {
+        error: Option<serde::de::IgnoredAny>,
+    }
+    serde_json::from_slice::<ErrorField>(bytes).is_ok_and(|response| response.error.is_some())
 }
 
 /// Rank a failed broadcast leg for selection as the fallback error returned to the
@@ -764,6 +924,13 @@ struct MethodField<'a> {
     method: Option<&'a str>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransactionRequest {
+    None,
+    Single,
+    Batch,
+}
+
 /// Max distinct method names rendered into a batch label before the remainder is
 /// collapsed into a `+N` suffix.
 const MAX_BATCH_LABEL_METHODS: usize = 5;
@@ -778,11 +945,25 @@ const MAX_METHOD_LABEL_LEN: usize = 128;
 /// `join(",")` let a 1000-element batch produce a ~15 KB never-evicted key); the
 /// count weights metrics/telemetry so that batch is billed as its true volume.
 pub fn extract_method(body: &[u8]) -> Option<(String, u64)> {
+    classify_request(body).map(|(method, count, _)| (method, count))
+}
+
+fn classify_request(body: &[u8]) -> Option<(String, u64, TransactionRequest)> {
     let first = body.iter().find(|&&b| !b.is_ascii_whitespace())?;
     if *first == b'{' {
         // Single request: parse only the method field, skip everything else.
         let req: MethodField<'_> = serde_json::from_slice(body).ok()?;
-        return req.method.map(|m| (m.to_owned(), 1));
+        return req.method.map(|m| {
+            (
+                m.to_owned(),
+                1,
+                if m == "sendTransaction" {
+                    TransactionRequest::Single
+                } else {
+                    TransactionRequest::None
+                },
+            )
+        });
     }
     // Batch request. Dedup method names (first-seen order), render up to
     // MAX_BATCH_LABEL_METHODS distinct names, collapse the rest into `+N`. A
@@ -792,8 +973,10 @@ pub fn extract_method(body: &[u8]) -> Option<(String, u64)> {
     let arr: Vec<MethodField<'_>> = serde_json::from_slice(body).ok()?;
     let mut uniques: Vec<&str> = Vec::new();
     let mut calls: u64 = 0;
+    let mut contains_send_transaction = false;
     for m in arr.iter().filter_map(|r| r.method) {
         calls += 1;
+        contains_send_transaction |= m == "sendTransaction";
         if !uniques.contains(&m) {
             uniques.push(m);
         }
@@ -813,7 +996,15 @@ pub fn extract_method(body: &[u8]) -> Option<(String, u64)> {
         }
         label.truncate(end);
     }
-    Some((label, calls))
+    Some((
+        label,
+        calls,
+        if contains_send_transaction {
+            TransactionRequest::Batch
+        } else {
+            TransactionRequest::None
+        },
+    ))
 }
 
 fn json_error_response(status: StatusCode, code: i64, message: &str) -> Response {
@@ -906,5 +1097,48 @@ mod tests {
     fn extract_method_batch_array_no_methods_returns_none() {
         let batch = br#"[{"jsonrpc":"2.0","id":1},{"jsonrpc":"2.0","id":2}]"#;
         assert_eq!(extract_method(batch), None);
+    }
+
+    #[tokio::test]
+    async fn saturated_transaction_queue_is_non_blocking_and_counted() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let metrics = Metrics::new();
+        let analytics = TransactionAnalytics {
+            sender,
+            metrics: metrics.clone(),
+            reporter: Arc::new(NoopReporter),
+        };
+        let body = Bytes::from_static(br#"{"params":["bad"]}"#);
+        analytics.finish(TransactionRequest::Single, &body, Some(Arc::from("a")));
+        analytics.finish(TransactionRequest::Single, &body, Some(Arc::from("a")));
+        let text = metrics.render();
+        assert!(
+            text.contains("rpc_plane_tx_decode_total{provider=\"a\",result=\"queue_dropped\"} 1")
+        );
+        assert!(
+            text.contains("rpc_plane_tx_submissions_total{outcome=\"accepted\",provider=\"a\"} 2")
+        );
+    }
+
+    #[test]
+    fn request_classification_excludes_simulation_and_marks_batches() {
+        assert_eq!(
+            classify_request(br#"{"method":"sendTransaction","params":[]}"#)
+                .unwrap()
+                .2,
+            TransactionRequest::Single
+        );
+        assert_eq!(
+            classify_request(br#"{"method":"simulateTransaction","params":[]}"#)
+                .unwrap()
+                .2,
+            TransactionRequest::None
+        );
+        assert_eq!(
+            classify_request(br#"[{"method":"getSlot"},{"method":"sendTransaction"}]"#)
+                .unwrap()
+                .2,
+            TransactionRequest::Batch
+        );
     }
 }
