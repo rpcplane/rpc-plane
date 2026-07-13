@@ -1,10 +1,13 @@
 use crate::config::ReportingConfig;
+use crate::tx::TransactionInfo;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tracing::{debug, warn};
 
 // ── Event types ───────────────────────────────────────────────────────────────
@@ -27,6 +30,29 @@ pub enum TelemetryEvent {
         latency_p95_ms: f64,
         latency_p99_ms: f64,
         latency_avg_ms: f64,
+    },
+    TransactionSubmit {
+        window_start_ms: u64,
+        window_end_ms: u64,
+        provider: String,
+        accepted_count: u64,
+        rejected_count: u64,
+        parsed_count: u64,
+        unparsed_count: u64,
+        unsupported_count: u64,
+        invalid_budget_count: u64,
+        batch_unsupported_count: u64,
+        decode_queue_drop_count: u64,
+        fee_sample_count: u64,
+        cu_limit_p50: u64,
+        cu_limit_p90: u64,
+        cu_limit_p95: u64,
+        cu_price_micro_lamports_p50: u64,
+        cu_price_micro_lamports_p90: u64,
+        cu_price_micro_lamports_p95: u64,
+        requested_priority_fee_lamports_p50: u64,
+        requested_priority_fee_lamports_p90: u64,
+        requested_priority_fee_lamports_p95: u64,
     },
     ProviderHealth {
         provider: String,
@@ -70,8 +96,37 @@ pub trait Reporter: Send + Sync {
     ) {
     }
 
+    fn record_transaction_submission(&self, _provider: &str, _accepted: bool) {}
+
+    fn record_transaction_decode(
+        &self,
+        _provider: &str,
+        _result: &str,
+        _sample: Option<&TransactionInfo>,
+    ) {
+    }
+
+    /// Record outcome and decode data atomically in one aggregation window.
+    fn record_transaction_result(
+        &self,
+        provider: &str,
+        accepted: bool,
+        result: &str,
+        sample: Option<&TransactionInfo>,
+    ) {
+        self.record_transaction_submission(provider, accepted);
+        self.record_transaction_decode(provider, result, sample);
+    }
+
     /// Signal the reporter to flush any buffered events. Fire-and-forget.
     fn flush(&self);
+
+    /// Flush and wait for the current remote write attempt to finish. Reporters
+    /// without buffering complete immediately.
+    fn flush_and_wait(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        self.flush();
+        Box::pin(async {})
+    }
 }
 
 // ── NoopReporter ──────────────────────────────────────────────────────────────
@@ -95,6 +150,7 @@ struct Aggregator {
 struct AggState {
     // key: (method, provider, status)
     buckets: HashMap<(String, String, String), Bucket>,
+    tx_buckets: HashMap<String, TransactionBucket>,
     window_start_ms: u64,
 }
 
@@ -108,11 +164,27 @@ struct Bucket {
     latencies: Vec<f64>,
 }
 
+#[derive(Default)]
+struct TransactionBucket {
+    accepted_count: u64,
+    rejected_count: u64,
+    parsed_count: u64,
+    unparsed_count: u64,
+    unsupported_count: u64,
+    invalid_budget_count: u64,
+    batch_unsupported_count: u64,
+    decode_queue_drop_count: u64,
+    cu_limits: Vec<u64>,
+    cu_prices: Vec<u64>,
+    fees: Vec<u64>,
+}
+
 impl Aggregator {
     fn new() -> Self {
         Self {
             state: Mutex::new(AggState {
                 buckets: HashMap::new(),
+                tx_buckets: HashMap::new(),
                 window_start_ms: now_ms(),
             }),
         }
@@ -128,13 +200,76 @@ impl Aggregator {
         bucket.latencies.push(latency_ms);
     }
 
+    fn record_transaction_submission(&self, provider: &str, accepted: bool) {
+        let mut s = self.state.lock().unwrap();
+        let bucket = s.tx_buckets.entry(provider.to_string()).or_default();
+        if accepted {
+            bucket.accepted_count += 1;
+        } else {
+            bucket.rejected_count += 1;
+        }
+    }
+
+    fn record_transaction_decode(
+        &self,
+        provider: &str,
+        result: &str,
+        sample: Option<&TransactionInfo>,
+    ) {
+        let mut s = self.state.lock().unwrap();
+        let bucket = s.tx_buckets.entry(provider.to_string()).or_default();
+        Self::record_transaction_decode_in_bucket(bucket, result, sample);
+    }
+
+    fn record_transaction_result(
+        &self,
+        provider: &str,
+        accepted: bool,
+        result: &str,
+        sample: Option<&TransactionInfo>,
+    ) {
+        let mut s = self.state.lock().unwrap();
+        let bucket = s.tx_buckets.entry(provider.to_string()).or_default();
+        if accepted {
+            bucket.accepted_count += 1;
+        } else {
+            bucket.rejected_count += 1;
+        }
+        Self::record_transaction_decode_in_bucket(bucket, result, sample);
+    }
+
+    fn record_transaction_decode_in_bucket(
+        bucket: &mut TransactionBucket,
+        result: &str,
+        sample: Option<&TransactionInfo>,
+    ) {
+        match result {
+            "parsed" => bucket.parsed_count += 1,
+            "unparsed" => bucket.unparsed_count += 1,
+            "unsupported" => bucket.unsupported_count += 1,
+            "invalid_budget" => bucket.invalid_budget_count += 1,
+            "batch_unsupported" => bucket.batch_unsupported_count += 1,
+            "queue_dropped" => bucket.decode_queue_drop_count += 1,
+            _ => return,
+        }
+        if let Some(info) = sample {
+            bucket.cu_limits.push(info.cu_limit);
+            bucket
+                .cu_prices
+                .push(info.cu_price_micro_lamports.unwrap_or(0));
+            bucket
+                .fees
+                .push(info.requested_priority_fee_lamports.unwrap_or(0));
+        }
+    }
+
     /// Drain all buckets into `RequestAggregate` events and reset the window.
     fn drain(&self) -> Vec<TelemetryEvent> {
         let now = now_ms();
         let mut s = self.state.lock().unwrap();
         let window_start = s.window_start_ms;
 
-        let events = s
+        let mut events: Vec<_> = s
             .buckets
             .drain()
             .filter(|(_, b)| !b.latencies.is_empty())
@@ -163,6 +298,35 @@ impl Aggregator {
             })
             .collect();
 
+        events.extend(s.tx_buckets.drain().map(|(provider, mut bucket)| {
+            bucket.cu_limits.sort_unstable();
+            bucket.cu_prices.sort_unstable();
+            bucket.fees.sort_unstable();
+            TelemetryEvent::TransactionSubmit {
+                window_start_ms: window_start,
+                window_end_ms: now,
+                provider,
+                accepted_count: bucket.accepted_count,
+                rejected_count: bucket.rejected_count,
+                parsed_count: bucket.parsed_count,
+                unparsed_count: bucket.unparsed_count,
+                unsupported_count: bucket.unsupported_count,
+                invalid_budget_count: bucket.invalid_budget_count,
+                batch_unsupported_count: bucket.batch_unsupported_count,
+                decode_queue_drop_count: bucket.decode_queue_drop_count,
+                fee_sample_count: bucket.cu_limits.len() as u64,
+                cu_limit_p50: percentile_u64(&bucket.cu_limits, 50),
+                cu_limit_p90: percentile_u64(&bucket.cu_limits, 90),
+                cu_limit_p95: percentile_u64(&bucket.cu_limits, 95),
+                cu_price_micro_lamports_p50: percentile_u64(&bucket.cu_prices, 50),
+                cu_price_micro_lamports_p90: percentile_u64(&bucket.cu_prices, 90),
+                cu_price_micro_lamports_p95: percentile_u64(&bucket.cu_prices, 95),
+                requested_priority_fee_lamports_p50: percentile_u64(&bucket.fees, 50),
+                requested_priority_fee_lamports_p90: percentile_u64(&bucket.fees, 90),
+                requested_priority_fee_lamports_p95: percentile_u64(&bucket.fees, 95),
+            }
+        }));
+
         s.window_start_ms = now;
         events
     }
@@ -184,6 +348,14 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
 }
 
+fn percentile_u64(sorted: &[u64], p: usize) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let rank = (p * sorted.len()).div_ceil(100);
+    sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
+}
+
 // ── RemoteReporter ────────────────────────────────────────────────────────────
 
 /// Buffers raw events in a bounded channel and aggregates request data in-memory.
@@ -192,6 +364,7 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
 pub struct RemoteReporter {
     tx: mpsc::Sender<TelemetryEvent>,
     flush_signal: Arc<Notify>,
+    flush_waiters: Arc<Mutex<Vec<oneshot::Sender<()>>>>,
     aggregator: Arc<Aggregator>,
 }
 
@@ -200,11 +373,13 @@ impl RemoteReporter {
     pub fn new(config: ReportingConfig, client: Arc<Client>) -> Self {
         let (tx, rx) = mpsc::channel(config.buffer_size);
         let flush_signal = Arc::new(Notify::new());
+        let flush_waiters = Arc::new(Mutex::new(Vec::new()));
         let aggregator = Arc::new(Aggregator::new());
 
         tokio::spawn(flush_task(
             rx,
             flush_signal.clone(),
+            flush_waiters.clone(),
             aggregator.clone(),
             config,
             client,
@@ -213,6 +388,7 @@ impl RemoteReporter {
         Self {
             tx,
             flush_signal,
+            flush_waiters,
             aggregator,
         }
     }
@@ -236,8 +412,43 @@ impl Reporter for RemoteReporter {
             .record(method, provider, status, latency_ms, count);
     }
 
+    fn record_transaction_submission(&self, provider: &str, accepted: bool) {
+        self.aggregator
+            .record_transaction_submission(provider, accepted);
+    }
+
+    fn record_transaction_decode(
+        &self,
+        provider: &str,
+        result: &str,
+        sample: Option<&TransactionInfo>,
+    ) {
+        self.aggregator
+            .record_transaction_decode(provider, result, sample);
+    }
+
+    fn record_transaction_result(
+        &self,
+        provider: &str,
+        accepted: bool,
+        result: &str,
+        sample: Option<&TransactionInfo>,
+    ) {
+        self.aggregator
+            .record_transaction_result(provider, accepted, result, sample);
+    }
+
     fn flush(&self) {
         self.flush_signal.notify_one();
+    }
+
+    fn flush_and_wait(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        let (done, receiver) = oneshot::channel();
+        self.flush_waiters.lock().unwrap().push(done);
+        self.flush_signal.notify_one();
+        Box::pin(async move {
+            let _ = receiver.await;
+        })
     }
 }
 
@@ -246,6 +457,7 @@ impl Reporter for RemoteReporter {
 async fn flush_task(
     mut rx: mpsc::Receiver<TelemetryEvent>,
     flush_signal: Arc<Notify>,
+    flush_waiters: Arc<Mutex<Vec<oneshot::Sender<()>>>>,
     aggregator: Arc<Aggregator>,
     config: ReportingConfig,
     client: Arc<Client>,
@@ -285,6 +497,9 @@ async fn flush_task(
                 if !batch.is_empty() {
                     send_batch(&client, &config, &mut batch).await;
                 }
+                for waiter in std::mem::take(&mut *flush_waiters.lock().unwrap()) {
+                    let _ = waiter.send(());
+                }
             }
         }
     }
@@ -296,6 +511,9 @@ async fn flush_task(
     }
     if !batch.is_empty() {
         send_batch(&client, &config, &mut batch).await;
+    }
+    for waiter in std::mem::take(&mut *flush_waiters.lock().unwrap()) {
+        let _ = waiter.send(());
     }
 }
 
@@ -519,5 +737,51 @@ mod tests {
         agg.record("getSlot", "helius", "error", 100.0, 1);
         let events = agg.drain();
         assert_eq!(events.len(), 4);
+    }
+
+    #[test]
+    fn transaction_aggregates_counts_and_accepted_percentiles() {
+        let agg = Aggregator::new();
+        agg.record_transaction_submission("helius", true);
+        agg.record_transaction_submission("helius", false);
+        for limit in [100, 200, 300, 400] {
+            let info = TransactionInfo {
+                cu_limit: limit,
+                cu_limit_defaulted: false,
+                cu_price_micro_lamports: Some(limit * 10),
+                requested_priority_fee_lamports: Some(limit * 100),
+                num_instructions: 1,
+                num_signatures: 1,
+                is_versioned: false,
+            };
+            agg.record_transaction_decode("helius", "parsed", Some(&info));
+        }
+        agg.record_transaction_decode("helius", "invalid_budget", None);
+        let events = agg.drain();
+        let event = events
+            .iter()
+            .find(|event| matches!(event, TelemetryEvent::TransactionSubmit { .. }))
+            .unwrap();
+        let TelemetryEvent::TransactionSubmit {
+            accepted_count,
+            rejected_count,
+            parsed_count,
+            invalid_budget_count,
+            cu_limit_p50,
+            cu_limit_p90,
+            cu_limit_p95,
+            ..
+        } = event
+        else {
+            unreachable!()
+        };
+        assert_eq!((*accepted_count, *rejected_count), (1, 1));
+        assert_eq!((*parsed_count, *invalid_budget_count), (4, 1));
+        assert_eq!(
+            (*cu_limit_p50, *cu_limit_p90, *cu_limit_p95),
+            (200, 400, 400)
+        );
+        let json = serde_json::to_value(event).unwrap();
+        assert_eq!(json["type"], "transaction_submit");
     }
 }

@@ -181,9 +181,10 @@ async fn run(config_path: PathBuf) -> Result<()> {
             .await?;
     }
 
+    // Ensure queued transaction decodes reach the reporter before its final flush.
+    state.flush_transaction_analytics().await;
     // Flush any buffered telemetry before exiting.
-    reporter.flush();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    reporter.flush_and_wait().await;
     info!("shutdown complete");
     Ok(())
 }

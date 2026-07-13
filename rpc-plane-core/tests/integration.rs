@@ -116,6 +116,35 @@ const GET_SLOT: &str = r#"{"jsonrpc":"2.0","id":1,"method":"getSlot"}"#;
 const SEND_TX: &str =
     r#"{"jsonrpc":"2.0","id":1,"method":"sendTransaction","params":["dummybase64"]}"#;
 
+fn valid_send_tx() -> String {
+    let mut tx = vec![1];
+    tx.extend([0u8; 64]);
+    tx.extend([1, 0, 0]);
+    tx.push(1);
+    tx.extend([7u8; 32]);
+    tx.extend([0u8; 32]);
+    tx.push(1);
+    tx.extend([0, 0, 1, 9]);
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "sendTransaction",
+        "params": [bs58::encode(tx).into_string()]
+    })
+    .to_string()
+}
+
+async fn wait_for_metric(metrics: &rpc_plane_core::metrics::Metrics, needle: &str) -> String {
+    for _ in 0..50 {
+        let text = metrics.render();
+        if text.contains(needle) {
+            return text;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    metrics.render()
+}
+
 fn slot_response(slot: u64) -> axum::Json<Value> {
     axum::Json(json!({ "jsonrpc": "2.0", "result": slot, "id": 1 }))
 }
@@ -129,6 +158,125 @@ fn rpc_error_response(code: i64, msg: &'static str) -> axum::Json<Value> {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn transaction_sequential_acceptance_and_rejection_are_counted_once() {
+    let ok_mock = Router::new().route("/", post(|| async { slot_response(123) }));
+    let (ok_url, _ok_abort) = start_mock(ok_mock).await;
+    let cfg = test_config(&[("a", &ok_url)], RoutingStrategy::FailoverOrdered, 0, 5);
+    let state = ProxyState::new(cfg);
+    let metrics = state.metrics.clone();
+    let (status, _) = proxy_request(build_router(state), &valid_send_tx()).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = wait_for_metric(
+        &metrics,
+        "rpc_plane_tx_compute_unit_limit_count{provider=\"a\"} 1",
+    )
+    .await;
+    assert!(text.contains("rpc_plane_tx_submissions_total{outcome=\"accepted\",provider=\"a\"} 1"));
+    assert!(text.contains("rpc_plane_tx_decode_total{provider=\"a\",result=\"parsed\"} 1"));
+
+    let error_mock = Router::new().route(
+        "/",
+        post(|| async { rpc_error_response(-32002, "preflight failed") }),
+    );
+    let (error_url, _error_abort) = start_mock(error_mock).await;
+    let cfg = test_config(&[("a", &error_url)], RoutingStrategy::FailoverOrdered, 0, 5);
+    let state = ProxyState::new(cfg);
+    let metrics = state.metrics.clone();
+    let (status, body) = proxy_request(build_router(state), &valid_send_tx()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["error"]["code"], -32002);
+    let text = wait_for_metric(
+        &metrics,
+        "rpc_plane_tx_decode_total{provider=\"none\",result=\"parsed\"} 1",
+    )
+    .await;
+    assert!(
+        text.contains("rpc_plane_tx_submissions_total{outcome=\"rejected\",provider=\"none\"} 1")
+    );
+    assert!(!text.contains("rpc_plane_tx_compute_unit_limit_count{provider=\"none\"}"));
+}
+
+#[tokio::test]
+async fn transaction_broadcast_attributes_only_first_acknowledging_provider() {
+    let (slow_url, _slow_abort) = start_slow_mock(1, Duration::from_millis(100)).await;
+    let fast_mock = Router::new().route("/", post(|| async { slot_response(2) }));
+    let (fast_url, _fast_abort) = start_mock(fast_mock).await;
+    let mut cfg = test_config(
+        &[("slow", &slow_url), ("fast", &fast_url)],
+        RoutingStrategy::FailoverOrdered,
+        1,
+        5,
+    );
+    cfg.routing.broadcast_writes = true;
+    let state = ProxyState::new(cfg);
+    let metrics = state.metrics.clone();
+    let (_, body) = proxy_request(build_router(state), &valid_send_tx()).await;
+    assert_eq!(body["result"], 2);
+    let text = wait_for_metric(
+        &metrics,
+        "rpc_plane_tx_compute_unit_limit_count{provider=\"fast\"} 1",
+    )
+    .await;
+    assert!(
+        text.contains("rpc_plane_tx_submissions_total{outcome=\"accepted\",provider=\"fast\"} 1")
+    );
+    assert!(
+        !text.contains("rpc_plane_tx_submissions_total{outcome=\"accepted\",provider=\"slow\"}")
+    );
+}
+
+#[tokio::test]
+async fn transaction_broadcast_all_rejected_has_no_fee_sample() {
+    let error_a = Router::new().route(
+        "/",
+        post(|| async { rpc_error_response(-32002, "preflight failed") }),
+    );
+    let error_b = Router::new().route(
+        "/",
+        post(|| async { rpc_error_response(-32602, "invalid params") }),
+    );
+    let (url_a, _abort_a) = start_mock(error_a).await;
+    let (url_b, _abort_b) = start_mock(error_b).await;
+    let mut cfg = test_config(
+        &[("a", &url_a), ("b", &url_b)],
+        RoutingStrategy::FailoverOrdered,
+        1,
+        5,
+    );
+    cfg.routing.broadcast_writes = true;
+    let state = ProxyState::new(cfg);
+    let metrics = state.metrics.clone();
+    let (_, body) = proxy_request(build_router(state), &valid_send_tx()).await;
+    assert!(body.get("error").is_some());
+    let text = wait_for_metric(
+        &metrics,
+        "rpc_plane_tx_decode_total{provider=\"none\",result=\"parsed\"} 1",
+    )
+    .await;
+    assert!(
+        text.contains("rpc_plane_tx_submissions_total{outcome=\"rejected\",provider=\"none\"} 1")
+    );
+    assert!(!text.contains("rpc_plane_tx_compute_unit_limit_count{provider=\"none\"}"));
+}
+
+#[tokio::test]
+async fn transaction_batch_is_counted_unsupported_without_decoding() {
+    let mock = Router::new().route("/", post(|| async { slot_response(1) }));
+    let (url, _abort) = start_mock(mock).await;
+    let cfg = test_config(&[("a", &url)], RoutingStrategy::FailoverOrdered, 0, 5);
+    let state = ProxyState::new(cfg);
+    let metrics = state.metrics.clone();
+    let batch = format!("[{},{}]", valid_send_tx(), GET_SLOT);
+    let (status, _) = proxy_request(build_router(state), &batch).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = metrics.render();
+    assert!(
+        text.contains("rpc_plane_tx_decode_total{provider=\"a\",result=\"batch_unsupported\"} 1")
+    );
+    assert!(!text.contains("rpc_plane_tx_decode_total{provider=\"a\",result=\"parsed\"}"));
+}
 
 /// When all providers are unreachable, the proxy must return 502 Bad Gateway
 /// with a JSON-RPC error body — not hang, not panic.
