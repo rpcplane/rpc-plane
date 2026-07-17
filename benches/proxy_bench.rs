@@ -1,10 +1,27 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use rpc_plane_core::{
+#![allow(dead_code, unused_imports)]
+
+#[path = "../src/config.rs"]
+mod config;
+#[path = "../src/health.rs"]
+mod health;
+#[path = "../src/metrics.rs"]
+mod metrics;
+#[path = "../src/proxy.rs"]
+mod proxy;
+#[path = "../src/router.rs"]
+mod router;
+#[path = "../src/telemetry.rs"]
+mod telemetry;
+#[path = "../src/tx.rs"]
+mod tx;
+
+use crate::{
     config::{ProviderConfig, RoutingStrategy},
     health::{CircuitState, CommitmentHealth, HealthSnapshot},
     proxy::extract_method,
     router::{extract_rpc_error_code, route},
 };
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use std::sync::Arc;
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────

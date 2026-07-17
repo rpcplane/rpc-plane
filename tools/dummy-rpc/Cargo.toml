@@ -4,6 +4,7 @@ description = "Minimal Solana JSON-RPC echo server for local load testing"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [[bin]]
 name = "dummy-rpc"

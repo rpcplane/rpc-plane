@@ -1614,34 +1614,15 @@ version = "0.10.0"
 dependencies = [
  "anyhow",
  "axum",
- "bytes",
- "clap",
- "hyper",
- "hyper-util",
- "libc",
- "parking_lot",
- "reqwest",
- "rpc-plane-core",
- "serde",
- "serde_json",
- "tokio",
- "toml",
- "tower",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "rpc-plane-core"
-version = "0.10.0"
-dependencies = [
- "anyhow",
- "axum",
  "base64",
  "bs58",
  "bytes",
+ "clap",
  "criterion",
  "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
  "parking_lot",
  "prometheus",
  "rand",
@@ -1650,12 +1631,12 @@ dependencies = [
  "serde_json",
  "shellexpand",
  "tempfile",
- "thiserror",
  "tokio",
  "toml",
  "tower",
  "tower-http",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

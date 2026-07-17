@@ -4,6 +4,7 @@ description = "HTTP load tester that supports both TCP and Unix domain sockets"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [[bin]]
 name = "load-test"
