@@ -17,7 +17,7 @@ codebase — contributions that keep it that way are the most welcome.
 
 ## Development setup
 
-The toolchain is pinned in `rust-toolchain.toml` (currently Rust **1.91.1**);
+The toolchain is pinned in `rust-toolchain.toml` (currently Rust **1.96.1**);
 `rustup` will install it automatically when you build.
 
 ```bash
