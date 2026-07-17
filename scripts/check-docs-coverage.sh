@@ -13,7 +13,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONFIG_RS="$ROOT/rpc-plane-core/src/config.rs"
+CONFIG_RS="$ROOT/src/config.rs"
 DOCS="${1:-$ROOT/../docs/docs/configuration.md}"
 
 if [[ ! -f "$CONFIG_RS" ]]; then

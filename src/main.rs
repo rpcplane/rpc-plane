@@ -1,6 +1,17 @@
+mod config;
+mod health;
+mod metrics;
+mod proxy;
+mod router;
+mod telemetry;
+mod tx;
+
+#[cfg(test)]
+mod integration_tests;
+
+use crate::telemetry::{NoopReporter, RemoteReporter, Reporter, TelemetryEvent};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use rpc_plane_core::telemetry::{NoopReporter, RemoteReporter, Reporter, TelemetryEvent};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -91,7 +102,7 @@ fn peek_worker_threads(path: &Path) -> Option<usize> {
 async fn run(config_path: PathBuf) -> Result<()> {
     #[cfg(unix)]
     raise_nofile_limit();
-    let config = rpc_plane_core::config::Config::load(&config_path)?;
+    let config = crate::config::Config::load(&config_path)?;
     let listen = config.server.listen.clone();
     let metrics_listen = config.server.metrics_listen.clone();
     let listen_backlog = config.server.listen_backlog;
@@ -121,9 +132,9 @@ async fn run(config_path: PathBuf) -> Result<()> {
         None => Arc::new(NoopReporter),
     };
 
-    let state = rpc_plane_core::proxy::ProxyState::new_with_reporter(config, reporter.clone());
-    let proxy_router = rpc_plane_core::proxy::build_router(state.clone());
-    let metrics_router = rpc_plane_core::proxy::build_metrics_router(state.clone());
+    let state = crate::proxy::ProxyState::new_with_reporter(config, reporter.clone());
+    let proxy_router = crate::proxy::build_router(state.clone());
+    let metrics_router = crate::proxy::build_metrics_router(state.clone());
 
     // Background tasks common to both TCP and UDS paths.
     let config_handle = state.config_handle();
@@ -194,7 +205,7 @@ async fn check(config_path: PathBuf) -> Result<()> {
     // (e.g. a typo'd `${HELIUS_API_KY}`) that silently collapse to empty and
     // would otherwise show up only as runtime 401s.
     if let Ok(raw) = std::fs::read_to_string(&config_path) {
-        let (_, unset_vars) = rpc_plane_core::config::expand_env_vars(&raw);
+        let (_, unset_vars) = crate::config::expand_env_vars(&raw);
         for var in &unset_vars {
             println!(
                 "[WARN] environment variable `${var}` is unset — it expanded to an empty \
@@ -206,7 +217,7 @@ async fn check(config_path: PathBuf) -> Result<()> {
         }
     }
 
-    let config = rpc_plane_core::config::Config::load(&config_path)?;
+    let config = crate::config::Config::load(&config_path)?;
     println!(
         "Config OK — {} provider(s) configured\n",
         config.providers.len()
@@ -273,7 +284,7 @@ async fn check(config_path: PathBuf) -> Result<()> {
 }
 
 async fn status(config_path: PathBuf) -> Result<()> {
-    let config = rpc_plane_core::config::Config::load(&config_path)?;
+    let config = crate::config::Config::load(&config_path)?;
     let listen = &config.server.listen;
 
     if is_unix_path(listen) {
@@ -362,7 +373,7 @@ async fn init(config_path: PathBuf) -> Result<()> {
         );
     }
 
-    let example = include_str!("../../config.example.toml");
+    let example = include_str!("../config.example.toml");
     std::fs::write(&config_path, example)?;
     println!("Created {}", config_path.display());
     println!("Edit the file to add your provider API keys, then run:");
@@ -374,9 +385,9 @@ async fn init(config_path: PathBuf) -> Result<()> {
 
 async fn watch_config(
     path: PathBuf,
-    config: Arc<parking_lot::RwLock<Arc<rpc_plane_core::config::Config>>>,
-    monitor: rpc_plane_core::health::HealthMonitor,
-    clients: rpc_plane_core::proxy::Clients,
+    config: Arc<parking_lot::RwLock<Arc<crate::config::Config>>>,
+    monitor: crate::health::HealthMonitor,
+    clients: crate::proxy::Clients,
 ) {
     let mut last_mtime = mtime(&path);
     let mut ticker = tokio::time::interval(Duration::from_secs(2));
@@ -394,7 +405,7 @@ async fn watch_config(
         // Brief pause so editors that do write-rename don't catch a partial file.
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let new_config = match rpc_plane_core::config::Config::load(&path) {
+        let new_config = match crate::config::Config::load(&path) {
             Ok(c) => c,
             Err(e) => {
                 warn!("config reload failed, keeping old config: {e}");
@@ -405,7 +416,7 @@ async fn watch_config(
         // Snapshot old config for diffing (clone out so we don't hold the lock).
         let (old_providers, old_server) = {
             let old = config.read();
-            let providers: HashMap<String, rpc_plane_core::config::ProviderConfig> = old
+            let providers: HashMap<String, crate::config::ProviderConfig> = old
                 .providers
                 .iter()
                 .map(|p| (p.name.clone(), p.clone()))
@@ -456,7 +467,7 @@ async fn watch_config(
                 clients.write().remove(name);
                 monitor.remove_provider(name);
             }
-            let client = Arc::new(rpc_plane_core::proxy::build_client(
+            let client = Arc::new(crate::proxy::build_client(
                 new_p,
                 new_config.server.pool_max_idle_per_host,
             ));
@@ -510,8 +521,8 @@ fn mtime(path: &Path) -> Option<SystemTime> {
 /// client's inputs (URL, `http3`, or the global pool size) changed. `weight` is
 /// deliberately excluded: it only affects routing, which reads the live config.
 fn client_rebuild_reason(
-    old: Option<&rpc_plane_core::config::ProviderConfig>,
-    new: &rpc_plane_core::config::ProviderConfig,
+    old: Option<&crate::config::ProviderConfig>,
+    new: &crate::config::ProviderConfig,
     pool_size_changed: bool,
 ) -> Option<&'static str> {
     match old {
@@ -636,7 +647,7 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rpc_plane_core::config::ProviderConfig;
+    use crate::config::ProviderConfig;
 
     fn provider(url: &str, http3: bool) -> ProviderConfig {
         ProviderConfig {

@@ -4,7 +4,9 @@ use crate::metrics::Metrics;
 use crate::router::{
     extract_rpc_error_code, is_client_error, is_retryable_http, is_retryable_rpc_code, route,
 };
-use crate::telemetry::{NoopReporter, Reporter, TelemetryEvent};
+#[cfg(test)]
+use crate::telemetry::NoopReporter;
+use crate::telemetry::{Reporter, TelemetryEvent};
 use crate::tx::{decode_request, DecodeError};
 use axum::{
     body::Bytes,
@@ -67,6 +69,7 @@ pub struct ProxyState {
 
 impl ProxyState {
     /// Build with a `NoopReporter` (Prometheus-only mode).
+    #[cfg(test)]
     pub fn new(config: Config) -> Self {
         Self::new_with_reporter(config, Arc::new(NoopReporter))
     }
@@ -944,6 +947,7 @@ const MAX_METHOD_LABEL_LEN: usize = 128;
 /// mint a giant, unbounded-cardinality metrics label / aggregator key (the raw
 /// `join(",")` let a 1000-element batch produce a ~15 KB never-evicted key); the
 /// count weights metrics/telemetry so that batch is billed as its true volume.
+#[allow(dead_code)] // Kept as a focused benchmark and unit-test entry point.
 pub fn extract_method(body: &[u8]) -> Option<(String, u64)> {
     classify_request(body).map(|(method, count, _)| (method, count))
 }

@@ -1,8 +1,12 @@
-/// Integration tests: spin up mock HTTP provider servers, run the full proxy
-/// stack (ProxyState → axum Router), send real requests via `tower::ServiceExt`,
-/// and assert end-to-end behaviour.
-///
-/// Each test gets its own tokio runtime; spawned tasks are aborted on drop.
+//! Integration tests: spin up mock HTTP provider servers, run the full proxy
+//! stack (ProxyState → axum Router), send real requests via `tower::ServiceExt`,
+//! and assert end-to-end behaviour.
+//!
+//! Each test gets its own tokio runtime; spawned tasks are aborted on drop.
+use crate::{
+    config::{Config, HealthConfig, ProviderConfig, RoutingConfig, RoutingStrategy, ServerConfig},
+    proxy::{build_router, ProxyState},
+};
 use axum::{
     body::Body,
     http::{Method, Request, StatusCode},
@@ -11,10 +15,6 @@ use axum::{
     Router,
 };
 use http_body_util::BodyExt;
-use rpc_plane_core::{
-    config::{Config, HealthConfig, ProviderConfig, RoutingConfig, RoutingStrategy, ServerConfig},
-    proxy::{build_router, ProxyState},
-};
 use serde_json::{json, Value};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -134,7 +134,7 @@ fn valid_send_tx() -> String {
     .to_string()
 }
 
-async fn wait_for_metric(metrics: &rpc_plane_core::metrics::Metrics, needle: &str) -> String {
+async fn wait_for_metric(metrics: &crate::metrics::Metrics, needle: &str) -> String {
     for _ in 0..50 {
         let text = metrics.render();
         if text.contains(needle) {
@@ -1052,7 +1052,7 @@ async fn client_4xx_passed_through_without_touching_health() {
     let snap = state.monitor.snapshots().pop().unwrap();
     assert_eq!(
         snap.circuit,
-        rpc_plane_core::health::CircuitState::Closed,
+        crate::health::CircuitState::Closed,
         "client 4xx must not open the circuit"
     );
     assert_eq!(snap.error_rate, 0.0, "client 4xx must not raise error rate");
@@ -1076,7 +1076,7 @@ async fn auth_4xx_counts_against_health_and_opens_circuit() {
     let snap = state.monitor.snapshots().pop().unwrap();
     assert_eq!(
         snap.circuit,
-        rpc_plane_core::health::CircuitState::Open,
+        crate::health::CircuitState::Open,
         "auth 4xx must open the circuit"
     );
 }
@@ -1113,7 +1113,7 @@ async fn rate_limited_provider_demoted_but_circuit_stays_closed() {
     let b = snaps.iter().find(|s| s.name.as_ref() == "b").unwrap();
     assert_eq!(
         a.circuit,
-        rpc_plane_core::health::CircuitState::Closed,
+        crate::health::CircuitState::Closed,
         "429 must not open the circuit"
     );
     assert!(a.is_available(), "throttled provider stays eligible");

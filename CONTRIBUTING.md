@@ -17,7 +17,7 @@ codebase — contributions that keep it that way are the most welcome.
 
 ## Development setup
 
-The toolchain is pinned in `rust-toolchain.toml` (currently Rust **1.91.1**);
+The toolchain is pinned in `rust-toolchain.toml` (currently Rust **1.96.1**);
 `rustup` will install it automatically when you build.
 
 ```bash
@@ -44,8 +44,8 @@ cargo test --all
 ## Pull requests
 
 - Keep PRs focused; one logical change per PR.
-- Add or update tests for behavior changes — most logic lives in
-  `rpc-plane-core` and is covered by unit/integration tests there.
+- Add or update tests for behavior changes. Most proxy logic is covered by
+  unit and integration tests alongside the binary source.
 - Update `README.md`, `config.example.toml`, and the relevant `examples/`
   configs when you add or change a config option.
 - Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/)

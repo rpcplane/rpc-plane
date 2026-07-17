@@ -513,6 +513,7 @@ impl ProviderHealth {
     }
 
     /// Convenience: set only the `processed` slot (single-commitment callers).
+    #[cfg(test)]
     pub fn update_slot(&self, slot: u64) {
         self.inner.write().slots.processed = Some(slot);
     }
@@ -747,6 +748,7 @@ impl HealthMonitor {
 
     /// Per-commitment network tips = max slot across all providers at each level,
     /// plus the external reference (a no-op when unconfigured / not yet probed).
+    #[cfg(test)]
     pub fn slot_tips(&self) -> SlotTips {
         let mut tips = SlotTips::default();
         for e in self.entries.read().values() {
@@ -765,6 +767,7 @@ impl HealthMonitor {
     }
 
     /// Network tip at `processed` = max processed slot across all providers.
+    #[cfg(test)]
     pub fn slot_tip(&self) -> u64 {
         self.slot_tips().processed
     }
@@ -799,6 +802,7 @@ impl HealthMonitor {
     }
 
     /// Update the cached slot height for a named provider.
+    #[cfg(test)]
     pub fn update_slot(&self, provider_name: &str, slot: u64) {
         if let Some(h) = self
             .entries
