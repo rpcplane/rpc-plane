@@ -105,6 +105,36 @@ jobs:
             ${{ matrix.asset_name }}.cosign.bundle
           if-no-files-found: error
 
+  publish-crate:
+    name: Publish crate
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1 (stable)
+        with:
+          toolchain: "1.96.1"
+
+      - name: Verify tag matches crate version
+        run: |
+          crate_version=$(cargo metadata --no-deps --format-version 1 |
+            jq -r '.packages[] | select(.name == "rpc-plane") | .version')
+          test "v${crate_version}" = "${GITHUB_REF_NAME}"
+
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        id: auth
+
+      - name: Publish to crates.io
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
   # Build amd64 and arm64 images on their NATIVE runners (no QEMU emulation),
   # push each by digest only. Manifest list is assembled in `docker-merge`.
   # Reference: https://docs.docker.com/build/ci/github-actions/multi-platform/#distribute-build-across-multiple-runners
