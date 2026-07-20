@@ -185,7 +185,24 @@ impl CommitmentSlots {
             self.finalized = new.finalized;
         }
     }
+
+    fn observe_max(&mut self, slots: &CommitmentSlots) {
+        self.processed = max_option(self.processed, slots.processed);
+        self.confirmed = max_option(self.confirmed, slots.confirmed);
+        self.finalized = max_option(self.finalized, slots.finalized);
+    }
 }
+
+fn max_option(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// Optional network tips captured in the same read pass as routing snapshots.
+/// Unlike [`SlotTips`], absence remains explicit for historical age telemetry.
+pub type ObservedSlotTips = CommitmentSlots;
 
 /// Network tip per commitment = max slot across all providers at that level.
 #[derive(Debug, Clone, Copy, Default)]
@@ -778,6 +795,12 @@ impl HealthMonitor {
     /// score computation), so 1000s of concurrent requests proceed without
     /// queuing on each other.
     pub fn snapshots(&self) -> Vec<HealthSnapshot> {
+        self.snapshots_with_tips().0
+    }
+
+    /// Current routing snapshots and the per-commitment network tips used to
+    /// build them, collected from one pass over provider health state.
+    pub fn snapshots_with_tips(&self) -> (Vec<HealthSnapshot>, ObservedSlotTips) {
         let entries: Vec<(Arc<ProviderHealth>, Option<Arc<RateLimiter>>)> = self
             .entries
             .read()
@@ -785,11 +808,16 @@ impl HealthMonitor {
             .map(|e| (e.health.clone(), e.limiter.clone()))
             .collect();
         let mut tips = SlotTips::default();
+        let mut observed_tips = ObservedSlotTips::default();
         for (h, _) in &entries {
-            tips.observe(&h.inner.read().slots);
+            let slots = h.inner.read().slots;
+            tips.observe(&slots);
+            observed_tips.observe_max(&slots);
         }
-        tips.observe(&self.reference_slots.read());
-        entries
+        let reference_slots = *self.reference_slots.read();
+        tips.observe(&reference_slots);
+        observed_tips.observe_max(&reference_slots);
+        let snapshots = entries
             .iter()
             .map(|(h, limiter)| {
                 let mut snap = h.snapshot(&tips, &self.cfg);
@@ -798,7 +826,8 @@ impl HealthMonitor {
                 snap.rate_limited = limiter.as_ref().is_some_and(|l| !l.has_capacity());
                 snap
             })
-            .collect()
+            .collect();
+        (snapshots, observed_tips)
     }
 
     /// Update the cached slot height for a named provider.

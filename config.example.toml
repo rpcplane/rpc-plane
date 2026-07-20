@@ -82,3 +82,20 @@ weight = 1
 # flush_interval_ms = 60000  # aggregate window + POST interval (ms)
 # buffer_size       = 1000   # max buffered events (oldest dropped when full)
 # batch_size        = 100    # max events per HTTP POST
+
+# ── Historical RPC analytics ───────────────────────────────────────────────────
+# Opt-in: presence of this block enables bounded analysis of getTransaction
+# workloads. Requires [reporting] above — results are delivered only as remote
+# telemetry aggregates for the hosted dashboard and are not exposed on /metrics.
+# It observes polling and successful-response reuse but does not cache,
+# alter, delay, or make additional RPC requests. Raw signatures, addresses,
+# request IDs, parameters, response bodies, and internal fingerprints are never
+# exported. The process-local keyed state resets whenever RPC Plane restarts.
+# All settings are restart-only; config hot reload does not apply changes here.
+# [historical_analytics]
+# queue_capacity   = 512       # maximum queued analysis jobs
+# max_queued_bytes = 67108864  # total queued request/response byte budget (64 MiB)
+# max_job_bytes    = 2097152   # largest accepted analysis job (2 MiB; <= queued budget)
+# state_capacity   = 250000    # maximum retained request fingerprints
+# state_ttl_secs   = 172800    # expire fingerprint lifecycle state after 48 hours
+# flush_interval_ms = 60000    # aggregate flush interval

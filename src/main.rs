@@ -1,5 +1,6 @@
 mod config;
 mod health;
+mod historical;
 mod metrics;
 mod proxy;
 mod router;
@@ -192,6 +193,8 @@ async fn run(config_path: PathBuf) -> Result<()> {
             .await?;
     }
 
+    // Emit accepted historical aggregates before the reporter's final flush.
+    state.flush_historical_analytics().await;
     // Ensure queued transaction decodes reach the reporter before its final flush.
     state.flush_transaction_analytics().await;
     // Flush any buffered telemetry before exiting.
@@ -414,14 +417,18 @@ async fn watch_config(
         };
 
         // Snapshot old config for diffing (clone out so we don't hold the lock).
-        let (old_providers, old_server) = {
+        let (old_providers, old_server, old_historical_analytics) = {
             let old = config.read();
             let providers: HashMap<String, crate::config::ProviderConfig> = old
                 .providers
                 .iter()
                 .map(|p| (p.name.clone(), p.clone()))
                 .collect();
-            (providers, old.server.clone())
+            (
+                providers,
+                old.server.clone(),
+                old.historical_analytics.clone(),
+            )
         };
 
         // pool_max_idle_per_host feeds every outbound client, so a change forces
@@ -505,6 +512,9 @@ async fn watch_config(
                 "a restart-only server setting changed (listen / metrics_listen / \
                  listen_backlog / worker_threads) — restart required to take effect"
             );
+        }
+        if old_historical_analytics != new_config.historical_analytics {
+            warn!("historical_analytics settings changed; restart required to take effect");
         }
 
         *config.write() = Arc::new(new_config);

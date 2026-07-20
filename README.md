@@ -90,6 +90,42 @@ Run `rpc-plane init` to generate a full config with all options and their defaul
 
 See the [configuration reference](https://docs.rpcplane.dev/configuration/) for every option.
 
+### Historical RPC analytics
+
+Historical workload analytics is disabled by default. It is delivered as remote
+telemetry aggregates for the hosted dashboard and has no Prometheus surface, so
+it requires a configured `[reporting]` block. Add the block below to opt in to
+bounded analysis of `getTransaction` polling, result reuse, and slot age:
+
+```toml
+[historical_analytics]
+queue_capacity = 512
+max_queued_bytes = 67108864
+max_job_bytes = 2097152
+state_capacity = 250000
+state_ttl_secs = 172800
+flush_interval_ms = 60000
+```
+
+Starting without `[reporting]` is a config error rather than a silent no-op:
+the analyzer would otherwise consume a worker, a queue, and retained fingerprint
+state while emitting nowhere.
+
+`queue_capacity`, `max_queued_bytes`, and `max_job_bytes` bound queued analysis
+work; `state_capacity` and `state_ttl_secs` bound retained fingerprint state.
+Jobs that exceed these limits are dropped from analysis without affecting RPC
+responses. `max_job_bytes` must not exceed `max_queued_bytes`, and all limits
+must be positive.
+
+The analyzer does not cache or alter RPC responses and makes no additional RPC
+calls. Results are reported only as aggregate counts in the versioned
+`historical_get_transaction_aggregate` telemetry event; no historical metric is
+exposed on `/metrics`. It never exports raw signatures, addresses, request IDs, parameters,
+response bodies, or request fingerprints. Request state uses process-local keyed
+fingerprints; restarting RPC Plane changes the key and resets that state. These
+settings are restart-only and changes made by config hot reload do not take
+effect until the process restarts.
+
 ## CLI
 
 ```

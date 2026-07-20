@@ -4,8 +4,12 @@
 //!
 //! Each test gets its own tokio runtime; spawned tasks are aborted on drop.
 use crate::{
-    config::{Config, HealthConfig, ProviderConfig, RoutingConfig, RoutingStrategy, ServerConfig},
+    config::{
+        Config, HealthConfig, HistoricalAnalyticsConfig, ProviderConfig, RoutingConfig,
+        RoutingStrategy, ServerConfig,
+    },
     proxy::{build_router, ProxyState},
+    telemetry::{Reporter, TelemetryEvent},
 };
 use axum::{
     body::Body,
@@ -18,7 +22,7 @@ use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::time::Duration;
 use tower::ServiceExt;
@@ -94,6 +98,7 @@ fn test_config(
             })
             .collect(),
         reporting: None,
+        historical_analytics: None,
     }
 }
 
@@ -157,7 +162,137 @@ fn rpc_error_response(code: i64, msg: &'static str) -> axum::Json<Value> {
     }))
 }
 
+/// Captures emitted telemetry so tests can assert on aggregates. Historical
+/// analysis has no Prometheus surface — the event is the only observable.
+#[derive(Default)]
+struct RecordingReporter(Mutex<Vec<TelemetryEvent>>);
+
+impl Reporter for RecordingReporter {
+    fn emit(&self, event: TelemetryEvent) {
+        self.0.lock().unwrap().push(event);
+    }
+
+    fn flush(&self) {}
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn historical_get_transaction_lifecycle_is_counted_once_and_body_is_unchanged() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mock_calls = calls.clone();
+    let mock = Router::new().route(
+        "/",
+        post(move |body: axum::body::Bytes| {
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            let is_transaction = request["method"] == "getTransaction";
+            let call = if is_transaction {
+                mock_calls.fetch_add(1, Ordering::Relaxed)
+            } else {
+                0
+            };
+            async move {
+                let result = if !is_transaction {
+                    json!(1_000)
+                } else if call < 2 {
+                    Value::Null
+                } else {
+                    json!({"slot": 900, "meta": null, "transaction": {}})
+                };
+                axum::Json(json!({"jsonrpc":"2.0", "result":result, "id":call + 1}))
+            }
+        }),
+    );
+    let (url, _abort) = start_mock(mock).await;
+    let mut cfg = test_config(&[("a", &url)], RoutingStrategy::FailoverOrdered, 0, 5);
+    cfg.historical_analytics = Some(HistoricalAnalyticsConfig {
+        queue_capacity: 8,
+        max_queued_bytes: 65_536,
+        max_job_bytes: 16_384,
+        state_capacity: 100,
+        state_ttl_secs: 60,
+        flush_interval_ms: 60_000,
+    });
+    let reporter = Arc::new(RecordingReporter::default());
+    let state = ProxyState::new_with_reporter(cfg, reporter.clone());
+    state.monitor.update_slot("a", 1_000);
+    let router = build_router(state.clone());
+
+    for id in 1..=4 {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "getTransaction",
+            "params": ["private-signature", {"commitment": "processed", "encoding": "json"}]
+        })
+        .to_string();
+        let (status, body) = proxy_request(router.clone(), &request).await;
+        assert_eq!(status, StatusCode::OK);
+        if id <= 2 {
+            assert!(body["result"].is_null());
+        } else {
+            assert_eq!(body["result"]["slot"], 900);
+        }
+    }
+
+    state.flush_historical_analytics().await;
+
+    // One aggregate per commitment per window; `processed` carries this test's
+    // four logical requests. Serialized form must never leak the signature.
+    let events = reporter.0.lock().unwrap();
+    let json = serde_json::to_string(&*events).unwrap();
+    assert!(
+        !json.contains("private-signature"),
+        "signature leaked: {json}"
+    );
+
+    let aggregate = events
+        .iter()
+        .find(|event| {
+            matches!(
+                event,
+                TelemetryEvent::HistoricalGetTransactionAggregate { commitment, .. }
+                    if commitment == "processed"
+            )
+        })
+        .expect("expected a processed-commitment aggregate");
+
+    let TelemetryEvent::HistoricalGetTransactionAggregate {
+        logical_request_count,
+        analyzed_request_count,
+        found_count,
+        null_count,
+        first_observation_null_count,
+        null_repeat_count,
+        null_to_found_count,
+        found_repeat_count,
+        found_to_null_regression_count,
+        polls_before_found_bucket_counts,
+        slot_age_bucket_counts,
+        ..
+    } = aggregate
+    else {
+        unreachable!()
+    };
+
+    // Four client-visible requests, each analyzed exactly once: null, null,
+    // found, found. Provider retries must not add logical samples.
+    assert_eq!(*logical_request_count, 4);
+    assert_eq!(*analyzed_request_count, 4);
+    assert_eq!(*null_count, 2);
+    assert_eq!(*found_count, 2);
+    assert_eq!(*first_observation_null_count, 1);
+    assert_eq!(*null_repeat_count, 1);
+    assert_eq!(*null_to_found_count, 1);
+    assert_eq!(*found_repeat_count, 1);
+    assert_eq!(*found_to_null_regression_count, 0);
+    // Two null polls preceded the first found result -> the "2" bucket.
+    assert_eq!(polls_before_found_bucket_counts[2], 1);
+    // Tip 1000 - slot 900 = 100 slots -> the 0-149 bucket, both found samples.
+    assert_eq!(slot_age_bucket_counts[0], 2);
+
+    assert_eq!(calls.load(Ordering::Relaxed), 4);
+}
 
 #[tokio::test]
 async fn transaction_sequential_acceptance_and_rejection_are_counted_once() {
@@ -630,6 +765,7 @@ async fn circuit_recovers_traffic_resumes() {
             },
         ],
         reporting: None,
+        historical_analytics: None,
     };
     let state = ProxyState::new(cfg);
 
