@@ -1,5 +1,6 @@
 use crate::config::{Config, ProviderConfig};
 use crate::health::{CircuitState, CommitmentHealth, HealthMonitor};
+use crate::historical::{HistoricalAnalytics, HistoricalRequestClass};
 use crate::metrics::Metrics;
 use crate::router::{
     extract_rpc_error_code, is_client_error, is_retryable_http, is_retryable_rpc_code, route,
@@ -65,6 +66,7 @@ pub struct ProxyState {
     pub metrics: Metrics,
     pub reporter: Arc<dyn Reporter>,
     tx_analytics: TransactionAnalytics,
+    historical_analytics: Option<HistoricalAnalytics>,
 }
 
 impl ProxyState {
@@ -81,6 +83,10 @@ impl ProxyState {
         let monitor = HealthMonitor::new(&config.providers, config.health.clone(), metrics.clone());
         monitor.start(clients.clone(), config.providers.clone());
         let tx_analytics = TransactionAnalytics::new(metrics.clone(), reporter.clone());
+        let historical_analytics = config
+            .historical_analytics
+            .clone()
+            .map(|analytics_config| HistoricalAnalytics::new(analytics_config, reporter.clone()));
         Self {
             config: Arc::new(parking_lot::RwLock::new(Arc::new(config))),
             clients,
@@ -88,6 +94,7 @@ impl ProxyState {
             metrics,
             reporter,
             tx_analytics,
+            historical_analytics,
         }
     }
 
@@ -106,6 +113,12 @@ impl ProxyState {
     /// been processed. Used during graceful shutdown before flushing telemetry.
     pub async fn flush_transaction_analytics(&self) {
         self.tx_analytics.flush().await;
+    }
+
+    pub async fn flush_historical_analytics(&self) {
+        if let Some(analytics) = &self.historical_analytics {
+            analytics.flush().await;
+        }
     }
 
     fn client_for(&self, name: &str) -> Option<Arc<Client>> {
@@ -431,11 +444,18 @@ async fn handle_rpc(State(state): State<ProxyState>, headers: HeaderMap, body: B
     let request_id = Uuid::new_v4();
     // `call_count` is the number of JSON-RPC calls (batch size) — used to weight
     // metrics/telemetry so a 1000-call batch is billed as 1000, not 1.
-    let (method, call_count, transaction_request) = classify_request(&body)
-        .unwrap_or_else(|| ("unknown".to_string(), 1, TransactionRequest::None));
+    let (method, call_count, transaction_request, historical_request) = classify_request(&body)
+        .unwrap_or_else(|| {
+            (
+                "unknown".to_string(),
+                1,
+                TransactionRequest::None,
+                HistoricalRequestClass::None,
+            )
+        });
 
     let config = state.current_config();
-    let snapshots = state.monitor.snapshots();
+    let (snapshots, observed_tips) = state.monitor.snapshots_with_tips();
     let decision = route(
         &method,
         &snapshots,
@@ -452,6 +472,8 @@ async fn handle_rpc(State(state): State<ProxyState>, headers: HeaderMap, body: B
         request_id,
         count: call_count,
         transaction_request,
+        historical_request,
+        observed_tips,
     };
 
     // A degraded decision means no provider was routable (all circuit-open
@@ -477,6 +499,27 @@ struct RequestCtx<'a> {
     /// JSON-RPC call count (batch size) — weights metrics/telemetry.
     count: u64,
     transaction_request: TransactionRequest,
+    historical_request: HistoricalRequestClass,
+    observed_tips: crate::health::ObservedSlotTips,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_analytics(
+    state: &ProxyState,
+    transaction_request: TransactionRequest,
+    historical_request: HistoricalRequestClass,
+    request: &Bytes,
+    response: &Bytes,
+    status: u16,
+    tips: crate::health::ObservedSlotTips,
+    acknowledging_provider: Option<Arc<str>>,
+) {
+    state
+        .tx_analytics
+        .finish(transaction_request, request, acknowledging_provider);
+    if let Some(analytics) = &state.historical_analytics {
+        analytics.finish(historical_request, request, response, status, tips);
+    }
 }
 
 /// Result of one provider forward: (provider name, Ok(status, body) | Err(msg), latency_ms).
@@ -498,6 +541,8 @@ async fn sequential(
         request_id,
         count,
         transaction_request,
+        historical_request,
+        observed_tips,
     } = ctx;
     let max_attempts = (config.routing.max_retries + 1).min(providers.len());
     // Count of real forwards issued. Providers skipped before dispatch (missing
@@ -603,13 +648,22 @@ async fn sequential(
                         "upstream non-2xx, passing status through"
                     );
                     recorder.record(method, name, outcome, latency_ms, count);
+                    finish_analytics(
+                        state,
+                        transaction_request,
+                        historical_request,
+                        body,
+                        &bytes,
+                        status,
+                        observed_tips,
+                        None,
+                    );
                     let response = (
                         StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
                         [("content-type", "application/json")],
                         bytes,
                     )
                         .into_response();
-                    state.tx_analytics.finish(transaction_request, body, None);
                     return response;
                 }
 
@@ -630,13 +684,22 @@ async fn sequential(
                 }
                 if has_rpc_error(&bytes) {
                     recorder.record(method, name, Outcome::ProviderError, latency_ms, count);
+                    finish_analytics(
+                        state,
+                        transaction_request,
+                        historical_request,
+                        body,
+                        &bytes,
+                        StatusCode::OK.as_u16(),
+                        observed_tips,
+                        None,
+                    );
                     let response = (
                         StatusCode::OK,
                         [("content-type", "application/json")],
                         bytes,
                     )
                         .into_response();
-                    state.tx_analytics.finish(transaction_request, body, None);
                     return response;
                 }
                 info!(
@@ -648,15 +711,22 @@ async fn sequential(
                     "request ok"
                 );
                 recorder.record(method, name, Outcome::Ok, latency_ms, count);
+                finish_analytics(
+                    state,
+                    transaction_request,
+                    historical_request,
+                    body,
+                    &bytes,
+                    StatusCode::OK.as_u16(),
+                    observed_tips,
+                    Some(name.clone()),
+                );
                 let response = (
                     StatusCode::OK,
                     [("content-type", "application/json")],
                     bytes,
                 )
                     .into_response();
-                state
-                    .tx_analytics
-                    .finish(transaction_request, body, Some(name.clone()));
                 return response;
             }
             Err(e) => {
@@ -675,8 +745,18 @@ async fn sequential(
     }
 
     error!(%request_id, method, "all providers failed");
-    state.tx_analytics.finish(transaction_request, body, None);
-    json_error_response(StatusCode::BAD_GATEWAY, -32603, "all providers failed")
+    let response_body = json_error_body(-32603, "all providers failed");
+    finish_analytics(
+        state,
+        transaction_request,
+        historical_request,
+        body,
+        &response_body,
+        StatusCode::BAD_GATEWAY.as_u16(),
+        observed_tips,
+        None,
+    );
+    json_response(StatusCode::BAD_GATEWAY, response_body)
 }
 
 // ── Broadcast (writes + parallel race) ────────────────────────────────────────
@@ -695,14 +775,22 @@ async fn broadcast(
         request_id,
         count,
         transaction_request,
+        historical_request,
+        observed_tips,
     } = ctx;
     if providers.is_empty() {
-        state.tx_analytics.finish(transaction_request, body, None);
-        return json_error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            -32603,
-            "no providers available",
+        let response_body = json_error_body(-32603, "no providers available");
+        finish_analytics(
+            state,
+            transaction_request,
+            historical_request,
+            body,
+            &response_body,
+            StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+            observed_tips,
+            None,
         );
+        return json_response(StatusCode::SERVICE_UNAVAILABLE, response_body);
     }
 
     let mut set: JoinSet<ForwardOutcome> = JoinSet::new();
@@ -775,15 +863,22 @@ async fn broadcast(
                         "broadcast first success"
                     );
                     spawn_straggler_drain(recorder, method, request_id, count, set);
+                    finish_analytics(
+                        state,
+                        transaction_request,
+                        historical_request,
+                        body,
+                        &bytes,
+                        StatusCode::OK.as_u16(),
+                        observed_tips,
+                        Some(name),
+                    );
                     let response = (
                         StatusCode::OK,
                         [("content-type", "application/json")],
                         bytes,
                     )
                         .into_response();
-                    state
-                        .tx_analytics
-                        .finish(transaction_request, body, Some(name));
                     return response;
                 }
                 let rpc_code = extract_rpc_error_code(&bytes);
@@ -809,18 +904,37 @@ async fn broadcast(
     // rather than masking it as a generic -32603.
     if let Some((status, bytes, _)) = best_error {
         error!(%request_id, method, "all broadcast providers failed; returning upstream error");
+        finish_analytics(
+            state,
+            transaction_request,
+            historical_request,
+            body,
+            &bytes,
+            status,
+            observed_tips,
+            None,
+        );
         let response = (
             StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
             [("content-type", "application/json")],
             bytes,
         )
             .into_response();
-        state.tx_analytics.finish(transaction_request, body, None);
         return response;
     }
     error!(%request_id, method, "all broadcast providers failed");
-    state.tx_analytics.finish(transaction_request, body, None);
-    json_error_response(StatusCode::BAD_GATEWAY, -32603, "all providers failed")
+    let response_body = json_error_body(-32603, "all providers failed");
+    finish_analytics(
+        state,
+        transaction_request,
+        historical_request,
+        body,
+        &response_body,
+        StatusCode::BAD_GATEWAY.as_u16(),
+        observed_tips,
+        None,
+    );
+    json_response(StatusCode::BAD_GATEWAY, response_body)
 }
 
 /// A broadcast leg counts as a success only on HTTP 2xx *and* a body with no
@@ -949,10 +1063,12 @@ const MAX_METHOD_LABEL_LEN: usize = 128;
 /// count weights metrics/telemetry so that batch is billed as its true volume.
 #[allow(dead_code)] // Kept as a focused benchmark and unit-test entry point.
 pub fn extract_method(body: &[u8]) -> Option<(String, u64)> {
-    classify_request(body).map(|(method, count, _)| (method, count))
+    classify_request(body).map(|(method, count, _, _)| (method, count))
 }
 
-fn classify_request(body: &[u8]) -> Option<(String, u64, TransactionRequest)> {
+fn classify_request(
+    body: &[u8],
+) -> Option<(String, u64, TransactionRequest, HistoricalRequestClass)> {
     let first = body.iter().find(|&&b| !b.is_ascii_whitespace())?;
     if *first == b'{' {
         // Single request: parse only the method field, skip everything else.
@@ -966,6 +1082,11 @@ fn classify_request(body: &[u8]) -> Option<(String, u64, TransactionRequest)> {
                 } else {
                     TransactionRequest::None
                 },
+                if m == "getTransaction" {
+                    HistoricalRequestClass::Single
+                } else {
+                    HistoricalRequestClass::None
+                },
             )
         });
     }
@@ -978,9 +1099,11 @@ fn classify_request(body: &[u8]) -> Option<(String, u64, TransactionRequest)> {
     let mut uniques: Vec<&str> = Vec::new();
     let mut calls: u64 = 0;
     let mut contains_send_transaction = false;
+    let mut historical_calls = 0u64;
     for m in arr.iter().filter_map(|r| r.method) {
         calls += 1;
         contains_send_transaction |= m == "sendTransaction";
+        historical_calls += u64::from(m == "getTransaction");
         if !uniques.contains(&m) {
             uniques.push(m);
         }
@@ -1008,16 +1131,28 @@ fn classify_request(body: &[u8]) -> Option<(String, u64, TransactionRequest)> {
         } else {
             TransactionRequest::None
         },
+        if historical_calls > 0 {
+            HistoricalRequestClass::Batch {
+                eligible_calls: historical_calls,
+            }
+        } else {
+            HistoricalRequestClass::None
+        },
     ))
 }
 
-fn json_error_response(status: StatusCode, code: i64, message: &str) -> Response {
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "error": { "code": code, "message": message },
-        "id": null,
-    })
-    .to_string();
+fn json_error_body(code: i64, message: &str) -> Bytes {
+    Bytes::from(
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "error": { "code": code, "message": message },
+            "id": null,
+        })
+        .to_string(),
+    )
+}
+
+fn json_response(status: StatusCode, body: Bytes) -> Response {
     (status, [("content-type", "application/json")], body).into_response()
 }
 

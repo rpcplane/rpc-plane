@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # Asserts that every serde-deserialized field in the user-facing config structs
-# (ServerConfig, HealthConfig, RoutingConfig, ProviderConfig) is mentioned in the
+# (ServerConfig, HealthConfig, RoutingConfig, ProviderConfig, and
+# HistoricalAnalyticsConfig) is mentioned in the
 # documentation. This automates the docs-sync rule: a flag that lands in
 # config.rs without a matching entry in configuration.md fails the build.
 #
@@ -26,11 +27,11 @@ if [[ ! -f "$DOCS" ]]; then
   exit 2
 fi
 
-# Extract the serde field name of every `pub` field inside the four user-facing
+# Extract the serde field name of every `pub` field inside the user-facing
 # config structs. A field-level #[serde(rename = "...")] wins over the Rust name.
 # Uses only POSIX awk features so it runs under both mawk and gawk.
 fields="$(awk '
-  /^pub struct (ServerConfig|HealthConfig|RoutingConfig|ProviderConfig) \{/ { in_s=1; rename=""; next }
+  /^pub struct (ServerConfig|HealthConfig|RoutingConfig|ProviderConfig|HistoricalAnalyticsConfig) \{/ { in_s=1; rename=""; next }
   in_s && /^\}/                                                            { in_s=0; rename=""; next }
   !in_s { next }
   /#\[serde\(rename = "/ {

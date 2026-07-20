@@ -14,6 +14,8 @@ pub struct Config {
     pub providers: Vec<ProviderConfig>,
     #[serde(default)]
     pub reporting: Option<ReportingConfig>,
+    #[serde(default)]
+    pub historical_analytics: Option<HistoricalAnalyticsConfig>,
 }
 
 impl Config {
@@ -87,6 +89,49 @@ impl Config {
                 "reporting.flush_interval_ms must be >= 10000 (10 s); got {}. \
                  Values below 10 s produce excessive telemetry volume.",
                 r.flush_interval_ms
+            );
+        }
+        if let Some(h) = &self.historical_analytics {
+            // The aggregate telemetry event is the only delivery path for
+            // historical analysis — it is not exported to Prometheus. Without a
+            // reporter the analyzer would run a worker, a queue, and up to
+            // `state_capacity` retained fingerprints while emitting into a
+            // no-op sink, with nothing anywhere to reveal it. Fail fast instead.
+            anyhow::ensure!(
+                self.reporting.is_some(),
+                "historical_analytics requires [reporting]: analysis is delivered \
+                 only as remote telemetry aggregates, so without a reporting \
+                 endpoint the analyzer would consume resources and report nothing"
+            );
+            anyhow::ensure!(
+                h.queue_capacity > 0,
+                "historical_analytics.queue_capacity must be positive"
+            );
+            anyhow::ensure!(
+                h.max_queued_bytes >= 4096,
+                "historical_analytics.max_queued_bytes must be at least 4096"
+            );
+            anyhow::ensure!(
+                h.max_job_bytes > 0,
+                "historical_analytics.max_job_bytes must be positive"
+            );
+            anyhow::ensure!(
+                h.state_capacity > 0,
+                "historical_analytics.state_capacity must be positive"
+            );
+            anyhow::ensure!(
+                h.state_ttl_secs > 0,
+                "historical_analytics.state_ttl_secs must be positive"
+            );
+            anyhow::ensure!(
+                h.flush_interval_ms > 0,
+                "historical_analytics.flush_interval_ms must be positive"
+            );
+            anyhow::ensure!(
+                h.max_job_bytes <= h.max_queued_bytes,
+                "historical_analytics.max_job_bytes ({}) must be <= max_queued_bytes ({})",
+                h.max_job_bytes,
+                h.max_queued_bytes
             );
         }
         Ok(())
@@ -399,6 +444,58 @@ fn default_buffer_size() -> usize {
 }
 fn default_batch_size() -> usize {
     100
+}
+
+// ── Historical analytics ────────────────────────────────────────────────────
+
+/// Optional bounded analysis of historical RPC workloads. Presence of the
+/// `[historical_analytics]` block enables the feature.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct HistoricalAnalyticsConfig {
+    #[serde(default = "default_historical_queue_capacity")]
+    pub queue_capacity: usize,
+    #[serde(default = "default_historical_max_queued_bytes")]
+    pub max_queued_bytes: usize,
+    #[serde(default = "default_historical_max_job_bytes")]
+    pub max_job_bytes: usize,
+    #[serde(default = "default_historical_state_capacity")]
+    pub state_capacity: usize,
+    #[serde(default = "default_historical_state_ttl_secs")]
+    pub state_ttl_secs: u64,
+    #[serde(default = "default_historical_flush_interval_ms")]
+    pub flush_interval_ms: u64,
+}
+
+impl Default for HistoricalAnalyticsConfig {
+    fn default() -> Self {
+        Self {
+            queue_capacity: default_historical_queue_capacity(),
+            max_queued_bytes: default_historical_max_queued_bytes(),
+            max_job_bytes: default_historical_max_job_bytes(),
+            state_capacity: default_historical_state_capacity(),
+            state_ttl_secs: default_historical_state_ttl_secs(),
+            flush_interval_ms: default_historical_flush_interval_ms(),
+        }
+    }
+}
+
+fn default_historical_queue_capacity() -> usize {
+    512
+}
+fn default_historical_max_queued_bytes() -> usize {
+    67_108_864
+}
+fn default_historical_max_job_bytes() -> usize {
+    2_097_152
+}
+fn default_historical_state_capacity() -> usize {
+    250_000
+}
+fn default_historical_state_ttl_secs() -> u64 {
+    172_800
+}
+fn default_historical_flush_interval_ms() -> u64 {
+    60_000
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -714,6 +811,122 @@ api_key = "rp_live_test"
         let f = write_config("[[providers]]\nname=\"p\"\nurl=\"http://x\"\n");
         let cfg = Config::load(f.path()).unwrap();
         assert!(cfg.reporting.is_none());
+    }
+
+    #[test]
+    fn historical_analytics_absent_is_none() {
+        let f = write_config("[[providers]]\nname=\"p\"\nurl=\"http://x\"\n");
+        let cfg = Config::load(f.path()).unwrap();
+        assert!(cfg.historical_analytics.is_none());
+    }
+
+    #[test]
+    fn historical_analytics_empty_block_uses_defaults() {
+        let f = write_config(
+            r#"
+[historical_analytics]
+
+[reporting]
+endpoint = "http://localhost:3000/api/ingest"
+api_key = "rp_live_test"
+
+[[providers]]
+name = "p"
+url = "http://x"
+"#,
+        );
+        let cfg = Config::load(f.path()).unwrap();
+        assert_eq!(
+            cfg.historical_analytics,
+            Some(HistoricalAnalyticsConfig::default())
+        );
+    }
+
+    #[test]
+    fn parses_custom_historical_analytics_config() {
+        let f = write_config(
+            r#"
+[historical_analytics]
+queue_capacity = 12
+max_queued_bytes = 4096
+max_job_bytes = 1024
+state_capacity = 34
+state_ttl_secs = 56
+flush_interval_ms = 78
+
+[reporting]
+endpoint = "http://localhost:3000/api/ingest"
+api_key = "rp_live_test"
+
+[[providers]]
+name = "p"
+url = "http://x"
+"#,
+        );
+        let cfg = Config::load(f.path()).unwrap();
+        assert_eq!(
+            cfg.historical_analytics,
+            Some(HistoricalAnalyticsConfig {
+                queue_capacity: 12,
+                max_queued_bytes: 4096,
+                max_job_bytes: 1024,
+                state_capacity: 34,
+                state_ttl_secs: 56,
+                flush_interval_ms: 78,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_historical_analytics_without_reporting() {
+        // Analysis ships only as remote aggregates, so this pairing would burn
+        // analyzer resources into a NoopReporter and surface nowhere.
+        let f = write_config(
+            "[historical_analytics]\n[[providers]]\nname = \"p\"\nurl = \"http://x\"\n",
+        );
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(err.contains("requires [reporting]"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_invalid_historical_analytics_config() {
+        let zero_cases = [
+            "queue_capacity",
+            "max_queued_bytes",
+            "max_job_bytes",
+            "state_capacity",
+            "state_ttl_secs",
+            "flush_interval_ms",
+        ];
+
+        for field in zero_cases {
+            let f = write_config(&format!(
+                "[historical_analytics]\n{field} = 0\n\
+                 [reporting]\nendpoint = \"http://x/i\"\napi_key = \"k\"\n\
+                 [[providers]]\nname = \"p\"\nurl = \"http://x\"\n"
+            ));
+            let err = Config::load(f.path()).unwrap_err().to_string();
+            assert!(err.contains(field), "field={field}, got: {err}");
+        }
+
+        let f = write_config(
+            r#"
+[historical_analytics]
+max_queued_bytes = 4096
+max_job_bytes = 4097
+
+[reporting]
+endpoint = "http://localhost:3000/api/ingest"
+api_key = "rp_live_test"
+
+[[providers]]
+name = "p"
+url = "http://x"
+"#,
+        );
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(err.contains("max_job_bytes"), "got: {err}");
+        assert!(err.contains("max_queued_bytes"), "got: {err}");
     }
 
     #[test]

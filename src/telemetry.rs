@@ -12,6 +12,13 @@ use tracing::{debug, warn};
 
 // ── Event types ───────────────────────────────────────────────────────────────
 
+/// Schema version for `HistoricalGetTransactionAggregate`, including array order.
+pub const HISTORICAL_GET_TRANSACTION_AGGREGATE_VERSION: u32 = 1;
+pub const HISTORICAL_SLOT_AGE_BUCKET_COUNT: usize = 9;
+pub const HISTORICAL_POLLS_BEFORE_FOUND_BUCKET_COUNT: usize = 6;
+pub const HISTORICAL_TIME_TO_FOUND_BUCKET_COUNT: usize = 6;
+pub const HISTORICAL_FOUND_REUSE_BUCKET_COUNT: usize = 5;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TelemetryEvent {
@@ -53,6 +60,55 @@ pub enum TelemetryEvent {
         requested_priority_fee_lamports_p50: u64,
         requested_priority_fee_lamports_p90: u64,
         requested_priority_fee_lamports_p95: u64,
+    },
+    HistoricalGetTransactionAggregate {
+        /// Defines the meaning and boundaries of every fixed-size bucket array.
+        schema_version: u32,
+        window_start_ms: u64,
+        window_end_ms: u64,
+        /// "processed" | "confirmed" | "finalized" | "unknown"
+        commitment: String,
+        logical_request_count: u64,
+        analyzed_request_count: u64,
+        found_count: u64,
+        null_count: u64,
+        rpc_error_count: u64,
+        parse_error_count: u64,
+        first_observation_found_count: u64,
+        first_observation_null_count: u64,
+        null_repeat_count: u64,
+        null_to_found_count: u64,
+        found_repeat_count: u64,
+        found_to_null_regression_count: u64,
+        /// Counts for 0-149, 150-749, 750-8,999, 9,000-53,999,
+        /// 54,000-215,999, 216,000-431,999, 432,000-2,159,999,
+        /// 2,160,000-4,319,999, and 4,320,000+ slots, in that order.
+        /// Boxed so this variant does not dominate the size of every
+        /// `TelemetryEvent`; a `Box<[u64; N]>` serializes as a plain array, so
+        /// the wire format is unchanged. One allocation per flush window.
+        slot_age_bucket_counts: Box<[u64; HISTORICAL_SLOT_AGE_BUCKET_COUNT]>,
+        slot_age_unknown_count: u64,
+        slot_age_tip_behind_count: u64,
+        /// Counts for 0, 1, 2, 3-5, 6-10, and 11+ null polls.
+        polls_before_found_bucket_counts: Box<[u64; HISTORICAL_POLLS_BEFORE_FOUND_BUCKET_COUNT]>,
+        /// Counts for <1s, <2s, <5s, <15s, <60s, and >=60s.
+        time_to_found_bucket_counts: Box<[u64; HISTORICAL_TIME_TO_FOUND_BUCKET_COUNT]>,
+        /// Counts for <300s, 300-3,599s, 3,600-86,399s, 86,400-172,799s,
+        /// and 172,800s or later.
+        found_reuse_bucket_counts: Box<[u64; HISTORICAL_FOUND_REUSE_BUCKET_COUNT]>,
+        unsupported_batch_count: u64,
+        queue_full_drop_count: u64,
+        byte_budget_exhausted_drop_count: u64,
+        oversized_job_drop_count: u64,
+        state_capacity_eviction_count: u64,
+        state_ttl_expiration_count: u64,
+        /// Subset of capacity evictions whose state was an unresolved null.
+        unresolved_null_capacity_eviction_count: u64,
+        /// Subset of TTL expirations whose state was an unresolved null.
+        unresolved_null_ttl_expiration_count: u64,
+        state_reset_count: u64,
+        current_state_entries: u64,
+        configured_state_capacity: u64,
     },
     ProviderHealth {
         provider: String,
@@ -662,6 +718,80 @@ mod tests {
         let json = serde_json::to_value(&ev).unwrap();
         assert_eq!(json["type"], "request_aggregate");
         assert_eq!(json["count"], 5000);
+    }
+
+    #[test]
+    fn historical_get_transaction_aggregate_serializes_schema() {
+        let ev = TelemetryEvent::HistoricalGetTransactionAggregate {
+            schema_version: HISTORICAL_GET_TRANSACTION_AGGREGATE_VERSION,
+            window_start_ms: 1_000,
+            window_end_ms: 61_000,
+            commitment: "confirmed".into(),
+            logical_request_count: 100,
+            analyzed_request_count: 95,
+            found_count: 40,
+            null_count: 50,
+            rpc_error_count: 3,
+            parse_error_count: 2,
+            first_observation_found_count: 20,
+            first_observation_null_count: 25,
+            null_repeat_count: 25,
+            null_to_found_count: 10,
+            found_repeat_count: 10,
+            found_to_null_regression_count: 1,
+            slot_age_bucket_counts: Box::new([1, 2, 3, 4, 5, 6, 7, 8, 9]),
+            slot_age_unknown_count: 2,
+            slot_age_tip_behind_count: 1,
+            polls_before_found_bucket_counts: Box::new([10, 9, 8, 7, 6, 5]),
+            time_to_found_bucket_counts: Box::new([1, 3, 5, 7, 9, 11]),
+            found_reuse_bucket_counts: Box::new([2, 4, 6, 8, 10]),
+            unsupported_batch_count: 2,
+            queue_full_drop_count: 1,
+            byte_budget_exhausted_drop_count: 2,
+            oversized_job_drop_count: 3,
+            state_capacity_eviction_count: 4,
+            state_ttl_expiration_count: 5,
+            unresolved_null_capacity_eviction_count: 2,
+            unresolved_null_ttl_expiration_count: 3,
+            state_reset_count: 1,
+            current_state_entries: 12_345,
+            configured_state_capacity: 250_000,
+        };
+
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["type"], "historical_get_transaction_aggregate");
+        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["commitment"], "confirmed");
+        assert_eq!(json["logical_request_count"], 100);
+        assert_eq!(
+            json["slot_age_bucket_counts"],
+            serde_json::json!([1, 2, 3, 4, 5, 6, 7, 8, 9])
+        );
+        assert_eq!(
+            json["polls_before_found_bucket_counts"],
+            serde_json::json!([10, 9, 8, 7, 6, 5])
+        );
+        assert_eq!(
+            json["time_to_found_bucket_counts"],
+            serde_json::json!([1, 3, 5, 7, 9, 11])
+        );
+        assert_eq!(
+            json["found_reuse_bucket_counts"],
+            serde_json::json!([2, 4, 6, 8, 10])
+        );
+        assert_eq!(json["slot_age_unknown_count"], 2);
+        assert_eq!(json["slot_age_tip_behind_count"], 1);
+        assert_eq!(json["configured_state_capacity"], 250_000);
+
+        let decoded: TelemetryEvent = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            decoded,
+            TelemetryEvent::HistoricalGetTransactionAggregate {
+                schema_version: HISTORICAL_GET_TRANSACTION_AGGREGATE_VERSION,
+                configured_state_capacity: 250_000,
+                ..
+            }
+        ));
     }
 
     #[test]
