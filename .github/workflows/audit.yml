@@ -18,6 +18,14 @@ on:
     - cron: "0 12 * * *"
   workflow_dispatch:
 
+# audit-check opens an issue when a new advisory lands on a push/schedule run,
+# and writes a check run on PRs. The default GITHUB_TOKEN is read-only here, so
+# both are granted explicitly.
+permissions:
+  contents: read
+  issues: write
+  checks: write
+
 jobs:
   audit:
     name: Cargo audit
