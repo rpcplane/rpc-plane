@@ -1,25 +1,45 @@
 # Free-tier maxxing
 #
-# Spreads load across four free or no-cost endpoints so no single provider
-# sees enough traffic to hit its rate limit. The optional `max_rps` cap on each
-# provider makes that explicit: once a provider is dispatching at its plan's
-# per-second limit it's treated as unavailable and load sheds to the others, so
-# you stop hitting a free key's 429s before they happen. Set each cap to the
-# limit your plan actually documents — the values below are illustrative.
+# ~60 requests/second of Solana RPC at zero cost. No single free tier gets you
+# there — the largest is 25 req/s — so this spreads load across four endpoints,
+# weighted so each one sits at roughly the same percentage of its own limit.
 #
-# One provider needs no sign-up at all:
+# `max_rps` is what makes that work. The circuit breaker is reactive: it only
+# reroutes after a key has already returned 429s. A cap sheds load before they
+# start. The values below are each provider's documented limit, verified
+# 2026-09-05 — re-check them, provider tiers move.
+#
+#   Provider           Rate limit   Monthly allowance
+#   ─────────────────  ───────────  ──────────────────────────────────────────
+#   Alchemy            25 req/s     30M compute units (~3M standard reads)
+#   QuickNode          15 req/s     10M credits — a TRIAL, not a monthly renewal
+#   Helius             10 req/s     1M credits; only 1 sendTransaction/s
+#   Solana Foundation  10 req/s     unmetered, no SLA, not for production
+#   PublicNode         unpublished  unmetered, no SLA (Allnodes) — no documented cap
+#
+# Watch the PER-METHOD limits, not just the headline. Helius free is 10 req/s
+# overall but 1 sendTransaction/s, 2 DAS/s and 5 getProgramAccounts/s; the
+# Foundation endpoint is ~10 req/s but 4/s for any single method. max_rps is
+# per provider ENTRY, not per method, so the Helius key below is registered
+# twice — once restricted to sendTransaction with its own 1 rps bucket, once
+# for everything else. Only `name` has to be unique, so this is legal, and the
+# two buckets are independent: writes cannot eat the read budget.
+#
+# If you need more than a couple of writes a second, add a paid provider —
+# more free keys will not help.
+#
+# No sign-up:
 #   - api.mainnet-beta.solana.com  (Solana Foundation public RPC)
-#
-# The other three require a free account:
-#   - Helius    https://helius.dev       (Developer plan)
-#   - QuickNode https://quicknode.com    (Free endpoint — note: the free tier
-#                                         only lasts ~1 month, then it's paid)
-#   - Alchemy   https://alchemy.com       (Free tier)
+#   - solana-rpc.publicnode.com    (PublicNode, operated by Allnodes)
+# Free account, no card:
+#   - Alchemy   https://alchemy.com
+#   - QuickNode https://quicknode.com   (trial credits, then paid)
+#   - Helius    https://helius.dev
 #
 # Usage:
-#   export HELIUS_API_KEY=...
-#   export QUICKNODE_API_KEY=...
 #   export ALCHEMY_API_KEY=...
+#   export QUICKNODE_API_KEY=...
+#   export HELIUS_API_KEY=...
 #   rpc-plane -c examples/free-tier.toml run
 
 [server]
@@ -34,35 +54,50 @@ circuit_error_threshold = 0.4
 circuit_cooldown_secs   = 2     # RPS windows reset per-second; recover fast
 
 [routing]
-strategy    = "weighted_random"  # spread load evenly — avoid hammering one key
-max_retries = 3                  # try all four before giving up
+strategy    = "weighted_random"  # spread load — avoid hammering one key
+max_retries = 4                  # try all five URLs before giving up
+
+# ── Free-tier accounts ─────────────────────────────────────────────────────────
+# Weights track capacity, not provider count. Equal weights would saturate
+# Helius at 10 req/s while Alchemy idled at 40% of its 25.
+
+[[providers]]
+name    = "alchemy"
+url     = "https://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}"
+weight  = 5
+max_rps = 25
+
+[[providers]]
+name    = "quicknode"
+url     = "https://your-endpoint.solana-mainnet.quiknode.pro/${QUICKNODE_API_KEY}/"
+weight  = 3
+max_rps = 15   # heads up: the free trial is 10M credits once, then the endpoint stops
+
+[[providers]]
+name    = "helius-writes"
+url     = "https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}"
+methods = ["sendTransaction"]
+weight  = 1
+max_rps = 1    # the free plan's sendTransaction limit, not its 10 req/s headline
+
+[[providers]]
+name    = "helius-reads"
+url     = "https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}"
+weight  = 2
+max_rps = 10
+# http3 = true   # opt-in QUIC. Can help on a lossy home/last-mile link, but there's no
+                 # HTTP/2 fallback — only enable if your endpoint serves QUIC. See docs.
 
 # ── No sign-up required ────────────────────────────────────────────────────────
 
 [[providers]]
 name    = "solana-foundation"
 url     = "https://api.mainnet-beta.solana.com"
-weight  = 1
-max_rps = 10   # illustrative — set to your plan's documented per-second limit
-
-# ── Free-tier accounts ─────────────────────────────────────────────────────────
+weight  = 2
+max_rps = 10   # 100 req/10s per IP — but only 40/10s for any ONE method
 
 [[providers]]
-name    = "helius"
-url     = "https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}"
-weight  = 1
-max_rps = 10
-# http3 = true   # opt-in QUIC. Can help on a lossy home/last-mile link, but there's no
-                 # HTTP/2 fallback — only enable if your endpoint serves QUIC. See docs.
-
-[[providers]]
-name    = "quicknode"
-url     = "https://your-endpoint.quiknode.pro/${QUICKNODE_API_KEY}"
-weight  = 1
-max_rps = 15   # heads up: QuickNode's free endpoint only lasts ~1 month, then it's paid
-
-[[providers]]
-name    = "alchemy"
-url     = "https://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}"
-weight  = 1
-max_rps = 15
+name    = "publicnode"
+url     = "https://solana-rpc.publicnode.com"
+weight  = 2
+max_rps = 10   # PublicNode (Allnodes) publishes no limit; start low, raise on evidence
