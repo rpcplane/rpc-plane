@@ -12,6 +12,11 @@ path = "src/main.rs"
 
 [dependencies]
 tokio.workspace = true
+# Used only for the https:// arm: the hyper paths below have no TLS, and an
+# HTTP/3 comparison has to run against a real TLS provider endpoint. reqwest is
+# built here exactly as src/proxy.rs builds it (rustls + http3, prior
+# knowledge), so the transport under test is the one the proxy actually uses.
+reqwest.workspace = true
 hyper = { version = "1", features = ["http1", "client"] }
 hyper-util.workspace = true
 http-body-util = "0.1"
