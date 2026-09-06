@@ -1,21 +1,31 @@
 # Free-tier maxxing
 #
-# ~60 requests/second of Solana RPC at zero cost. No single free tier gets you
-# there — the largest is 25 req/s — so this spreads load across four endpoints,
+# ~105 requests/second of Solana RPC at zero cost. No single free tier gets you
+# there — the largest is 25 req/s — so this spreads load across eight providers,
 # weighted so each one sits at roughly the same percentage of its own limit.
 #
 # `max_rps` is what makes that work. The circuit breaker is reactive: it only
 # reroutes after a key has already returned 429s. A cap sheds load before they
-# start. The values below are each provider's documented limit, verified
-# 2026-09-05 — re-check them, provider tiers move.
+# start. The values below are each provider's documented limit — Alchemy,
+# QuickNode and Helius verified 2026-09-05, Chainstack, OnFinality and dRPC
+# 2026-09-06. Re-check them, provider tiers move.
 #
 #   Provider           Rate limit   Monthly allowance
 #   ─────────────────  ───────────  ──────────────────────────────────────────
 #   Alchemy            25 req/s     30M compute units (~3M standard reads)
+#   Chainstack         25 req/s     3M request units — 1 RU/call, so 3M calls
+#   OnFinality         20 calls/s   400K response units PER DAY (~6M/month)
 #   QuickNode          15 req/s     10M credits — a TRIAL, not a monthly renewal
 #   Helius             10 req/s     1M credits; only 1 sendTransaction/s
 #   Solana Foundation  10 req/s     unmetered, no SLA, not for production
 #   PublicNode         unpublished  unmetered, no SLA (Allnodes) — no documented cap
+#   dRPC               unpublished  210M CU/30d (~10.5M calls) — PUBLIC NODE POOL
+#
+# Two of those do not read the way the others do. OnFinality's cap is 40
+# RESPONSE UNITS per second and every Solana method costs 2 RU, so it is 20
+# calls/s — the units differ from every other row. And dRPC's free tier is
+# served over its public node pool, slower and less reliable than its paid
+# endpoints, so it is headroom rather than a leg for latency-sensitive traffic.
 #
 # Watch the PER-METHOD limits, not just the headline. Helius free is 10 req/s
 # overall but 1 sendTransaction/s, 2 DAS/s and 5 getProgramAccounts/s; the
@@ -32,14 +42,24 @@
 #   - api.mainnet-beta.solana.com  (Solana Foundation public RPC)
 #   - solana-rpc.publicnode.com    (PublicNode, operated by Allnodes)
 # Free account, no card:
-#   - Alchemy   https://alchemy.com
-#   - QuickNode https://quicknode.com   (trial credits, then paid)
-#   - Helius    https://helius.dev
+#   - Alchemy    https://alchemy.com
+#   - Chainstack https://chainstack.com
+#   - OnFinality https://onfinality.io
+#   - dRPC       https://drpc.org        (public pool on the free tier)
+#   - QuickNode  https://quicknode.com   (trial credits, then paid)
+#   - Helius     https://helius.dev
+#
+# Chainstack, OnFinality and dRPC take a whole endpoint URL rather than a bare
+# key, so pass the full URL from their console. Env vars are expanded across the
+# entire config, so a variable can stand in for a whole value.
 #
 # Usage:
 #   export ALCHEMY_API_KEY=...
 #   export QUICKNODE_API_KEY=...
 #   export HELIUS_API_KEY=...
+#   export CHAINSTACK_URL=...
+#   export ONFINALITY_URL=...
+#   export DRPC_URL=...
 #   rpc-plane -c examples/free-tier.toml run
 
 [server]
@@ -55,7 +75,7 @@ circuit_cooldown_secs   = 2     # RPS windows reset per-second; recover fast
 
 [routing]
 strategy    = "weighted_random"  # spread load — avoid hammering one key
-max_retries = 4                  # try all five URLs before giving up
+max_retries = 8                  # try all nine entries before giving up
 
 # ── Free-tier accounts ─────────────────────────────────────────────────────────
 # Weights track capacity, not provider count. Equal weights would saturate
@@ -66,6 +86,18 @@ name    = "alchemy"
 url     = "https://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}"
 weight  = 5
 max_rps = 25
+
+[[providers]]
+name    = "chainstack"
+url     = "${CHAINSTACK_URL}"
+weight  = 5
+max_rps = 25   # getSupply is paid-plans-only on Chainstack — it will fail on the free tier
+
+[[providers]]
+name    = "onfinality"
+url     = "${ONFINALITY_URL}"
+weight  = 4
+max_rps = 20   # 40 RU/s at 2 RU per call. sendTransaction is not in its published method set
 
 [[providers]]
 name    = "quicknode"
@@ -101,3 +133,9 @@ name    = "publicnode"
 url     = "https://solana-rpc.publicnode.com"
 weight  = 2
 max_rps = 10   # PublicNode (Allnodes) publishes no limit; start low, raise on evidence
+
+[[providers]]
+name    = "drpc"
+url     = "${DRPC_URL}"
+weight  = 2
+max_rps = 10   # no published free-tier limit, and it runs on the public pool; stay conservative
