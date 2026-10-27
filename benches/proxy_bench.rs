@@ -60,6 +60,7 @@ fn prov(name: &str) -> ProviderConfig {
         http3: false,
         methods: None,
         max_rps: None,
+        history: Default::default(),
     }
 }
 
@@ -97,6 +98,7 @@ fn bench_route(c: &mut Criterion) {
                 black_box(&providers),
                 false,
                 black_box(&writes),
+                false,
             )
         })
     });
@@ -109,6 +111,7 @@ fn bench_route(c: &mut Criterion) {
                 black_box(&providers),
                 false,
                 black_box(&writes),
+                false,
             )
         })
     });
@@ -121,6 +124,7 @@ fn bench_route(c: &mut Criterion) {
                 black_box(&providers),
                 true,
                 black_box(&writes),
+                false,
             )
         })
     });

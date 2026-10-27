@@ -988,6 +988,7 @@ async fn reference_loop(
         http3: false,
         methods: None,
         max_rps: None,
+        history: Default::default(),
     };
     info!(reference = %reference.url, "external slot reference enabled (probe-only, never routed)");
 
@@ -1446,6 +1447,7 @@ mod tests {
             http3: false,
             methods: None,
             max_rps: None,
+            history: Default::default(),
         };
         let monitor = HealthMonitor::new(
             std::slice::from_ref(&provider),
@@ -1482,6 +1484,7 @@ mod tests {
             http3: false,
             methods: None,
             max_rps: None,
+            history: Default::default(),
         };
         // We don't call add_provider here (needs real HTTP) — just verify map ops
         {
