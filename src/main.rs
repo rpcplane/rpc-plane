@@ -667,6 +667,7 @@ mod tests {
             http3,
             methods: None,
             max_rps: None,
+            history: Default::default(),
         }
     }
 

@@ -40,6 +40,10 @@ max_retries      = 2               # retry on next-best provider on transient er
 # broadcast_writes = false         # fan out write methods to all providers
 # write_methods    = ["sendTransaction"]  # methods routed as writes (default: sendTransaction
                                           # only; add "simulateTransaction" to broadcast it too)
+# For pools that mix `history = "recent"` providers with full-history ones (see below):
+# history_methods      = ["getTransaction", "getBlock"]  # a recent provider's null/error
+                                          # fails over to a full-history provider
+# full_history_methods = ["getSignaturesForAddress"]     # never sent to recent providers
 
 # ── Providers ──────────────────────────────────────────────────────────────────
 [[providers]]
@@ -64,6 +68,17 @@ name   = "triton"
 url    = "https://your-pool.rpcpool.com/${TRITON_API_KEY}"
 weight = 1
 # http3 = true   # see the helius note above before enabling
+
+# Shallow provider (free tier or public endpoint) that keeps only the last days
+# of history and answers older getTransaction calls with `null`, which clients
+# read as "no such transaction". `history = "recent"` makes those answers fail
+# over to a full-history provider (the default, `history = "full"`) and keeps
+# getSignaturesForAddress, which such providers silently truncate, off it.
+# Miss counts show up as rpc_plane_requests_total{status="miss"}.
+# [[providers]]
+# name    = "publicnode"
+# url     = "https://solana-rpc.publicnode.com"
+# history = "recent"
 
 # Submission-only provider (e.g. a transaction-landing service). `methods`
 # scopes it to the calls it supports, so it never receives reads it can't

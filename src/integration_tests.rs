@@ -5,8 +5,8 @@
 //! Each test gets its own tokio runtime; spawned tasks are aborted on drop.
 use crate::{
     config::{
-        Config, HealthConfig, HistoricalAnalyticsConfig, ProviderConfig, RoutingConfig,
-        RoutingStrategy, ServerConfig,
+        Config, HealthConfig, HistoricalAnalyticsConfig, HistoryDepth, ProviderConfig,
+        RoutingConfig, RoutingStrategy, ServerConfig,
     },
     proxy::{build_router, ProxyState},
     telemetry::{Reporter, TelemetryEvent},
@@ -95,6 +95,7 @@ fn test_config(
                 http3: false,
                 methods: None,
                 max_rps: None,
+                history: Default::default(),
             })
             .collect(),
         reporting: None,
@@ -754,6 +755,7 @@ async fn circuit_recovers_traffic_resumes() {
                 http3: false,
                 methods: None,
                 max_rps: None,
+                history: Default::default(),
             },
             ProviderConfig {
                 name: "b".into(),
@@ -762,6 +764,7 @@ async fn circuit_recovers_traffic_resumes() {
                 http3: false,
                 methods: None,
                 max_rps: None,
+                history: Default::default(),
             },
         ],
         reporting: None,
@@ -1353,4 +1356,346 @@ async fn max_rps_lone_provider_still_serves_when_capped() {
         2,
         "both reads reach the lone provider"
     );
+}
+
+// ── History depth (`history = "recent"`) ──────────────────────────────────────
+
+const GET_TX: &str = r#"{"jsonrpc":"2.0","id":1,"method":"getTransaction","params":["sig",{"encoding":"json","maxSupportedTransactionVersion":0}]}"#;
+const GET_SIGS: &str = r#"{"jsonrpc":"2.0","id":1,"method":"getSignaturesForAddress","params":["addr",{"limit":1000}]}"#;
+
+/// A mock answering every POST with `response` after `delay`, counting only the
+/// POSTs whose body contains `needle` (so background `getSlot` probes don't).
+async fn start_json_mock(
+    response: Value,
+    needle: &'static str,
+    delay: Duration,
+) -> (String, Arc<AtomicUsize>, tokio::task::AbortHandle) {
+    let count = Arc::new(AtomicUsize::new(0));
+    let c = count.clone();
+    let router = Router::new().route(
+        "/",
+        post(move |body: axum::body::Bytes| {
+            let c = c.clone();
+            let response = response.clone();
+            async move {
+                if std::str::from_utf8(&body).is_ok_and(|s| s.contains(needle)) {
+                    c.fetch_add(1, Ordering::Relaxed);
+                }
+                tokio::time::sleep(delay).await;
+                axum::Json(response)
+            }
+        }),
+    );
+    let (url, abort) = start_mock(router).await;
+    (url, count, abort)
+}
+
+fn tx_found() -> Value {
+    json!({ "jsonrpc": "2.0", "result": { "slot": 42, "meta": { "err": null } }, "id": 1 })
+}
+
+fn tx_null() -> Value {
+    json!({ "jsonrpc": "2.0", "result": null, "id": 1 })
+}
+
+fn rpc_error(code: i64) -> Value {
+    json!({ "jsonrpc": "2.0", "error": { "code": code, "message": "not here" }, "id": 1 })
+}
+
+/// `test_config` with each provider's `history` set from `recent`.
+fn history_config(
+    providers: &[(&str, &str, bool)],
+    strategy: RoutingStrategy,
+    max_retries: usize,
+) -> Config {
+    let pairs: Vec<(&str, &str)> = providers.iter().map(|(n, u, _)| (*n, *u)).collect();
+    let mut cfg = test_config(&pairs, strategy, max_retries, 5);
+    for (p, (_, _, recent)) in cfg.providers.iter_mut().zip(providers) {
+        if *recent {
+            p.history = HistoryDepth::Recent;
+        }
+    }
+    cfg
+}
+
+/// The bug in #61: a shallow provider's `null` for an old transaction went back
+/// to the client as success. It must fail over to the full-history provider,
+/// be counted as `miss` rather than `ok`, and record the failover.
+#[tokio::test]
+async fn recent_provider_null_fails_over_to_full_history_provider() {
+    let (shallow, shallow_n, _a) =
+        start_json_mock(tx_null(), "getTransaction", Duration::ZERO).await;
+    let (archive, archive_n, _b) =
+        start_json_mock(tx_found(), "getTransaction", Duration::ZERO).await;
+    let cfg = history_config(
+        &[("shallow", &shallow, true), ("archive", &archive, false)],
+        RoutingStrategy::FailoverOrdered,
+        2,
+    );
+    let state = ProxyState::new(cfg);
+    let metrics = state.metrics.clone();
+
+    let (status, body) = proxy_request(build_router(state), GET_TX).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"]["slot"], 42);
+    assert_eq!(shallow_n.load(Ordering::Relaxed), 1);
+    assert_eq!(archive_n.load(Ordering::Relaxed), 1);
+    let text = metrics.render();
+    assert!(text.contains(
+        "rpc_plane_requests_total{method=\"getTransaction\",provider=\"shallow\",status=\"miss\"} 1"
+    ));
+    assert!(text.contains(
+        "rpc_plane_requests_total{method=\"getTransaction\",provider=\"archive\",status=\"ok\"} 1"
+    ));
+    assert!(text
+        .contains("rpc_plane_failover_total{from_provider=\"shallow\",to_provider=\"archive\"} 1"));
+}
+
+/// Shallow providers report a missing transaction with their own error codes
+/// (e.g. -32017, which Solana defines as something unrelated). Any error from a
+/// `recent` provider on a history lookup fails over.
+#[tokio::test]
+async fn recent_provider_error_fails_over_to_full_history_provider() {
+    let (shallow, _, _a) =
+        start_json_mock(rpc_error(-32017), "getTransaction", Duration::ZERO).await;
+    let (archive, _, _b) = start_json_mock(tx_found(), "getTransaction", Duration::ZERO).await;
+    let cfg = history_config(
+        &[("shallow", &shallow, true), ("archive", &archive, false)],
+        RoutingStrategy::FailoverOrdered,
+        2,
+    );
+
+    let (status, body) = proxy_request(build_router(ProxyState::new(cfg)), GET_TX).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"]["slot"], 42);
+}
+
+/// A full-history provider's `null` is the real answer — the transaction isn't
+/// there (yet). Retrying it would multiply every confirmation poll by
+/// `max_retries + 1` and still return `null`.
+#[tokio::test]
+async fn full_history_null_is_returned_without_failover() {
+    let (archive, archive_n, _a) =
+        start_json_mock(tx_null(), "getTransaction", Duration::ZERO).await;
+    let (other, other_n, _b) = start_json_mock(tx_found(), "getTransaction", Duration::ZERO).await;
+    let cfg = history_config(
+        &[("archive", &archive, false), ("other", &other, false)],
+        RoutingStrategy::FailoverOrdered,
+        2,
+    );
+
+    let (status, body) = proxy_request(build_router(ProxyState::new(cfg)), GET_TX).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["result"].is_null());
+    assert_eq!(archive_n.load(Ordering::Relaxed), 1);
+    assert_eq!(other_n.load(Ordering::Relaxed), 0);
+}
+
+/// After a miss, other shallow providers are skipped: one that lacked the data
+/// says nothing about whether another shallow one has it, and asking them all
+/// would spend free-tier quota on the most common miss — a not-yet-landed poll.
+#[tokio::test]
+async fn history_miss_skips_other_recent_providers() {
+    let (first, _, _a) = start_json_mock(tx_null(), "getTransaction", Duration::ZERO).await;
+    let (second, second_n, _b) = start_json_mock(tx_null(), "getTransaction", Duration::ZERO).await;
+    let (archive, archive_n, _c) =
+        start_json_mock(tx_found(), "getTransaction", Duration::ZERO).await;
+    let cfg = history_config(
+        &[
+            ("first", &first, true),
+            ("second", &second, true),
+            ("archive", &archive, false),
+        ],
+        RoutingStrategy::FailoverOrdered,
+        2,
+    );
+
+    let (_, body) = proxy_request(build_router(ProxyState::new(cfg)), GET_TX).await;
+
+    assert_eq!(body["result"]["slot"], 42);
+    assert_eq!(second_n.load(Ordering::Relaxed), 0);
+    assert_eq!(archive_n.load(Ordering::Relaxed), 1);
+}
+
+/// With no full-history provider to ask, the shallow answer goes back as is —
+/// the same response as before `history` existed, not a 502.
+#[tokio::test]
+async fn history_miss_returned_when_no_full_history_provider_is_left() {
+    let (first, _, _a) = start_json_mock(tx_null(), "getTransaction", Duration::ZERO).await;
+    let (second, second_n, _b) =
+        start_json_mock(tx_found(), "getTransaction", Duration::ZERO).await;
+    let cfg = history_config(
+        &[("first", &first, true), ("second", &second, true)],
+        RoutingStrategy::FailoverOrdered,
+        2,
+    );
+
+    let (status, body) = proxy_request(build_router(ProxyState::new(cfg)), GET_TX).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["result"].is_null());
+    assert_eq!(second_n.load(Ordering::Relaxed), 0);
+}
+
+/// If the full-history provider then fails outright, the client gets the miss
+/// it would have gotten before, not "all providers failed".
+#[tokio::test]
+async fn history_miss_returned_when_full_history_provider_fails() {
+    let (shallow, _, _a) = start_json_mock(tx_null(), "getTransaction", Duration::ZERO).await;
+    let (archive, _abort_archive) = start_mock(Router::new().route(
+        "/",
+        post(|| async { (StatusCode::SERVICE_UNAVAILABLE, "down") }),
+    ))
+    .await;
+    let cfg = history_config(
+        &[("shallow", &shallow, true), ("archive", &archive, false)],
+        RoutingStrategy::FailoverOrdered,
+        2,
+    );
+
+    let (status, body) = proxy_request(build_router(ProxyState::new(cfg)), GET_TX).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["result"].is_null());
+}
+
+/// A standard history-gap code (-32004 block not available) fails over even
+/// from a full-history provider: another archive may have the block.
+#[tokio::test]
+async fn full_history_gap_code_fails_over() {
+    let (pruned, _, _a) = start_json_mock(rpc_error(-32004), "getBlock", Duration::ZERO).await;
+    let (archive, _, _b) = start_json_mock(tx_found(), "getBlock", Duration::ZERO).await;
+    let cfg = history_config(
+        &[("pruned", &pruned, false), ("archive", &archive, false)],
+        RoutingStrategy::FailoverOrdered,
+        2,
+    );
+
+    let (_, body) = proxy_request(
+        build_router(ProxyState::new(cfg)),
+        r#"{"jsonrpc":"2.0","id":1,"method":"getBlock","params":[42]}"#,
+    )
+    .await;
+
+    assert_eq!(body["result"]["slot"], 42);
+}
+
+/// `null` is a normal answer for most methods (an account that doesn't exist);
+/// only `routing.history_methods` treat it as a miss.
+#[tokio::test]
+async fn null_for_other_methods_is_not_a_miss() {
+    let (shallow, _, _a) = start_json_mock(tx_null(), "getAccountInfo", Duration::ZERO).await;
+    let (archive, archive_n, _b) =
+        start_json_mock(tx_found(), "getAccountInfo", Duration::ZERO).await;
+    let cfg = history_config(
+        &[("shallow", &shallow, true), ("archive", &archive, false)],
+        RoutingStrategy::FailoverOrdered,
+        2,
+    );
+
+    let (_, body) = proxy_request(
+        build_router(ProxyState::new(cfg)),
+        r#"{"jsonrpc":"2.0","id":1,"method":"getAccountInfo","params":["addr"]}"#,
+    )
+    .await;
+
+    assert!(body["result"].is_null());
+    assert_eq!(archive_n.load(Ordering::Relaxed), 0);
+}
+
+/// A batch answers with an array, so its `null`s aren't inspected: it goes
+/// back as is rather than resending the whole batch for one missing entry.
+#[tokio::test]
+async fn history_batch_is_passed_through() {
+    let (shallow, _, _a) = start_json_mock(
+        json!([{ "jsonrpc": "2.0", "result": null, "id": 1 }]),
+        "getTransaction",
+        Duration::ZERO,
+    )
+    .await;
+    let (archive, archive_n, _b) =
+        start_json_mock(json!([tx_found()]), "getTransaction", Duration::ZERO).await;
+    let cfg = history_config(
+        &[("shallow", &shallow, true), ("archive", &archive, false)],
+        RoutingStrategy::FailoverOrdered,
+        2,
+    );
+
+    let (status, body) =
+        proxy_request(build_router(ProxyState::new(cfg)), &format!("[{GET_TX}]")).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body[0]["result"].is_null());
+    assert_eq!(archive_n.load(Ordering::Relaxed), 0);
+}
+
+/// A shallow provider answers `getSignaturesForAddress` with a short list and no
+/// error, so there is nothing to fail over on: it must never get the call,
+/// including inside a mixed batch.
+#[tokio::test]
+async fn full_history_methods_never_reach_recent_providers() {
+    let list = json!({ "jsonrpc": "2.0", "result": [], "id": 1 });
+    let (shallow, shallow_n, _a) =
+        start_json_mock(list.clone(), "getSignaturesForAddress", Duration::ZERO).await;
+    let (archive, archive_n, _b) =
+        start_json_mock(list, "getSignaturesForAddress", Duration::ZERO).await;
+    let cfg = history_config(
+        &[("shallow", &shallow, true), ("archive", &archive, false)],
+        RoutingStrategy::FailoverOrdered,
+        2,
+    );
+    let router = build_router(ProxyState::new(cfg));
+
+    let (status, _) = proxy_request(router.clone(), GET_SIGS).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = proxy_request(router, &format!("[{GET_SLOT},{GET_SIGS}]")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert_eq!(shallow_n.load(Ordering::Relaxed), 0);
+    assert_eq!(archive_n.load(Ordering::Relaxed), 2);
+}
+
+/// Under `parallel_race` a shallow provider's `null` skips the history lookup
+/// and comes back first. It must not win the race over a slower archive that
+/// has the transaction.
+#[tokio::test]
+async fn parallel_race_history_miss_does_not_win() {
+    let (shallow, _, _a) = start_json_mock(tx_null(), "getTransaction", Duration::ZERO).await;
+    let (archive, _, _b) =
+        start_json_mock(tx_found(), "getTransaction", Duration::from_millis(200)).await;
+    let cfg = history_config(
+        &[("shallow", &shallow, true), ("archive", &archive, false)],
+        RoutingStrategy::ParallelRace,
+        0,
+    );
+
+    let (status, body) = proxy_request(build_router(ProxyState::new(cfg)), GET_TX).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"]["slot"], 42);
+}
+
+/// …and if the archive fails, the race hands back the miss rather than the
+/// archive's bare 5xx.
+#[tokio::test]
+async fn parallel_race_returns_miss_when_archive_fails() {
+    let (shallow, _, _a) = start_json_mock(tx_null(), "getTransaction", Duration::ZERO).await;
+    let (archive, _abort_archive) = start_mock(Router::new().route(
+        "/",
+        post(|| async { (StatusCode::SERVICE_UNAVAILABLE, "down") }),
+    ))
+    .await;
+    let cfg = history_config(
+        &[("shallow", &shallow, true), ("archive", &archive, false)],
+        RoutingStrategy::ParallelRace,
+        0,
+    );
+
+    let (status, body) = proxy_request(build_router(ProxyState::new(cfg)), GET_TX).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["result"].is_null());
 }

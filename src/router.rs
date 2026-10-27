@@ -1,4 +1,4 @@
-use crate::config::{ProviderConfig, RoutingStrategy};
+use crate::config::{HistoryDepth, ProviderConfig, RoutingStrategy};
 use crate::health::HealthSnapshot;
 use rand::Rng;
 use std::sync::Arc;
@@ -60,6 +60,18 @@ pub fn is_retryable_rpc_code(code: i64) -> bool {
     matches!(code, -32003 | -32005 | -32603)
 }
 
+/// Standard Solana JSON-RPC codes meaning "this node doesn't have that part of
+/// the ledger", which another provider may well have. Only consulted for
+/// `routing.history_methods`: the codes are block/history specific, and
+/// providers reuse the neighbouring numbers for unrelated errors.
+pub fn is_history_gap_code(code: i64) -> bool {
+    // -32001 = block cleaned up (pruned from this node's ledger)
+    // -32004 = block not available for slot
+    // -32011 = transaction history not available on this node
+    // -32019 = long-term storage unreachable
+    matches!(code, -32001 | -32004 | -32011 | -32019)
+}
+
 pub fn extract_rpc_error_code(body: &[u8]) -> Option<i64> {
     #[derive(serde::Deserialize)]
     struct RpcErr {
@@ -93,6 +105,9 @@ pub struct RouteDecision {
 /// `providers`: config entries in config order — `weight` drives
 /// `WeightedRandom` and the order is the stable tiebreak for `FailoverOrdered`.
 /// Borrowed directly from the live config so nothing is allocated per request.
+///
+/// `full_history`: the request calls a `routing.full_history_methods` method
+/// (anywhere in a batch), so `history = "recent"` providers are left out.
 pub fn route(
     method: &str,
     snapshots: &[HealthSnapshot],
@@ -100,16 +115,20 @@ pub fn route(
     providers: &[ProviderConfig],
     broadcast_writes: bool,
     write_methods: &[String],
+    full_history: bool,
 ) -> RouteDecision {
     let class = classify(method, write_methods);
 
     // A provider serves this request only if its optional `methods` allowlist
-    // permits the method (unrestricted providers permit everything).
+    // permits the method (unrestricted providers permit everything), and — for
+    // a full-history request — only if it keeps the full history.
     let supports = |name: &Arc<str>| {
         providers
             .iter()
             .find(|p| p.name.as_str() == name.as_ref())
-            .is_none_or(|p| p.supports(method))
+            .is_none_or(|p| {
+                p.supports(method) && !(full_history && p.history == HistoryDepth::Recent)
+            })
     };
 
     let mut available: Vec<&HealthSnapshot> = snapshots
@@ -296,6 +315,7 @@ mod tests {
                 http3: false,
                 methods: None,
                 max_rps: None,
+                history: Default::default(),
             })
             .collect()
     }
@@ -329,6 +349,7 @@ mod tests {
             &providers(&["a", "b", "c"]),
             false,
             &writes(),
+            false,
         );
         assert_eq!(&*d.providers[0], "a");
         assert_eq!(&*d.providers[1], "b");
@@ -345,6 +366,7 @@ mod tests {
             &providers(&["a", "b"]),
             false,
             &writes(),
+            false,
         );
         assert!(!d.broadcast);
         assert_eq!(&*d.providers[0], "a");
@@ -360,6 +382,7 @@ mod tests {
             &providers(&["a", "b"]),
             true,
             &writes(),
+            false,
         );
         assert!(d.broadcast);
         assert_eq!(d.providers.len(), 2);
@@ -375,6 +398,7 @@ mod tests {
             &providers(&["a", "b", "c"]),
             false,
             &writes(),
+            false,
         );
         assert!(!d.providers.iter().any(|p| p.as_ref() == "b"));
     }
@@ -389,6 +413,7 @@ mod tests {
             &providers(&["a", "b", "c"]),
             true,
             &writes(),
+            false,
         );
         assert!(!d.providers.iter().any(|p| p.as_ref() == "b"));
         assert_eq!(d.providers.len(), 2);
@@ -404,8 +429,54 @@ mod tests {
             &providers(&["a", "b"]),
             false,
             &writes(),
+            false,
         );
         assert_eq!(d.providers.len(), 2);
+    }
+
+    /// A full-history request leaves `recent` providers out — even in the
+    /// degraded fallback, which otherwise lists every provider: a shallow
+    /// provider's truncated list is worse than an error.
+    #[test]
+    fn full_history_request_excludes_recent_providers() {
+        let mut cfg = providers(&["shallow", "archive"]);
+        cfg[0].history = HistoryDepth::Recent;
+
+        let healthy = vec![snap("shallow", 0.9), snap("archive", 0.5)];
+        let d = route(
+            "getSignaturesForAddress",
+            &healthy,
+            &RoutingStrategy::BestScore,
+            &cfg,
+            false,
+            &writes(),
+            true,
+        );
+        assert_eq!(names(&d), ["archive"]);
+
+        let archive_down = vec![snap("shallow", 0.9), snap_open("archive")];
+        let d = route(
+            "getSignaturesForAddress",
+            &archive_down,
+            &RoutingStrategy::BestScore,
+            &cfg,
+            false,
+            &writes(),
+            true,
+        );
+        assert!(d.degraded);
+        assert_eq!(names(&d), ["archive"]);
+
+        let d = route(
+            "getSlot",
+            &healthy,
+            &RoutingStrategy::BestScore,
+            &cfg,
+            false,
+            &writes(),
+            false,
+        );
+        assert_eq!(names(&d), ["shallow", "archive"]);
     }
 
     #[test]
@@ -419,6 +490,7 @@ mod tests {
             &cfg,
             false,
             &writes(),
+            false,
         );
         assert_eq!(names(&d), ["c", "a", "b"]);
     }
@@ -514,6 +586,7 @@ mod tests {
             &providers(&["a", "b"]),
             false,
             &writes(),
+            false,
         );
         assert!(d.broadcast);
         assert_eq!(names(&d), ["a", "b"]);
@@ -529,6 +602,7 @@ mod tests {
             &providers(&["a", "b"]),
             false,
             &writes(),
+            false,
         );
         assert_eq!(names(&d), ["b"]);
         assert!(!d.broadcast);
@@ -546,6 +620,7 @@ mod tests {
             &cfg,
             true,
             &writes(),
+            false,
         );
         assert_eq!(names(&d), ["read"]);
         assert!(!d.broadcast);
@@ -562,6 +637,7 @@ mod tests {
             &cfg,
             true,
             &writes(),
+            false,
         );
         assert!(d.broadcast);
         let mut got = names(&d);
@@ -581,6 +657,7 @@ mod tests {
             &cfg,
             true,
             &writes(),
+            false,
         );
         assert!(d.providers.is_empty());
     }
@@ -597,6 +674,7 @@ mod tests {
             &cfg,
             true,
             &writes(),
+            false,
         );
         // getSlot can't go to the submit-only provider even in the degraded path.
         assert_eq!(names(&d), ["read"]);
@@ -613,6 +691,7 @@ mod tests {
             &providers(&["a", "b", "c"]),
             false,
             &writes(),
+            false,
         );
         assert!(!d.providers.iter().any(|p| p.as_ref() == "b"));
         assert_eq!(&*d.providers[0], "a");
@@ -632,6 +711,7 @@ mod tests {
             &providers(&["a", "b"]),
             false,
             &writes(),
+            false,
         );
         assert_eq!(d.providers.len(), 2);
         assert!(
@@ -650,6 +730,7 @@ mod tests {
             &providers(&["a", "b"]),
             false,
             &writes(),
+            false,
         );
         assert!(!d.degraded);
     }

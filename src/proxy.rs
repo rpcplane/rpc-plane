@@ -1,9 +1,10 @@
-use crate::config::{Config, ProviderConfig};
+use crate::config::{Config, HistoryDepth, ProviderConfig};
 use crate::health::{CircuitState, CommitmentHealth, HealthMonitor};
 use crate::historical::{HistoricalAnalytics, HistoricalRequestClass};
 use crate::metrics::Metrics;
 use crate::router::{
-    extract_rpc_error_code, is_client_error, is_retryable_http, is_retryable_rpc_code, route,
+    extract_rpc_error_code, is_client_error, is_history_gap_code, is_retryable_http,
+    is_retryable_rpc_code, route,
 };
 #[cfg(test)]
 use crate::telemetry::NoopReporter;
@@ -269,6 +270,11 @@ enum Outcome {
     RateLimited,
     /// Client-attributable 4xx — recorded for visibility, never fed to health.
     ClientError,
+    /// A history lookup the provider couldn't answer from its own ledger (see
+    /// [`is_history_miss`]). Health-neutral: the provider works, it just doesn't
+    /// keep that far back. Counted apart from `ok` so a shallow provider's
+    /// `null`s don't make it look like the healthiest in the pool.
+    Miss,
 }
 
 impl Outcome {
@@ -288,9 +294,20 @@ impl Outcome {
 
     /// Classify a broadcast leg, which is a success only on a 2xx with no
     /// JSON-RPC error body ([`leg_succeeded`]); a 2xx carrying an error body is a
-    /// provider failure (a preflight -32002), not a success.
-    fn from_leg(status: u16, bytes: &Bytes) -> Self {
-        if leg_succeeded(status, bytes) {
+    /// provider failure (a preflight -32002), not a success. For a history
+    /// lookup, a miss is not a success either, so it can't win a race.
+    fn from_leg(
+        status: u16,
+        bytes: &Bytes,
+        history_lookup: bool,
+        provider: &ProviderConfig,
+    ) -> Self {
+        if history_lookup
+            && (200..300).contains(&status)
+            && is_history_miss(provider, extract_rpc_error_code(bytes), bytes)
+        {
+            Outcome::Miss
+        } else if leg_succeeded(status, bytes) {
             Outcome::Ok
         } else if status == 429 {
             Outcome::RateLimited
@@ -308,6 +325,7 @@ impl Outcome {
             Outcome::ProviderError => "error",
             Outcome::RateLimited => "rate_limited",
             Outcome::ClientError => "client_error",
+            Outcome::Miss => "miss",
         }
     }
 }
@@ -324,7 +342,8 @@ struct OutcomeRecorder {
 impl OutcomeRecorder {
     /// Record one forwarded leg across metrics, telemetry, and provider health.
     /// The health effect is per-outcome: success/failure feed the circuit, a 429
-    /// demotes the score only, and a client-attributable 4xx is health-neutral.
+    /// demotes the score only, and a client-attributable 4xx or a history miss is
+    /// health-neutral.
     fn record(&self, method: &str, name: &str, outcome: Outcome, latency_ms: f64, count: u64) {
         let label = outcome.label();
         self.metrics
@@ -338,7 +357,7 @@ impl OutcomeRecorder {
             Outcome::Ok => self.monitor.record(name, true, latency_ms, false),
             Outcome::ProviderError => self.monitor.record(name, false, latency_ms, false),
             Outcome::RateLimited => self.monitor.record_throttled(name, latency_ms),
-            Outcome::ClientError => {}
+            Outcome::ClientError | Outcome::Miss => {}
         }
     }
 }
@@ -442,19 +461,28 @@ async fn handle_metrics(State(state): State<ProxyState>) -> impl IntoResponse {
 
 async fn handle_rpc(State(state): State<ProxyState>, headers: HeaderMap, body: Bytes) -> Response {
     let request_id = Uuid::new_v4();
-    // `call_count` is the number of JSON-RPC calls (batch size) — used to weight
-    // metrics/telemetry so a 1000-call batch is billed as 1000, not 1.
-    let (method, call_count, transaction_request, historical_request) = classify_request(&body)
-        .unwrap_or_else(|| {
-            (
-                "unknown".to_string(),
-                1,
-                TransactionRequest::None,
-                HistoricalRequestClass::None,
-            )
-        });
-
     let config = state.current_config();
+    let RequestClass {
+        method,
+        calls,
+        batch,
+        full_history,
+        transaction: transaction_request,
+        historical: historical_request,
+    } = classify_request(&body, &config.routing.full_history_methods).unwrap_or_else(|| {
+        RequestClass {
+            method: "unknown".to_string(),
+            calls: 1,
+            batch: false,
+            full_history: false,
+            transaction: TransactionRequest::None,
+            historical: HistoricalRequestClass::None,
+        }
+    });
+    // Miss detection reads a single response's `result`; a batch answers with an
+    // array and is passed through as is.
+    let history_lookup = !batch && config.routing.history_methods.contains(&method);
+
     let (snapshots, observed_tips) = state.monitor.snapshots_with_tips();
     let decision = route(
         &method,
@@ -463,6 +491,7 @@ async fn handle_rpc(State(state): State<ProxyState>, headers: HeaderMap, body: B
         &config.providers,
         config.routing.broadcast_writes,
         &config.routing.write_methods,
+        full_history,
     );
 
     let ctx = RequestCtx {
@@ -470,7 +499,8 @@ async fn handle_rpc(State(state): State<ProxyState>, headers: HeaderMap, body: B
         headers: &headers,
         body: &body,
         request_id,
-        count: call_count,
+        count: calls,
+        history_lookup,
         transaction_request,
         historical_request,
         observed_tips,
@@ -498,6 +528,9 @@ struct RequestCtx<'a> {
     request_id: Uuid,
     /// JSON-RPC call count (batch size) — weights metrics/telemetry.
     count: u64,
+    /// A single `routing.history_methods` call: a provider's miss fails over to
+    /// a `full` provider instead of going back to the client.
+    history_lookup: bool,
     transaction_request: TransactionRequest,
     historical_request: HistoricalRequestClass,
     observed_tips: crate::health::ObservedSlotTips,
@@ -522,8 +555,10 @@ fn finish_analytics(
     }
 }
 
-/// Result of one provider forward: (provider name, Ok(status, body) | Err(msg), latency_ms).
-type ForwardOutcome = (Arc<str>, Result<(u16, Bytes), String>, f64);
+/// Result of one provider forward: (provider name, Ok(status, body, outcome) |
+/// Err(msg), latency_ms). The leg classifies its own outcome, since a history
+/// miss depends on the provider's `history` depth.
+type ForwardOutcome = (Arc<str>, Result<(u16, Bytes, Outcome), String>, f64);
 
 // ── Sequential (reads + failover) ────────────────────────────────────────────
 
@@ -540,6 +575,7 @@ async fn sequential(
         body,
         request_id,
         count,
+        history_lookup,
         transaction_request,
         historical_request,
         observed_tips,
@@ -551,8 +587,18 @@ async fn sequential(
     let mut attempt = 0usize;
     let mut prev_failed: Option<(Arc<str>, &'static str)> = None; // (name, reason)
     let recorder = state.recorder();
+    // The first history miss's body. Once set, only `full` providers are asked —
+    // a shallow one won't hold what another provider lacked — and it's returned
+    // if none of them answers, so a full-history outage serves what it does today.
+    let mut miss: Option<Bytes> = None;
+    let full_history_provider = |name: &Arc<str>| {
+        config
+            .providers
+            .iter()
+            .any(|p| p.name.as_str() == name.as_ref() && p.history == HistoryDepth::Full)
+    };
 
-    for name in providers {
+    for (index, name) in providers.iter().enumerate() {
         if attempt >= max_attempts {
             break;
         }
@@ -564,6 +610,9 @@ async fn sequential(
         else {
             continue;
         };
+        if miss.is_some() && provider.history == HistoryDepth::Recent {
+            continue;
+        }
 
         let Some(client) = state.client_for(name) else {
             continue;
@@ -667,7 +716,38 @@ async fn sequential(
                     return response;
                 }
 
-                if let Some(code) = extract_rpc_error_code(&bytes) {
+                let rpc_code = extract_rpc_error_code(&bytes);
+                if history_lookup && is_history_miss(provider, rpc_code, &bytes) {
+                    recorder.record(method, name, Outcome::Miss, latency_ms, count);
+                    if attempt < max_attempts
+                        && providers[index + 1..].iter().any(full_history_provider)
+                    {
+                        info!(
+                            request_id = %request_id,
+                            provider = %name,
+                            method,
+                            code = ?rpc_code,
+                            attempt = idx,
+                            "history miss, asking a full-history provider"
+                        );
+                        prev_failed = Some((name.clone(), "history_miss"));
+                        miss.get_or_insert(bytes);
+                        continue;
+                    }
+                    // Nobody left who could know better: this is the answer.
+                    finish_analytics(
+                        state,
+                        transaction_request,
+                        historical_request,
+                        body,
+                        &bytes,
+                        StatusCode::OK.as_u16(),
+                        observed_tips,
+                        None,
+                    );
+                    return json_response(StatusCode::OK, bytes);
+                }
+                if let Some(code) = rpc_code {
                     if is_retryable_rpc_code(code) && attempt < max_attempts {
                         warn!(
                             request_id = %request_id,
@@ -744,6 +824,21 @@ async fn sequential(
         }
     }
 
+    if let Some(bytes) = miss {
+        warn!(%request_id, method, "no full-history provider answered; returning the history miss");
+        finish_analytics(
+            state,
+            transaction_request,
+            historical_request,
+            body,
+            &bytes,
+            StatusCode::OK.as_u16(),
+            observed_tips,
+            None,
+        );
+        return json_response(StatusCode::OK, bytes);
+    }
+
     error!(%request_id, method, "all providers failed");
     let response_body = json_error_body(-32603, "all providers failed");
     finish_analytics(
@@ -774,6 +869,7 @@ async fn broadcast(
         body,
         request_id,
         count,
+        history_lookup,
         transaction_request,
         historical_request,
         observed_tips,
@@ -829,6 +925,10 @@ async fn broadcast(
             let t0 = Instant::now();
             let result = forward(&client, &provider, &headers, &body).await;
             let latency_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let result = result.map(|(status, bytes)| {
+                let outcome = Outcome::from_leg(status, &bytes, history_lookup, &provider);
+                (status, bytes, outcome)
+            });
             (name, result.map_err(|e| e.to_string()), latency_ms)
         });
     }
@@ -846,13 +946,16 @@ async fn broadcast(
     // `best_error` keeps the most informative failed-leg body so that, if no leg
     // succeeds, the client gets a real upstream error (a deterministic -32602/-32002
     // it can act on) instead of a generic "all providers failed".
+    //
+    // A history miss is not a success either: a shallow provider's `null` skips
+    // the history lookup, so it is often the fastest leg, and letting it win would
+    // hand the client a false "not found" whenever a deeper provider is racing.
     let mut best_error: Option<(u16, Bytes, u8)> = None; // (status, body, rank)
     let recorder = state.recorder();
 
     while let Some(res) = set.join_next().await {
         match res {
-            Ok((name, Ok((status, bytes)), latency_ms)) => {
-                let outcome = Outcome::from_leg(status, &bytes);
+            Ok((name, Ok((status, bytes, outcome)), latency_ms)) => {
                 recorder.record(method, &name, outcome, latency_ms, count);
                 if matches!(outcome, Outcome::Ok) {
                     info!(
@@ -882,8 +985,12 @@ async fn broadcast(
                     return response;
                 }
                 let rpc_code = extract_rpc_error_code(&bytes);
-                warn!(request_id = %request_id, provider = %name, method, status, code = ?rpc_code, outcome = outcome.label(), "broadcast leg failed");
-                let rank = broadcast_error_rank(status, rpc_code);
+                if matches!(outcome, Outcome::Miss) {
+                    info!(request_id = %request_id, provider = %name, method, code = ?rpc_code, "broadcast leg history miss");
+                } else {
+                    warn!(request_id = %request_id, provider = %name, method, status, code = ?rpc_code, outcome = outcome.label(), "broadcast leg failed");
+                }
+                let rank = broadcast_error_rank(outcome, status, rpc_code);
                 if best_error.as_ref().is_none_or(|(_, _, best)| rank > *best) {
                     best_error = Some((status, bytes, rank));
                 }
@@ -952,14 +1059,40 @@ fn has_rpc_error(bytes: &[u8]) -> bool {
     serde_json::from_slice::<ErrorField>(bytes).is_ok_and(|response| response.error.is_some())
 }
 
+/// Whether a 2xx answer to a `routing.history_methods` lookup is a *miss*: it
+/// only says this provider lacks the data, so a `full` provider should be asked.
+/// From a `recent` provider any `null` result or JSON-RPC error is a miss — its
+/// retention window, not the ledger, is what ran out, and the error codes for
+/// that vary by provider. A `full` provider's `null` is the real answer; only a
+/// standard history-gap code ([`is_history_gap_code`]) from it is a miss.
+fn is_history_miss(provider: &ProviderConfig, rpc_code: Option<i64>, bytes: &[u8]) -> bool {
+    match provider.history {
+        HistoryDepth::Full => rpc_code.is_some_and(is_history_gap_code),
+        HistoryDepth::Recent => rpc_code.is_some() || !has_result(bytes),
+    }
+}
+
+/// Whether the body carries a non-null `result` member.
+fn has_result(bytes: &[u8]) -> bool {
+    #[derive(serde::Deserialize)]
+    struct ResultField {
+        result: Option<serde::de::IgnoredAny>,
+    }
+    serde_json::from_slice::<ResultField>(bytes).is_ok_and(|response| response.result.is_some())
+}
+
 /// Rank a failed broadcast leg for selection as the fallback error returned to the
 /// client when no leg succeeds. Higher wins. A non-retryable JSON-RPC error (bad
 /// params, failed preflight) is deterministic and identical across providers, so
-/// it's the most useful thing to hand back; a retryable RPC error is next; a bare
-/// HTTP error with no JSON-RPC body is last.
-fn broadcast_error_rank(status: u16, rpc_code: Option<i64>) -> u8 {
+/// it's the most useful thing to hand back; a history miss is next — when no
+/// full-history leg answered, it's what the sequential path would return too —
+/// then a retryable RPC error; a bare HTTP error with no JSON-RPC body is last.
+fn broadcast_error_rank(outcome: Outcome, status: u16, rpc_code: Option<i64>) -> u8 {
+    if matches!(outcome, Outcome::Miss) {
+        return 3;
+    }
     match rpc_code {
-        Some(code) if !is_retryable_rpc_code(code) => 3,
+        Some(code) if !is_retryable_rpc_code(code) => 4,
         Some(_) => 2,
         None if !(200..300).contains(&status) => 1,
         None => 0,
@@ -981,9 +1114,7 @@ fn spawn_straggler_drain(
     tokio::spawn(async move {
         while let Some(res) = set.join_next().await {
             let (name, outcome, latency_ms) = match res {
-                Ok((name, Ok((status, bytes)), latency_ms)) => {
-                    (name, Outcome::from_leg(status, &bytes), latency_ms)
-                }
+                Ok((name, Ok((_, _, outcome)), latency_ms)) => (name, outcome, latency_ms),
                 Ok((name, Err(e), latency_ms)) => {
                     warn!(request_id = %request_id, provider = %name, error = %e, "broadcast straggler failed");
                     (name, Outcome::ProviderError, latency_ms)
@@ -1055,6 +1186,22 @@ const MAX_BATCH_LABEL_METHODS: usize = 5;
 /// telemetry-aggregator map key). Defensive against pathologically long names.
 const MAX_METHOD_LABEL_LEN: usize = 128;
 
+/// What the proxy needs to know about a request body before routing it.
+struct RequestClass {
+    /// Bounded method label — see [`classify_request`].
+    method: String,
+    /// JSON-RPC call count (batch size) — weights metrics/telemetry so a
+    /// 1000-call batch is billed as 1000, not 1.
+    calls: u64,
+    /// The body is a JSON array, even of a single call.
+    batch: bool,
+    /// Some call is a `routing.full_history_methods` method — checked per call,
+    /// since the batch label lists at most a few method names.
+    full_history: bool,
+    transaction: TransactionRequest,
+    historical: HistoricalRequestClass,
+}
+
 /// Returns the (bounded method label, JSON-RPC call count) for a request body.
 /// A single request is one call; a batch's call count is the number of
 /// method-bearing elements. The label is bounded so a large/varied batch can't
@@ -1063,31 +1210,30 @@ const MAX_METHOD_LABEL_LEN: usize = 128;
 /// count weights metrics/telemetry so that batch is billed as its true volume.
 #[allow(dead_code)] // Kept as a focused benchmark and unit-test entry point.
 pub fn extract_method(body: &[u8]) -> Option<(String, u64)> {
-    classify_request(body).map(|(method, count, _, _)| (method, count))
+    classify_request(body, &[]).map(|class| (class.method, class.calls))
 }
 
-fn classify_request(
-    body: &[u8],
-) -> Option<(String, u64, TransactionRequest, HistoricalRequestClass)> {
+fn classify_request(body: &[u8], full_history_methods: &[String]) -> Option<RequestClass> {
+    let is_full_history = |m: &str| full_history_methods.iter().any(|f| f == m);
     let first = body.iter().find(|&&b| !b.is_ascii_whitespace())?;
     if *first == b'{' {
         // Single request: parse only the method field, skip everything else.
         let req: MethodField<'_> = serde_json::from_slice(body).ok()?;
-        return req.method.map(|m| {
-            (
-                m.to_owned(),
-                1,
-                if m == "sendTransaction" {
-                    TransactionRequest::Single
-                } else {
-                    TransactionRequest::None
-                },
-                if m == "getTransaction" {
-                    HistoricalRequestClass::Single
-                } else {
-                    HistoricalRequestClass::None
-                },
-            )
+        return req.method.map(|m| RequestClass {
+            method: m.to_owned(),
+            calls: 1,
+            batch: false,
+            full_history: is_full_history(m),
+            transaction: if m == "sendTransaction" {
+                TransactionRequest::Single
+            } else {
+                TransactionRequest::None
+            },
+            historical: if m == "getTransaction" {
+                HistoricalRequestClass::Single
+            } else {
+                HistoricalRequestClass::None
+            },
         });
     }
     // Batch request. Dedup method names (first-seen order), render up to
@@ -1111,6 +1257,7 @@ fn classify_request(
     if uniques.is_empty() {
         return None;
     }
+    let full_history = uniques.iter().any(|m| is_full_history(m));
     let shown = uniques.len().min(MAX_BATCH_LABEL_METHODS);
     let mut label = uniques[..shown].join(",");
     if uniques.len() > shown {
@@ -1123,22 +1270,24 @@ fn classify_request(
         }
         label.truncate(end);
     }
-    Some((
-        label,
+    Some(RequestClass {
+        method: label,
         calls,
-        if contains_send_transaction {
+        batch: true,
+        full_history,
+        transaction: if contains_send_transaction {
             TransactionRequest::Batch
         } else {
             TransactionRequest::None
         },
-        if historical_calls > 0 {
+        historical: if historical_calls > 0 {
             HistoricalRequestClass::Batch {
                 eligible_calls: historical_calls,
             }
         } else {
             HistoricalRequestClass::None
         },
-    ))
+    })
 }
 
 fn json_error_body(code: i64, message: &str) -> Bytes {
@@ -1262,22 +1411,46 @@ mod tests {
     #[test]
     fn request_classification_excludes_simulation_and_marks_batches() {
         assert_eq!(
-            classify_request(br#"{"method":"sendTransaction","params":[]}"#)
+            classify_request(br#"{"method":"sendTransaction","params":[]}"#, &[])
                 .unwrap()
-                .2,
+                .transaction,
             TransactionRequest::Single
         );
         assert_eq!(
-            classify_request(br#"{"method":"simulateTransaction","params":[]}"#)
+            classify_request(br#"{"method":"simulateTransaction","params":[]}"#, &[])
                 .unwrap()
-                .2,
+                .transaction,
             TransactionRequest::None
         );
         assert_eq!(
-            classify_request(br#"[{"method":"getSlot"},{"method":"sendTransaction"}]"#)
-                .unwrap()
-                .2,
+            classify_request(
+                br#"[{"method":"getSlot"},{"method":"sendTransaction"}]"#,
+                &[]
+            )
+            .unwrap()
+            .transaction,
             TransactionRequest::Batch
         );
+    }
+
+    /// The batch label shows at most five method names, so a full-history call
+    /// past them must still be found by checking every call.
+    #[test]
+    fn request_classification_finds_full_history_calls_inside_batches() {
+        let full = ["getSignaturesForAddress".to_string()];
+        let single = classify_request(br#"{"method":"getSignaturesForAddress"}"#, &full).unwrap();
+        assert!(single.full_history);
+        assert!(!single.batch);
+
+        let hidden = br#"[{"method":"a"},{"method":"b"},{"method":"c"},{"method":"d"},
+            {"method":"e"},{"method":"f"},{"method":"getSignaturesForAddress"}]"#;
+        let batch = classify_request(hidden, &full).unwrap();
+        assert_eq!(batch.method, "a,b,c,d,e+2");
+        assert!(batch.full_history);
+        assert!(batch.batch);
+
+        let lone = classify_request(br#"[{"method":"getTransaction"}]"#, &full).unwrap();
+        assert!(lone.batch, "a one-call array is still a batch");
+        assert!(!lone.full_history);
     }
 }

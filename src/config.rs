@@ -73,6 +73,28 @@ impl Config {
                 .all(|m| !m.trim().is_empty()),
             "routing.write_methods must not contain empty entries"
         );
+        for (key, list) in [
+            ("history_methods", &self.routing.history_methods),
+            ("full_history_methods", &self.routing.full_history_methods),
+        ] {
+            anyhow::ensure!(
+                list.iter().all(|m| !m.trim().is_empty()),
+                "routing.{key} must not contain empty entries"
+            );
+        }
+        // With every provider marked `recent`, full-history methods would have
+        // nowhere to go and fail with "all providers failed" on every call.
+        anyhow::ensure!(
+            self.routing.full_history_methods.is_empty()
+                || self
+                    .providers
+                    .iter()
+                    .any(|p| p.history == HistoryDepth::Full),
+            "every provider has history = \"recent\", so routing.full_history_methods ({}) \
+             would have no provider; mark at least one provider history = \"full\", or set \
+             routing.full_history_methods = [] to send those calls to recent providers",
+            self.routing.full_history_methods.join(", ")
+        );
         if let Some(url) = &self.health.reference_url {
             anyhow::ensure!(
                 !url.trim().is_empty(),
@@ -344,6 +366,19 @@ pub struct RoutingConfig {
     /// to reclassify (e.g. drop `simulateTransaction` to route it like a read).
     #[serde(default = "default_write_methods")]
     pub write_methods: Vec<String>,
+    /// Point lookups whose negative answer from a `history = "recent"` provider
+    /// is not trusted. A `null` result or any JSON-RPC error from such a provider
+    /// fails over to a `full` one instead of going back to the client; a standard
+    /// history-gap error (see [`crate::router::is_history_gap_code`]) fails over
+    /// from any provider. Single requests only — a batch is passed through as is.
+    #[serde(default = "default_history_methods")]
+    pub history_methods: Vec<String>,
+    /// Methods routed only to `history = "full"` providers. A shallow provider
+    /// answers these with a short or empty list and no error, which a client
+    /// cannot tell apart from an address with little history, so the response
+    /// gives nothing to fail over on. Applies to batches containing them too.
+    #[serde(default = "default_full_history_methods")]
+    pub full_history_methods: Vec<String>,
 }
 
 impl Default for RoutingConfig {
@@ -353,6 +388,8 @@ impl Default for RoutingConfig {
             max_retries: default_max_retries(),
             broadcast_writes: false,
             write_methods: default_write_methods(),
+            history_methods: default_history_methods(),
+            full_history_methods: default_full_history_methods(),
         }
     }
 }
@@ -368,7 +405,28 @@ fn default_write_methods() -> Vec<String> {
     vec!["sendTransaction".to_string()]
 }
 
+fn default_history_methods() -> Vec<String> {
+    vec!["getTransaction".to_string(), "getBlock".to_string()]
+}
+
+fn default_full_history_methods() -> Vec<String> {
+    vec!["getSignaturesForAddress".to_string()]
+}
+
 // ── Providers ───────────────────────────────────────────────────────────────
+
+/// How far back a provider's ledger history goes.
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryDepth {
+    /// Serves the whole ledger (archive or long-term storage). Its `null` is
+    /// authoritative.
+    #[default]
+    Full,
+    /// Keeps only recent history — free tiers and public endpoints that answer
+    /// an older lookup with `null` or a provider-specific error.
+    Recent,
+}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ProviderConfig {
@@ -397,6 +455,13 @@ pub struct ProviderConfig {
     /// default) means unlimited, with zero per-request overhead.
     #[serde(default)]
     pub max_rps: Option<u32>,
+    /// How far back this provider's history goes: `full` (the default) or
+    /// `recent`. A `recent` provider never receives
+    /// `routing.full_history_methods`, and its `null` or error answer to a
+    /// `routing.history_methods` call fails over to a `full` provider, so mixing
+    /// free tiers with an archive provider can't turn into false "not found"s.
+    #[serde(default)]
+    pub history: HistoryDepth,
 }
 
 impl ProviderConfig {
@@ -675,6 +740,81 @@ methods = []
         );
         let err = Config::load(f.path()).unwrap_err().to_string();
         assert!(err.contains("empty methods list"), "got: {err}");
+    }
+
+    #[test]
+    fn parses_provider_history_with_full_default() {
+        let f = write_config(
+            r#"
+[[providers]]
+name = "archive"
+url = "http://localhost:8899"
+
+[[providers]]
+name = "public"
+url = "http://localhost:9000"
+history = "recent"
+"#,
+        );
+        let cfg = Config::load(f.path()).unwrap();
+        assert_eq!(cfg.providers[0].history, HistoryDepth::Full);
+        assert_eq!(cfg.providers[1].history, HistoryDepth::Recent);
+        assert_eq!(
+            cfg.routing.history_methods,
+            vec!["getTransaction".to_string(), "getBlock".to_string()]
+        );
+        assert_eq!(
+            cfg.routing.full_history_methods,
+            vec!["getSignaturesForAddress".to_string()]
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_history_value() {
+        let f = write_config(
+            r#"
+[[providers]]
+name = "p"
+url = "http://localhost:8899"
+history = "archive"
+"#,
+        );
+        assert!(Config::load(f.path()).is_err());
+    }
+
+    #[test]
+    fn rejects_all_recent_providers_with_full_history_methods() {
+        let f = write_config(
+            r#"
+[[providers]]
+name = "a"
+url = "http://localhost:8899"
+history = "recent"
+
+[[providers]]
+name = "b"
+url = "http://localhost:9000"
+history = "recent"
+"#,
+        );
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(err.contains("getSignaturesForAddress"), "got: {err}");
+    }
+
+    #[test]
+    fn accepts_all_recent_providers_without_full_history_methods() {
+        let f = write_config(
+            r#"
+[routing]
+full_history_methods = []
+
+[[providers]]
+name = "a"
+url = "http://localhost:8899"
+history = "recent"
+"#,
+        );
+        assert!(Config::load(f.path()).is_ok());
     }
 
     #[test]

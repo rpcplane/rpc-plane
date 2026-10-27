@@ -33,6 +33,7 @@ Your app replaces its provider URL with `http://localhost:9400`. No other change
 - **Circuit breaker** per provider: opens on failure, probes for recovery, resumes traffic automatically
 - **Slot tracker**: tracks slot height across providers, deprioritizes drifting nodes
 - **Auto-retry** on transient errors (429, 503, timeout) — tries the next-best provider
+- **History-aware routing**: mark free-tier and public providers `history = "recent"` and their `null` for an old transaction fails over to a full-history provider instead of reaching your app as "not found"
 - **Hot reload**: edit the config file, changes apply without restart
 - **Prometheus metrics** on `:9401/metrics`
 - **Zero infrastructure**: single binary, single config file, no databases, no Redis
