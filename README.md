@@ -150,7 +150,7 @@ rpc-plane -c /path/to/config.toml run
 | `failover_ordered` | Try providers in config order, skip open circuits |
 | `parallel_race` | Send to all healthy providers, return fastest success |
 
-Writes (`sendTransaction`, `simulateTransaction`) always broadcast to all healthy providers regardless of strategy.
+Writes (`routing.write_methods`, `sendTransaction` by default) don't use the read strategy: they go through the failover list one provider at a time, or to every healthy provider at once with `routing.broadcast_writes = true`. `simulateTransaction` is routed as a read unless you add it to `write_methods`.
 
 ## Observability
 
