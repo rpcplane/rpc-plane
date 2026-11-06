@@ -29,9 +29,12 @@ pub fn classify(method: &str, write_methods: &[String]) -> MethodClass {
 
 // ── Retryability ──────────────────────────────────────────────────────────────
 
-/// HTTP-level errors worth retrying on the next provider.
+/// HTTP-level errors worth retrying on the next provider. `501` is what a node
+/// sends for a method it doesn't implement — Firedancer's RPC serves only a subset
+/// (no `getBlock`, `getTransaction`, `sendTransaction`, …) — so another provider
+/// can still answer.
 pub fn is_retryable_http(status: u16) -> bool {
-    matches!(status, 429 | 500 | 502 | 503 | 504)
+    matches!(status, 429 | 500 | 501 | 502 | 503 | 504)
 }
 
 /// Non-retryable 4xx statuses attributable to the *client's* request rather than
@@ -54,22 +57,56 @@ pub fn is_client_error(status: u16) -> bool {
 
 /// JSON-RPC error codes that may succeed on a different provider.
 pub fn is_retryable_rpc_code(code: i64) -> bool {
-    // -32003 = transaction simulation failed / node not ready
-    // -32005 = node is behind
+    // -32005 = node unhealthy (behind its cluster)
     // -32603 = internal error (transient)
-    matches!(code, -32003 | -32005 | -32603)
+    matches!(code, -32005 | -32603) || is_behind_rpc_code(code)
+}
+
+/// The node hasn't caught up to the slot the request needs. A fresher provider
+/// can answer, so these fail over — but they are **health-neutral**: the probe
+/// loop already scores drift, and at ~200 ms slots a provider a slot or two behind
+/// a caller's `minContextSlot` is normal, not a fault worth opening a circuit for.
+pub fn is_behind_rpc_code(code: i64) -> bool {
+    // -32014 = block status not available yet (getBlock past the last written slot)
+    // -32016 = minimum context slot not reached (`minContextSlot` is accepted by
+    //          most reads, `sendTransaction`, and since Agave 4.4 `getTransaction`
+    //          and `getSignatureStatuses`)
+    matches!(code, -32014 | -32016)
+}
+
+/// JSON-RPC errors the request itself caused. Every provider gives the same
+/// answer, so they are passed straight back, never retried, and kept out of
+/// provider health — otherwise one client stuck on, say,
+/// `maxSupportedTransactionVersion: 0` (every `getBlock` now carries v1
+/// transactions) would open every circuit in turn. Mirrors [`is_client_error`]
+/// for errors that ride on HTTP 200.
+pub fn is_client_rpc_code(code: i64) -> bool {
+    // -32700 / -32600 / -32601 / -32602 = parse error / invalid request /
+    //          method not found / invalid params (JSON-RPC 2.0)
+    // -32002 = transaction preflight (simulation) failed
+    // -32003 = signature verification failed (Agave < 3.1; `requestAirdrop` today)
+    // -32006 = precompile verification failed
+    // -32013 = signature length mismatch
+    // -32015 = transaction version above the request's `maxSupportedTransactionVersion`
+    matches!(
+        code,
+        -32700 | -32600 | -32601 | -32602 | -32002 | -32003 | -32006 | -32013 | -32015
+    )
 }
 
 /// Standard Solana JSON-RPC codes meaning "this node doesn't have that part of
-/// the ledger", which another provider may well have. Only consulted for
-/// `routing.history_methods`: the codes are block/history specific, and
-/// providers reuse the neighbouring numbers for unrelated errors.
+/// the ledger", which another provider may well have. Fail-over on them is
+/// limited to `routing.history_methods`: the codes are block/history specific,
+/// and providers reuse the neighbouring numbers for unrelated errors. Elsewhere
+/// they pass through but stay health-neutral — a shallow ledger isn't a fault.
 pub fn is_history_gap_code(code: i64) -> bool {
     // -32001 = block cleaned up (pruned from this node's ledger)
     // -32004 = block not available for slot
     // -32011 = transaction history not available on this node
     // -32019 = long-term storage unreachable
-    matches!(code, -32001 | -32004 | -32011 | -32019)
+    // -32020 = getSignaturesForAddress `before`/`until` signature not found
+    //          (Agave 4.0+; previously an empty list)
+    matches!(code, -32001 | -32004 | -32011 | -32019 | -32020)
 }
 
 pub fn extract_rpc_error_code(body: &[u8]) -> Option<i64> {
@@ -520,7 +557,7 @@ mod tests {
 
     #[test]
     fn retryable_http_status_codes() {
-        for code in [429u16, 500, 502, 503, 504] {
+        for code in [429u16, 500, 501, 502, 503, 504] {
             assert!(is_retryable_http(code), "expected {code} to be retryable");
         }
     }
@@ -548,7 +585,7 @@ mod tests {
     #[test]
     fn provider_and_auth_statuses_are_not_client_errors() {
         // Auth (401/403) → provider unusable; 429/5xx → retryable; 2xx → success.
-        for code in [200u16, 401, 403, 429, 500, 502, 503, 504] {
+        for code in [200u16, 401, 403, 429, 500, 501, 502, 503, 504] {
             assert!(
                 !is_client_error(code),
                 "expected {code} to NOT be client-attributable"
@@ -558,7 +595,7 @@ mod tests {
 
     #[test]
     fn retryable_rpc_error_codes() {
-        for code in [-32003i64, -32005, -32603] {
+        for code in [-32005i64, -32603, -32014, -32016] {
             assert!(
                 is_retryable_rpc_code(code),
                 "expected {code} to be retryable"
@@ -568,12 +605,47 @@ mod tests {
 
     #[test]
     fn non_retryable_rpc_error_codes() {
-        for code in [-32700i64, -32600, -32601, -32602, 0, 1] {
+        // -32003 (signature verification) fails identically everywhere.
+        for code in [
+            -32700i64, -32600, -32601, -32602, -32002, -32003, -32015, 0, 1,
+        ] {
             assert!(
                 !is_retryable_rpc_code(code),
                 "expected {code} to be non-retryable"
             );
         }
+    }
+
+    #[test]
+    fn behind_codes_are_retryable_and_disjoint_from_client_codes() {
+        for code in [-32014i64, -32016] {
+            assert!(is_behind_rpc_code(code));
+            assert!(is_retryable_rpc_code(code));
+            assert!(!is_client_rpc_code(code));
+        }
+        assert!(!is_behind_rpc_code(-32005), "node-unhealthy still counts");
+    }
+
+    #[test]
+    fn client_rpc_codes_are_never_retried_or_gaps() {
+        for code in [
+            -32700i64, -32600, -32601, -32602, -32002, -32003, -32006, -32013, -32015,
+        ] {
+            assert!(is_client_rpc_code(code), "expected {code} to be client");
+            assert!(!is_retryable_rpc_code(code));
+            assert!(!is_history_gap_code(code));
+        }
+        for code in [-32005i64, -32603, -32016, -32001, -32020, 0] {
+            assert!(!is_client_rpc_code(code), "expected {code} not client");
+        }
+    }
+
+    #[test]
+    fn history_gap_codes_include_signature_filter_miss() {
+        for code in [-32001i64, -32004, -32011, -32019, -32020] {
+            assert!(is_history_gap_code(code), "expected {code} to be a gap");
+        }
+        assert!(!is_history_gap_code(-32016));
     }
 
     #[test]

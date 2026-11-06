@@ -1699,3 +1699,189 @@ async fn parallel_race_returns_miss_when_archive_fails() {
     assert_eq!(status, StatusCode::OK);
     assert!(body["result"].is_null());
 }
+
+// ── JSON-RPC error attribution ────────────────────────────────────────────────
+
+const GET_BLOCK_V0: &str = r#"{"jsonrpc":"2.0","id":1,"method":"getBlock","params":[1,{"maxSupportedTransactionVersion":0}]}"#;
+
+/// A mock that answers POSTs containing `needle` with JSON-RPC error `code`
+/// (counting them) and everything else — the background `getSlot` probes — with
+/// a slot, so probe outcomes don't muddy the health assertions.
+async fn start_error_on(
+    code: i64,
+    needle: &'static str,
+) -> (String, Arc<AtomicUsize>, tokio::task::AbortHandle) {
+    let count = Arc::new(AtomicUsize::new(0));
+    let c = count.clone();
+    let router = Router::new().route(
+        "/",
+        post(move |body: axum::body::Bytes| {
+            let c = c.clone();
+            async move {
+                if std::str::from_utf8(&body).is_ok_and(|s| s.contains(needle)) {
+                    c.fetch_add(1, Ordering::Relaxed);
+                    axum::Json(rpc_error(code))
+                } else {
+                    slot_response(1)
+                }
+            }
+        }),
+    );
+    let (url, abort) = start_mock(router).await;
+    (url, count, abort)
+}
+
+/// CONTRACT: a JSON-RPC error the request itself caused rides on HTTP 200 but is
+/// the caller's fault. A client still sending `maxSupportedTransactionVersion: 0`
+/// gets -32015 on nearly every block since v1 transactions went live; it must go
+/// back unchanged, not be retried, and never open a circuit — before this, five
+/// such calls opened the first provider, then the next.
+#[tokio::test]
+async fn client_rpc_error_passed_through_without_touching_health() {
+    let (url_a, calls_a, _a) = start_error_on(-32015, "getBlock").await;
+    let (url_b, calls_b, _b) = start_error_on(-32015, "getBlock").await;
+    // circuit_open_failures = 2: two counted failures would open a circuit.
+    let cfg = test_config(
+        &[("a", &url_a), ("b", &url_b)],
+        RoutingStrategy::FailoverOrdered,
+        2,
+        2,
+    );
+    let state = ProxyState::new(cfg);
+    let router = build_router(state.clone());
+
+    for _ in 0..6 {
+        let (status, body) = proxy_request(router.clone(), GET_BLOCK_V0).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["error"]["code"], -32015);
+    }
+
+    assert_eq!(calls_a.load(Ordering::Relaxed), 6, "A answers every call");
+    assert_eq!(
+        calls_b.load(Ordering::Relaxed),
+        0,
+        "a client error is not retried"
+    );
+    for snap in state.monitor.snapshots() {
+        assert_eq!(
+            snap.circuit,
+            crate::health::CircuitState::Closed,
+            "{} must stay closed",
+            snap.name
+        );
+        assert_eq!(snap.error_rate, 0.0, "{} error rate", snap.name);
+    }
+    assert!(state.metrics.render().contains(
+        "rpc_plane_requests_total{method=\"getBlock\",provider=\"a\",status=\"client_error\"} 6"
+    ));
+}
+
+/// CONTRACT: -32016 (min context slot not reached) means this node is behind
+/// the slot the caller already saw elsewhere. A fresher provider can answer, so
+/// it fails over — but it is health-neutral: drift is the probes' job, and at
+/// ~200 ms slots a node one slot behind is normal, not a fault.
+#[tokio::test]
+async fn behind_rpc_error_fails_over_without_touching_health() {
+    let (url_a, calls_a, _a) = start_error_on(-32016, "getBalance").await;
+    let mock_b = Router::new().route("/", post(|| async { slot_response(7) }));
+    let (url_b, _b) = start_mock(mock_b).await;
+    let cfg = test_config(
+        &[("a", &url_a), ("b", &url_b)],
+        RoutingStrategy::FailoverOrdered,
+        1,
+        2,
+    );
+    let state = ProxyState::new(cfg);
+    let router = build_router(state.clone());
+
+    for _ in 0..4 {
+        let (status, body) = proxy_request(router.clone(), GET_BALANCE).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"], 7, "B answers after A is behind");
+    }
+
+    assert_eq!(calls_a.load(Ordering::Relaxed), 4, "A stays first in line");
+    let a = state
+        .monitor
+        .snapshots()
+        .into_iter()
+        .find(|s| s.name.as_ref() == "a")
+        .unwrap();
+    assert_eq!(a.circuit, crate::health::CircuitState::Closed);
+    assert_eq!(a.error_rate, 0.0);
+    assert!(state.metrics.render().contains(
+        "rpc_plane_requests_total{method=\"getBalance\",provider=\"a\",status=\"behind\"} 4"
+    ));
+}
+
+/// When every provider is behind, the caller gets the real -32016 (with the
+/// node's `contextSlot`), not a synthetic "all providers failed".
+#[tokio::test]
+async fn exhausted_retryable_rpc_error_returns_upstream_body() {
+    let (url_a, _, _a) = start_error_on(-32016, "getBalance").await;
+    let (url_b, _, _b) = start_error_on(-32016, "getBalance").await;
+    let cfg = test_config(
+        &[("a", &url_a), ("b", &url_b)],
+        RoutingStrategy::FailoverOrdered,
+        5,
+        5,
+    );
+    let (status, body) = proxy_request(build_router(ProxyState::new(cfg)), GET_BALANCE).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["error"]["code"], -32016);
+}
+
+/// A client error from a `history = "recent"` provider is not a history miss:
+/// the archive would say the same, so asking it only costs a call (and, before,
+/// a hit on the archive's health).
+#[tokio::test]
+async fn recent_provider_client_error_is_not_a_history_miss() {
+    let (shallow, shallow_n, _a) = start_error_on(-32015, "getTransaction").await;
+    let (archive, archive_n, _b) =
+        start_json_mock(tx_found(), "getTransaction", Duration::ZERO).await;
+    let cfg = history_config(
+        &[("shallow", &shallow, true), ("archive", &archive, false)],
+        RoutingStrategy::FailoverOrdered,
+        2,
+    );
+
+    let (status, body) = proxy_request(build_router(ProxyState::new(cfg)), GET_TX).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["error"]["code"], -32015);
+    assert_eq!(shallow_n.load(Ordering::Relaxed), 1);
+    assert_eq!(archive_n.load(Ordering::Relaxed), 0);
+}
+
+/// HTTP 501 is a node that doesn't implement the method (Firedancer's RPC serves
+/// a subset). It fails over, and stays health-neutral since the node is up.
+#[tokio::test]
+async fn not_implemented_fails_over_without_touching_health() {
+    let (url_a, _a) = start_status_on_get_balance(StatusCode::NOT_IMPLEMENTED).await;
+    let mock_b = Router::new().route("/", post(|| async { slot_response(9) }));
+    let (url_b, _b) = start_mock(mock_b).await;
+    let cfg = test_config(
+        &[("a", &url_a), ("b", &url_b)],
+        RoutingStrategy::FailoverOrdered,
+        1,
+        2,
+    );
+    let state = ProxyState::new(cfg);
+    let router = build_router(state.clone());
+
+    for _ in 0..3 {
+        let (status, body) = proxy_request(router.clone(), GET_BALANCE).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"], 9);
+    }
+
+    let a = state
+        .monitor
+        .snapshots()
+        .into_iter()
+        .find(|s| s.name.as_ref() == "a")
+        .unwrap();
+    assert_eq!(a.circuit, crate::health::CircuitState::Closed);
+    assert_eq!(a.error_rate, 0.0);
+}
