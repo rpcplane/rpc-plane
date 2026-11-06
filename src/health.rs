@@ -236,9 +236,9 @@ impl SlotTips {
 ///
 /// Independent loops that slept `interval_ms` after each probe drifted out of
 /// phase by their latency difference every cycle, until samples taken up to a
-/// whole interval apart were compared. At ~200 ms slots that read as up to
-/// `interval_ms / 200` slots of drift that wasn't there — ~5 at the 1 s default,
-/// ~140 at a 30 s interval.
+/// whole interval apart were compared. At 200 ms slots that read as up to
+/// `interval_ms / 200` slots of drift that wasn't there — 5 at the 1 s default,
+/// 150 at a 30 s interval.
 #[derive(Debug, Clone, Copy)]
 struct ProbeClock {
     start: tokio::time::Instant,
