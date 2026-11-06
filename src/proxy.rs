@@ -3,8 +3,8 @@ use crate::health::{CircuitState, CommitmentHealth, HealthMonitor};
 use crate::historical::{HistoricalAnalytics, HistoricalRequestClass};
 use crate::metrics::Metrics;
 use crate::router::{
-    extract_rpc_error_code, is_client_error, is_history_gap_code, is_retryable_http,
-    is_retryable_rpc_code, route,
+    extract_rpc_error_code, is_behind_rpc_code, is_client_error, is_client_rpc_code,
+    is_history_gap_code, is_retryable_http, is_retryable_rpc_code, route,
 };
 #[cfg(test)]
 use crate::telemetry::NoopReporter;
@@ -262,19 +262,30 @@ enum Outcome {
     /// success and is the only outcome that ends a broadcast race.
     Ok,
     /// Provider-attributable failure — a 5xx, an auth 4xx, a 2xx carrying an
-    /// error body, an upstream `Err`, or a retryable JSON-RPC error. Feeds health
-    /// as a hard failure.
+    /// error body not classified below, an upstream `Err`, or a retryable
+    /// JSON-RPC error such as -32005/-32603. Feeds health as a hard failure.
     ProviderError,
     /// HTTP 429 — a load signal, not a fault. Fails over like a 5xx, but demotes
     /// the provider's score without opening its circuit (see [`HealthMonitor`]).
     RateLimited,
-    /// Client-attributable 4xx — recorded for visibility, never fed to health.
+    /// Client-attributable — a 4xx ([`is_client_error`]) or a JSON-RPC error the
+    /// request itself caused ([`is_client_rpc_code`]: bad params, failed
+    /// preflight, unsupported transaction version …). Recorded for visibility,
+    /// never fed to health.
     ClientError,
     /// A history lookup the provider couldn't answer from its own ledger (see
-    /// [`is_history_miss`]). Health-neutral: the provider works, it just doesn't
-    /// keep that far back. Counted apart from `ok` so a shallow provider's
-    /// `null`s don't make it look like the healthiest in the pool.
+    /// [`is_history_miss`]), or a history-gap code on any other call.
+    /// Health-neutral: the provider works, it just doesn't keep that far back.
+    /// Counted apart from `ok` so a shallow provider's `null`s don't make it look
+    /// like the healthiest in the pool.
     Miss,
+    /// The node hasn't reached the slot the request needs yet
+    /// ([`is_behind_rpc_code`]: -32016 / -32014). Fails over; health-neutral,
+    /// because drift is already scored by the probes.
+    Behind,
+    /// HTTP 501 — the node doesn't implement this method (Firedancer's RPC serves
+    /// a subset). Fails over; health-neutral, since the provider is up.
+    Unsupported,
 }
 
 impl Outcome {
@@ -285,6 +296,8 @@ impl Outcome {
             Outcome::Ok
         } else if status == 429 {
             Outcome::RateLimited
+        } else if status == 501 {
+            Outcome::Unsupported
         } else if is_client_error(status) {
             Outcome::ClientError
         } else {
@@ -292,29 +305,36 @@ impl Outcome {
         }
     }
 
+    /// Classify a JSON-RPC error carried in a 2xx body by its code.
+    fn from_rpc_error(code: Option<i64>) -> Self {
+        match code {
+            Some(c) if is_client_rpc_code(c) => Outcome::ClientError,
+            Some(c) if is_behind_rpc_code(c) => Outcome::Behind,
+            Some(c) if is_history_gap_code(c) => Outcome::Miss,
+            _ => Outcome::ProviderError,
+        }
+    }
+
     /// Classify a broadcast leg, which is a success only on a 2xx with no
-    /// JSON-RPC error body ([`leg_succeeded`]); a 2xx carrying an error body is a
-    /// provider failure (a preflight -32002), not a success. For a history
-    /// lookup, a miss is not a success either, so it can't win a race.
+    /// JSON-RPC error body; a 2xx carrying an error body (a preflight -32002) is
+    /// never a success, whoever it is attributed to. For a history lookup, a
+    /// miss is not a success either, so it can't win a race.
     fn from_leg(
         status: u16,
         bytes: &Bytes,
         history_lookup: bool,
         provider: &ProviderConfig,
     ) -> Self {
-        if history_lookup
-            && (200..300).contains(&status)
-            && is_history_miss(provider, extract_rpc_error_code(bytes), bytes)
-        {
+        if !(200..300).contains(&status) {
+            return Self::from_status(status);
+        }
+        let code = extract_rpc_error_code(bytes);
+        if history_lookup && is_history_miss(provider, code, bytes) {
             Outcome::Miss
-        } else if leg_succeeded(status, bytes) {
-            Outcome::Ok
-        } else if status == 429 {
-            Outcome::RateLimited
-        } else if is_client_error(status) {
-            Outcome::ClientError
+        } else if has_rpc_error(bytes) {
+            Self::from_rpc_error(code)
         } else {
-            Outcome::ProviderError
+            Outcome::Ok
         }
     }
 
@@ -326,6 +346,8 @@ impl Outcome {
             Outcome::RateLimited => "rate_limited",
             Outcome::ClientError => "client_error",
             Outcome::Miss => "miss",
+            Outcome::Behind => "behind",
+            Outcome::Unsupported => "unsupported",
         }
     }
 }
@@ -342,8 +364,8 @@ struct OutcomeRecorder {
 impl OutcomeRecorder {
     /// Record one forwarded leg across metrics, telemetry, and provider health.
     /// The health effect is per-outcome: success/failure feed the circuit, a 429
-    /// demotes the score only, and a client-attributable 4xx or a history miss is
-    /// health-neutral.
+    /// demotes the score only, and a client error, a history miss, a node that is
+    /// merely behind, or an unimplemented method is health-neutral.
     fn record(&self, method: &str, name: &str, outcome: Outcome, latency_ms: f64, count: u64) {
         let label = outcome.label();
         self.metrics
@@ -357,7 +379,7 @@ impl OutcomeRecorder {
             Outcome::Ok => self.monitor.record(name, true, latency_ms, false),
             Outcome::ProviderError => self.monitor.record(name, false, latency_ms, false),
             Outcome::RateLimited => self.monitor.record_throttled(name, latency_ms),
-            Outcome::ClientError | Outcome::Miss => {}
+            Outcome::ClientError | Outcome::Miss | Outcome::Behind | Outcome::Unsupported => {}
         }
     }
 }
@@ -591,6 +613,10 @@ async fn sequential(
     // a shallow one won't hold what another provider lacked — and it's returned
     // if none of them answers, so a full-history outage serves what it does today.
     let mut miss: Option<Bytes> = None;
+    // The last retryable JSON-RPC error body (e.g. a -32016 carrying the node's
+    // `contextSlot`). Returned if the providers after it run out without an
+    // answer, so the client sees a real upstream error rather than a synthetic one.
+    let mut retried: Option<Bytes> = None;
     let full_history_provider = |name: &Arc<str>| {
         config
             .providers
@@ -749,21 +775,33 @@ async fn sequential(
                 }
                 if let Some(code) = rpc_code {
                     if is_retryable_rpc_code(code) && attempt < max_attempts {
+                        let outcome = Outcome::from_rpc_error(rpc_code);
                         warn!(
                             request_id = %request_id,
                             provider = %name,
                             method,
                             code,
                             attempt = idx,
+                            outcome = outcome.label(),
                             "retryable RPC error, trying next provider"
                         );
-                        recorder.record(method, name, Outcome::ProviderError, latency_ms, count);
-                        prev_failed = Some((name.clone(), "retryable_rpc_error"));
+                        recorder.record(method, name, outcome, latency_ms, count);
+                        let reason = if matches!(outcome, Outcome::Behind) {
+                            "behind"
+                        } else {
+                            "retryable_rpc_error"
+                        };
+                        prev_failed = Some((name.clone(), reason));
+                        retried = Some(bytes);
                         continue;
                     }
                 }
                 if has_rpc_error(&bytes) {
-                    recorder.record(method, name, Outcome::ProviderError, latency_ms, count);
+                    // Attributed by code: a client mistake, a lagging node or a
+                    // shallow ledger is passed through without counting against
+                    // the provider; anything else is the provider's failure.
+                    let outcome = Outcome::from_rpc_error(rpc_code);
+                    recorder.record(method, name, outcome, latency_ms, count);
                     finish_analytics(
                         state,
                         transaction_request,
@@ -826,6 +864,21 @@ async fn sequential(
 
     if let Some(bytes) = miss {
         warn!(%request_id, method, "no full-history provider answered; returning the history miss");
+        finish_analytics(
+            state,
+            transaction_request,
+            historical_request,
+            body,
+            &bytes,
+            StatusCode::OK.as_u16(),
+            observed_tips,
+            None,
+        );
+        return json_response(StatusCode::OK, bytes);
+    }
+
+    if let Some(bytes) = retried {
+        warn!(%request_id, method, "providers exhausted after a retryable RPC error; returning it");
         finish_analytics(
             state,
             transaction_request,
@@ -1044,13 +1097,6 @@ async fn broadcast(
     json_response(StatusCode::BAD_GATEWAY, response_body)
 }
 
-/// A broadcast leg counts as a success only on HTTP 2xx *and* a body with no
-/// JSON-RPC `error` member. A 2xx carrying an error body — e.g. a `sendTransaction`
-/// preflight failure (-32002) — is a failed leg, not a success; see `broadcast()`.
-fn leg_succeeded(status: u16, bytes: &Bytes) -> bool {
-    (200..300).contains(&status) && !has_rpc_error(bytes)
-}
-
 fn has_rpc_error(bytes: &[u8]) -> bool {
     #[derive(serde::Deserialize)]
     struct ErrorField {
@@ -1063,12 +1109,18 @@ fn has_rpc_error(bytes: &[u8]) -> bool {
 /// only says this provider lacks the data, so a `full` provider should be asked.
 /// From a `recent` provider any `null` result or JSON-RPC error is a miss — its
 /// retention window, not the ledger, is what ran out, and the error codes for
-/// that vary by provider. A `full` provider's `null` is the real answer; only a
-/// standard history-gap code ([`is_history_gap_code`]) from it is a miss.
+/// that vary by provider — except a client error ([`is_client_rpc_code`], which
+/// every provider would repeat: asking an archive again only costs a call) and a
+/// node that is merely behind ([`is_behind_rpc_code`], which any fresher provider
+/// can answer). A `full` provider's `null` is the real answer; only a standard
+/// history-gap code ([`is_history_gap_code`]) from it is a miss.
 fn is_history_miss(provider: &ProviderConfig, rpc_code: Option<i64>, bytes: &[u8]) -> bool {
     match provider.history {
         HistoryDepth::Full => rpc_code.is_some_and(is_history_gap_code),
-        HistoryDepth::Recent => rpc_code.is_some() || !has_result(bytes),
+        HistoryDepth::Recent => match rpc_code {
+            Some(code) => !is_client_rpc_code(code) && !is_behind_rpc_code(code),
+            None => !has_result(bytes),
+        },
     }
 }
 
