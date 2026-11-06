@@ -1,12 +1,58 @@
 use base64::Engine;
 
-const MAX_ENCODED_LEN: usize = 1700;
-const MAX_PACKET_LEN: usize = 1232;
+/// Largest legacy/v0 transaction (`PACKET_DATA_SIZE`).
+const MAX_LEGACY_LEN: usize = 1232;
+/// Largest v1 transaction (SIMD-0385).
+const MAX_V1_LEN: usize = 4096;
+/// Agave's caps on the encoded string (`rpc.rs`, v4.4). base58 only ever
+/// carries up to 1232 bytes; base64 of a v1 transaction runs to 4096.
+const MAX_BASE58_LEN: usize = 1683;
+const MAX_BASE64_LEN: usize = 5464;
+/// First byte of a v1 transaction. v1 puts the message first and the
+/// signatures last; legacy/v0 open with the signature count, which can't have
+/// the high bit set within 1232 bytes.
+const V1_PREFIX: u8 = 0x81;
+
 const MAX_COMPUTE_UNITS: u64 = 1_400_000;
+/// Default allotment for an instruction when no SetComputeUnitLimit is given:
+/// builtins get 3,000 CU, everything else 200,000 (SIMD-0170, live on mainnet
+/// since 2025-03-17).
 const DEFAULT_INSTRUCTION_COMPUTE_UNITS: u64 = 200_000;
+const DEFAULT_BUILTIN_COMPUTE_UNITS: u64 = 3_000;
 const COMPUTE_BUDGET_ID: [u8; 32] = [
     3, 6, 70, 111, 229, 33, 23, 50, 255, 236, 173, 186, 114, 195, 155, 231, 188, 140, 229, 187,
     197, 247, 18, 107, 44, 67, 155, 58, 64, 0, 0, 0,
+];
+/// Programs that count as builtins for the default limit — Agave v4.4
+/// `builtins-default-costs` minus the Vote program, which SIMD-0387 moved out.
+/// Stake, Config and ALT are on-chain BPF programs now and take the full 200k.
+const BUILTIN_PROGRAM_IDS: [[u8; 32]; 8] = [
+    [0; 32], // System
+    COMPUTE_BUDGET_ID,
+    [
+        2, 168, 246, 145, 78, 136, 161, 176, 226, 16, 21, 62, 247, 99, 174, 43, 0, 194, 185, 61,
+        22, 193, 36, 210, 192, 83, 122, 16, 4, 128, 0, 0,
+    ], // BPFLoaderUpgradeab1e
+    [
+        2, 168, 246, 145, 78, 136, 161, 107, 189, 35, 149, 133, 95, 100, 4, 217, 180, 244, 86, 183,
+        130, 27, 176, 20, 87, 73, 66, 140, 0, 0, 0, 0,
+    ], // BPFLoader1 (deprecated)
+    [
+        2, 168, 246, 145, 78, 136, 161, 110, 57, 90, 225, 40, 148, 143, 250, 105, 86, 147, 55, 104,
+        24, 221, 71, 67, 82, 33, 243, 198, 0, 0, 0, 0,
+    ], // BPFLoader2
+    [
+        5, 18, 180, 17, 81, 81, 227, 122, 173, 10, 139, 197, 211, 136, 46, 123, 127, 218, 76, 243,
+        210, 192, 40, 200, 207, 131, 54, 24, 0, 0, 0, 0,
+    ], // LoaderV4
+    [
+        4, 198, 252, 32, 240, 80, 204, 240, 85, 132, 215, 33, 28, 159, 140, 245, 158, 193, 71, 133,
+        187, 22, 106, 30, 40, 48, 232, 18, 32, 0, 0, 0,
+    ], // KeccakSecp256k1
+    [
+        3, 125, 70, 214, 124, 147, 251, 190, 18, 249, 66, 143, 131, 141, 64, 255, 5, 112, 116, 73,
+        39, 244, 138, 100, 252, 202, 112, 68, 128, 0, 0, 0,
+    ], // Ed25519SigVerify
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,7 +86,7 @@ pub fn decode_request(body: &[u8]) -> Result<TransactionInfo, DecodeError> {
         .first()
         .and_then(serde_json::Value::as_str)
         .ok_or(DecodeError::Unparsed)?;
-    if encoded.len() > MAX_ENCODED_LEN {
+    if encoded.len() > MAX_BASE64_LEN {
         return Err(DecodeError::Unparsed);
     }
     let encoding = params
@@ -49,6 +95,7 @@ pub fn decode_request(body: &[u8]) -> Result<TransactionInfo, DecodeError> {
         .and_then(serde_json::Value::as_str)
         .unwrap_or("base58");
     let bytes = match encoding {
+        "base58" if encoded.len() > MAX_BASE58_LEN => return Err(DecodeError::Unparsed),
         "base58" => bs58::decode(encoded)
             .into_vec()
             .map_err(|_| DecodeError::Unparsed)?,
@@ -57,13 +104,24 @@ pub fn decode_request(body: &[u8]) -> Result<TransactionInfo, DecodeError> {
             .map_err(|_| DecodeError::Unparsed)?,
         _ => return Err(DecodeError::Unsupported),
     };
-    if bytes.len() > MAX_PACKET_LEN {
+    let max_len = if bytes.first() == Some(&V1_PREFIX) {
+        MAX_V1_LEN
+    } else {
+        MAX_LEGACY_LEN
+    };
+    if bytes.len() > max_len {
         return Err(DecodeError::Unparsed);
     }
     decode_transaction(&bytes)
 }
 
 pub fn decode_transaction(bytes: &[u8]) -> Result<TransactionInfo, DecodeError> {
+    match bytes.first() {
+        Some(&V1_PREFIX) => return decode_v1(bytes),
+        // A later message-first version.
+        Some(first) if *first > V1_PREFIX => return Err(DecodeError::Unsupported),
+        _ => {}
+    }
     let mut cursor = Cursor::new(bytes);
     let num_signatures = cursor.shortvec()?;
     cursor.skip(
@@ -92,7 +150,7 @@ pub fn decode_transaction(bytes: &[u8]) -> Result<TransactionInfo, DecodeError> 
     let instruction_count = cursor.shortvec()?;
     let mut explicit_limit = None;
     let mut price = None;
-    let mut non_budget_instructions = 0u64;
+    let mut default_limit = 0u64;
 
     for _ in 0..instruction_count {
         let program_index = cursor.byte()? as usize;
@@ -104,22 +162,31 @@ pub fn decode_transaction(bytes: &[u8]) -> Result<TransactionInfo, DecodeError> 
         let data_len = cursor.shortvec()?;
         let data = cursor.take(data_len)?;
         let program_key = &keys[program_index * 32..program_index * 32 + 32];
+        default_limit = default_limit.saturating_add(
+            if BUILTIN_PROGRAM_IDS.iter().any(|id| id == program_key) {
+                DEFAULT_BUILTIN_COMPUTE_UNITS
+            } else {
+                DEFAULT_INSTRUCTION_COMPUTE_UNITS
+            },
+        );
         if program_key != COMPUTE_BUDGET_ID {
-            non_budget_instructions = non_budget_instructions.saturating_add(1);
             continue;
         }
         let Some(tag) = data.first() else {
             return Err(DecodeError::InvalidBudget);
         };
+        // Agave reads these with borsh's `try_from_slice_unchecked`, so trailing
+        // bytes after the value are allowed (some clients write the limit as a
+        // u64); a short value or a duplicate fails the transaction.
         match *tag {
             2 => {
-                if data.len() != 5 || explicit_limit.is_some() {
+                if data.len() < 5 || explicit_limit.is_some() {
                     return Err(DecodeError::InvalidBudget);
                 }
                 explicit_limit = Some(u32::from_le_bytes(data[1..5].try_into().unwrap()) as u64);
             }
             3 => {
-                if data.len() != 9 || price.is_some() {
+                if data.len() < 9 || price.is_some() {
                     return Err(DecodeError::InvalidBudget);
                 }
                 price = Some(u64::from_le_bytes(data[1..9].try_into().unwrap()));
@@ -130,15 +197,10 @@ pub fn decode_transaction(bytes: &[u8]) -> Result<TransactionInfo, DecodeError> 
 
     let (cu_limit, effective_cu_limit, cu_limit_defaulted) = match explicit_limit {
         Some(limit) => (limit, limit.min(MAX_COMPUTE_UNITS), false),
-        None => (
-            non_budget_instructions
-                .saturating_mul(DEFAULT_INSTRUCTION_COMPUTE_UNITS)
-                .min(MAX_COMPUTE_UNITS),
-            non_budget_instructions
-                .saturating_mul(DEFAULT_INSTRUCTION_COMPUTE_UNITS)
-                .min(MAX_COMPUTE_UNITS),
-            true,
-        ),
+        None => {
+            let limit = default_limit.min(MAX_COMPUTE_UNITS);
+            (limit, limit, true)
+        }
     };
     let requested_priority_fee_lamports = price.map(|p| {
         let product = (effective_cu_limit as u128).saturating_mul(p as u128);
@@ -154,6 +216,80 @@ pub fn decode_transaction(bytes: &[u8]) -> Result<TransactionInfo, DecodeError> 
         num_instructions: instruction_count as u64,
         num_signatures: num_signatures as u64,
         is_versioned,
+    })
+}
+
+/// Decode a v1 transaction (SIMD-0385):
+///
+/// ```text
+/// 0x81 · header [u8; 3] · config mask u32 · lifetime [u8; 32]
+/// · num_instructions u8 · num_addresses u8 · addresses [[u8; 32]]
+/// · config values [u8; 4] per set mask bit
+/// · instruction headers (program u8, num_accounts u8, data_len u16)
+/// · instruction payloads (account indexes, data) · signatures [[u8; 64]]
+/// ```
+///
+/// The compute budget lives in the config values, not in instructions
+/// (ComputeBudget instructions in a v1 transaction are ignored): bits 0+1 are
+/// the priority fee as a u64 **total in lamports**, bit 2 the compute unit
+/// limit, bits 3 and 4 the loaded-accounts-data and heap limits. An unset limit
+/// or fee is 0, as in Agave's `transaction_meta.rs`.
+fn decode_v1(bytes: &[u8]) -> Result<TransactionInfo, DecodeError> {
+    let mut cursor = Cursor::new(bytes);
+    cursor.skip(1)?; // version
+    let num_signatures = cursor.byte()? as usize;
+    cursor.skip(2)?; // readonly signed / unsigned counts
+    let mask = u32::from_le_bytes(cursor.take(4)?.try_into().unwrap());
+    cursor.skip(32)?; // lifetime
+    let num_instructions = cursor.byte()? as usize;
+    let num_addresses = cursor.byte()? as usize;
+    cursor.skip(num_addresses * 32)?;
+
+    let (mut fee_low, mut fee_high, mut limit) = (None, None, None);
+    for bit in (0..32).filter(|bit| mask & (1 << bit) != 0) {
+        let value = u32::from_le_bytes(cursor.take(4)?.try_into().unwrap());
+        match bit {
+            0 => fee_low = Some(value),
+            1 => fee_high = Some(value),
+            2 => limit = Some(value),
+            _ => {}
+        }
+    }
+    let fee = match (fee_low, fee_high) {
+        (Some(low), Some(high)) => Some(u64::from(high) << 32 | u64::from(low)),
+        (None, None) => None,
+        _ => return Err(DecodeError::InvalidBudget), // half a u64
+    };
+
+    let mut payload_len = 0usize;
+    for _ in 0..num_instructions {
+        if cursor.byte()? as usize >= num_addresses {
+            return Err(DecodeError::Unparsed);
+        }
+        let accounts = cursor.byte()? as usize;
+        let data_len = u16::from_le_bytes(cursor.take(2)?.try_into().unwrap()) as usize;
+        payload_len += accounts + data_len;
+    }
+    cursor.skip(payload_len)?;
+    if cursor.remaining() != num_signatures * 64 {
+        return Err(DecodeError::Unparsed);
+    }
+
+    let cu_limit = u64::from(limit.unwrap_or(0));
+    let effective_cu_limit = cu_limit.min(MAX_COMPUTE_UNITS);
+    Ok(TransactionInfo {
+        cu_limit,
+        cu_limit_defaulted: limit.is_none(),
+        // What getRecentPrioritizationFees reports for v1: floor(fee × 1e6 / limit).
+        cu_price_micro_lamports: fee.map(|fee| {
+            (u128::from(fee) * 1_000_000)
+                .checked_div(u128::from(effective_cu_limit))
+                .map_or(0, |price| price.min(u64::MAX as u128) as u64)
+        }),
+        requested_priority_fee_lamports: fee,
+        num_instructions: num_instructions as u64,
+        num_signatures: num_signatures as u64,
+        is_versioned: true,
     })
 }
 
@@ -180,6 +316,10 @@ impl<'a> Cursor<'a> {
 
     fn skip(&mut self, len: usize) -> Result<(), DecodeError> {
         self.take(len).map(|_| ())
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len() - self.pos
     }
 
     fn shortvec(&mut self) -> Result<usize, DecodeError> {
@@ -296,8 +436,10 @@ mod tests {
             &[(&COMPUTE_BUDGET_ID, price(5)), (&OTHER, vec![1])],
         ))
         .unwrap();
-        assert_eq!(info.cu_limit, 200_000);
-        assert_eq!(info.requested_priority_fee_lamports, Some(1));
+        // SIMD-0170: the ComputeBudget instruction is a builtin (3,000 CU), the
+        // other instruction 200,000 — so ceil(203,000 × 5 / 1e6) = 2 lamports.
+        assert_eq!(info.cu_limit, 203_000);
+        assert_eq!(info.requested_priority_fee_lamports, Some(2));
 
         let info = decode_transaction(&transaction(
             false,
@@ -319,12 +461,81 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(info.cu_price_micro_lamports, None);
-        assert_eq!(info.cu_limit, 200_000);
+        assert_eq!(info.cu_limit, 203_000);
 
         let info =
             decode_transaction(&transaction(false, &[(&COMPUTE_BUDGET_ID, price(0))])).unwrap();
         assert_eq!(info.cu_price_micro_lamports, Some(0));
         assert_eq!(info.requested_priority_fee_lamports, Some(0));
+        assert_eq!(info.cu_limit, 3_000);
+    }
+
+    /// SIMD-0170 default limits: 3,000 CU per builtin instruction, 200,000 per
+    /// other one. Vote left the builtin list with SIMD-0387.
+    #[test]
+    fn default_limit_counts_builtins_at_3000() {
+        const SYSTEM: [u8; 32] = [0; 32];
+        let info = decode_transaction(&transaction(
+            false,
+            &[(&SYSTEM, vec![2]), (&SYSTEM, vec![2])],
+        ))
+        .unwrap();
+        assert_eq!(info.cu_limit, 6_000);
+        assert!(info.cu_limit_defaulted);
+
+        let vote = bs58::decode("Vote111111111111111111111111111111111111111")
+            .into_vec()
+            .unwrap();
+        let vote: [u8; 32] = vote.try_into().unwrap();
+        let info = decode_transaction(&transaction(true, &[(&vote, vec![1]), (&SYSTEM, vec![2])]))
+            .unwrap();
+        assert_eq!(info.cu_limit, 203_000);
+
+        let many: Vec<_> = (0..8).map(|_| (&OTHER, vec![1])).collect();
+        assert_eq!(
+            decode_transaction(&transaction(false, &many))
+                .unwrap()
+                .cu_limit,
+            1_400_000,
+            "capped"
+        );
+    }
+
+    #[test]
+    fn builtin_ids_match_program_addresses() {
+        let names = [
+            "11111111111111111111111111111111",
+            "ComputeBudget111111111111111111111111111111",
+            "BPFLoaderUpgradeab1e11111111111111111111111",
+            "BPFLoader1111111111111111111111111111111111",
+            "BPFLoader2111111111111111111111111111111111",
+            "LoaderV411111111111111111111111111111111111",
+            "KeccakSecp256k11111111111111111111111111111",
+            "Ed25519SigVerify111111111111111111111111111",
+        ];
+        for (id, name) in BUILTIN_PROGRAM_IDS.iter().zip(names) {
+            assert_eq!(bs58::encode(id).into_string(), name);
+        }
+    }
+
+    /// Seen on mainnet: SetComputeUnitLimit serialized with a u64, i.e. four
+    /// trailing zero bytes. The runtime accepts it, so the decoder must too.
+    #[test]
+    fn budget_values_with_trailing_bytes_decode() {
+        let mut limit_u64 = limit(100_001);
+        limit_u64.extend([0; 4]);
+        let mut price_long = price(7);
+        price_long.push(0);
+        let info = decode_transaction(&transaction(
+            false,
+            &[
+                (&COMPUTE_BUDGET_ID, limit_u64),
+                (&COMPUTE_BUDGET_ID, price_long),
+            ],
+        ))
+        .unwrap();
+        assert_eq!(info.cu_limit, 100_001);
+        assert_eq!(info.cu_price_micro_lamports, Some(7));
     }
 
     #[test]
@@ -363,10 +574,18 @@ mod tests {
         let body = br#"{"params":["abc",{"encoding":"base32"}]}"#;
         assert_eq!(decode_request(body), Err(DecodeError::Unsupported));
 
-        let oversized = "1".repeat(MAX_ENCODED_LEN + 1);
+        let oversized = "1".repeat(MAX_BASE58_LEN + 1);
         let body = serde_json::json!({"params": [oversized]}).to_string();
         assert_eq!(decode_request(body.as_bytes()), Err(DecodeError::Unparsed));
+        // 1233 bytes is too long for legacy/v0…
         let oversized = base64::engine::general_purpose::STANDARD.encode([0u8; 1233]);
+        let body = serde_json::json!({"params": [oversized, {"encoding":"base64"}]}).to_string();
+        assert_eq!(decode_request(body.as_bytes()), Err(DecodeError::Unparsed));
+        // …and 4097 too long for v1.
+        let mut v1 = vec![V1_PREFIX];
+        v1.resize(4097, 0);
+        let oversized = base64::engine::general_purpose::STANDARD.encode(v1);
+        assert!(oversized.len() <= MAX_BASE64_LEN + 4);
         let body = serde_json::json!({"params": [oversized, {"encoding":"base64"}]}).to_string();
         assert_eq!(decode_request(body.as_bytes()), Err(DecodeError::Unparsed));
     }
@@ -477,6 +696,152 @@ mod tests {
             165, 66, 156, 67, 58, 14, 75, 81, 197, 96, 95, 10, 40, 248, 178, 148, 124, 155, 162,
             75, 215, 16, 1, 0, 0,
         ];
+    }
+
+    // Real v1 transactions from mainnet slot 466,007,5xx (2026-11-06), taken
+    // from `getBlock` with `maxSupportedTransactionVersion: 1`. The expected fees
+    // are what the runtime charged: `meta.fee` minus 5,000 per signature.
+    mod v1_fixtures {
+        // len=257 mask=0xf sig=2TY5kD2wJQVHGPKaCqyU4wNXdb7pyDMivXGktgNhGuGeFv3GvMZ1v2MBdF7KmMNKoNfX6WNkn5y3jHzWtqFfFEwa
+        // fee paid 5324 = 5000 base + 324 priority; limit 24; 1 ix
+        pub const V1_FEE_AND_LIMIT: &str = concat!(
+            "gQEAAQ8AAADxpwvSwWwDZGKZjjmA+T7pc4FybFpHT6EFTBwyGAwOoAED1uHdYSOgHIfEFaT+/////1sWwSJ8TzNrw4",
+            "nWmDcSyYpnqSuGAaXe6clNBmTkI4f8kiOs3J//AwibHXJ374kCwgloGfZKAvdXJHoeJzNoY5iNbKgT2jEcJ/lZlSdr",
+            "kFHoRAEAAAAAAAAYAAAAcQMAAAICIQAAAdFYVgUAAAAAocVWBQAAAABjtsYbQEIPANiuiK+hAQAA/0jmiiXKXV5LEj",
+            "JLa8BvvFpvC5pdCReSlv7YTEEMUZdnD1ENbEShwFr5jlZ6yb8OMbTCa+KTBiP5uesj8xjz/wE=",
+        );
+        // len=587 mask=0x1f sig=5CXc9RrEwVsH9DnTAYJtetJ7ZUipBnkZKr3T6ZUJzBHLhPzwziRnRcyUj2W5mgxMgBnAAUeCeJ6jR3FxkMzjCGZy
+        // fee paid 5005 = 5000 base + 5 priority; limit 610; 1 ix
+        pub const V1_FEE_LIMIT_HEAP: &str = concat!(
+            "gQEAAR8AAABW4WP0pwilODFa0zv7813b4XLv2HlbAH8F2JIi1bWhcQEDaKLdQ+LwfDvX9PJ4Uj+1MDLhFU1YcLoOdl",
+            "BRwcItglvyyHeIvEHlnUg8fuAqXSjUT4UTmj04WFjKgCbdQYPkAgv4/JLU3rMUWgjuC2u6N5eRRt1SZoMgKa8hW58V",
+            "BcyaBQAAAAAAAABiAgAAQKgCAACAAAACAmcBAAE3AEz5Mdk4AAAAY7bGGwAAAAAiFgDD7ME7NndGvgQAw+wL3kF3Rr",
+            "4MAMPsQzjSKUy+DwDD7MmNS3dGvgoAw+wXYF93Rr4GAMPsh8Zfd0a+DQDD7C3YQnhGvgsAw+xFdV93Rr4QAMPs4y9Z",
+            "d0a+EwDD7FEYCHdGvh4Aw+zV2MR1Rr4OAMPsPYmyd0a+HADD7BdIHGNGvgAAw+yBJUF3Rr4iAMPsHcc5c0a+IADD7D",
+            "8T1n9GvicAw+yT0BB9Rr4hAMPsBWy8cka+EQDD7DVlTXhGvgEAw+zxLUF3Rr4IAMPssWQrdka+KQDD7K9SknNGviYA",
+            "w+zJgah2Rr4UAMPsWTWbd0a+HQDD7Ckljn9GvgMAw+ydvFN3Rr4bAMPsf/bVdka+KADD7M0N4H5GvhoAw+yNGkt3Rr",
+            "4SAMPsNWVNeEa+JQDD7HtjqnJGvh8Aw+y30EFzRr4HAMPsZwRcd0a+AgDD7G0JTnZGvtICUBtAARZKjIbYap9wg8/i",
+            "o1qFz+IGZ8aJn5tsdq8kuwyW/fCPVjhngJonPM+xxjqySYsoCHgQS9To24SjTQw=",
+        );
+        // len=322 mask=0xc sig=MczyW3Eymc7miNGxknDTZeWqt4ewUdeqFzjSBu5ihjufax46oPGJKmf7W6ryLFD5AcNkRh16VfghHy4pqVnHj98
+        // fee paid 5000 = 5000 base + 0 priority; limit 20000; 3 ix; ComputeBudget ix tags ['02', '03']
+        pub const V1_NO_FEE_WITH_IGNORED_BUDGET_IXS: &str = concat!(
+            "gQEAAwwAAAAYSjgeGymsjMOP8FEO4vi8Jqj9oNNNqdAlIKUoD+vzNwMECJ7rBJUAwhnucTD+W8jojhTzhhvYVpuR23",
+            "ruCEPIWGiW8PnGQjAugJaVd/Xf/2vr5Ksf1sQdWKtA4NThyr8qkAMGRm/lIRcy/+ytunLDm+e8jOW7xfcSayxDmzpA",
+            "AAAABUpTWpkpIQZNJOhxYNo4fHw1td28kruB5B+oQEEFRI0gTgAAAAAABAIABQACAAkAAwI0AAIgTgAAA5DQAwAAAA",
+            "AAAAFzd206T1JrSEZqVU5DQUVJRVFBTkQxY1NIUUZDV1Z4RVdSeEpFVUZYVXhkQlFsdEJYQT09EchRfKyhEwBA5Gx4",
+            "r+QJ+/4Nt0gac4dqlzv9Vw+uYJtD/z4d4H3Xb1jkx/cdHr+dzwNpKCq3y6Zn+2jjACxSDw==",
+        );
+        // len=1318 mask=0xf sig=41tscx8bAjCmyhLFCSZz2xKJLFvjhgqRyEtVtEqcqPFt7XHhQjC27A9qsWRVcREK7K9NQ3tQPWjvENTHP6QB2And
+        // fee paid 5290 = 5000 base + 290 priority; limit 222603; 1 ix
+        pub const V1_OVER_1232_BYTES: &str = concat!(
+            "gQEADg8AAAAD1k2CSL1vExuHd6ES3LcXynDpTTYVW+ujpgd46zoZnAEgwelJV+pl4QpqhEkwM7S1MRkj7B9/oL49oe",
+            "Lr1xXjMLz+H3Lk35Lnf5QB3gXwy+0OjuQPwYeKjSrYsIF+ocATWh99Ig2xX4v5ssVAy9KHqohn/SqiU0LLp8a8Flcg",
+            "MgaE4T5jcIruZFjjkYG464IkwAyq2sddxEDIucHPh8LhRCuwXh/SEip7YgRXkVlpOPdeGP2kXllUkhGKP/sswqnGrc",
+            "+tji0MxO2oiJx2MXjGX1r9OT3t1OynVk5h3xZ2hnQbwrweL2JhmYRLYb3c5UU6gwnsJx9jQkYxhkWan8KXR9/bBIJ1",
+            "5KaEe8Nlx/PNGaOyhAHwYxwtdK7a2W7WUmPTUP+u2riy8E0U9XFDZh6A0qWGWEtc0FbQlymH84NCUEgX42//BZsyGU",
+            "5cBNDGj4YTuti9jazZf7svGBtJ7qWlxU7mvaIi/Csr+TU/pE2eK8qiSeGo2MQxNzv7AxzfsF/5R6CIuqst7S4/849r",
+            "HUIecl0MLEBY7xhvRXX6IiH0hjmJHNkAUwoITjZh+Y9yssTouB1MtU79HEsBTHxisbdAldOftbte0ltw90OueMLJFB",
+            "d9pUGD4xZTc9oE/3TgVjwaBn3rMjjt3MSi7nmPSPRLhwnVsdX2fKJH21ctwkqWnEbSetqQGdwIAQ796RHSATo84yqH",
+            "dl95J1EItUkKJfgWCdhkZ3Itp5hYwo64jBwdHJzvhk8QMLkeviqn6SE3oyFq3fFCKMkW0Cytle77nGnL/oC8hC7IJt",
+            "PkjLSWk9OGhwmhk+oNdDjoYd6RfEBitaAqGDeI1fLfB8mR7Qz4Rt0PbVCJC6ZE/h9VqhnxHNLS7BTTIztuCkvq7vcr",
+            "aYWOIeFw1gabiFf+q4GE+2h/Y0YYwDXaxDncGus7VZig8AAAAAABBt324ddloZPZy+FGzut5rBy0he1fWzeROoz1hX",
+            "7/AKkAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEEkbsx9eP6B5BdzpGllQZk3kjoHZEeX328+tRRCYBDL",
+            "5UpwlSiDn2HAubhgeYkcE5IW5Hpxti+3O+xyFpRYdF4MFN78gl7GdpQlCBi7ZUBl9CmNMVbVcbTU+AkMGOmoYz4frH",
+            "Bi7UccWx8zX/04G4CEI6KYj0NAFmoWBQ+T3t2vBt324e51j94YQl285GzN2rYa/E2DuQ0n/r35KNihi/wMRfffjZ5y",
+            "lWKEkz9tmLdXAy6D34RgT7XhF//2HVsS+QVKU1qZKSEGTSTocWDaOHx8NbXdvJK7geQfqEBBBUSNDgNoX46QkFPkWB",
+            "IcZvWnau3HcGqhHIL4qpUqjyt4eamwsShG8lBLdJ/iMbayXjSpVj2dIhuZLuW2jUF0uCcuMyIBAAAAAAAAi2UDAAAA",
+            "XgEfIIgAABITFAEVFgIXAxgZBAUaBgcIGxwJCgsMDQ4PEBEbHR4BA2W2xhsAAAAAX258xqufgIY0Bf+DLtxJdFWHo3",
+            "epj/f27vzChHcKPLGCU1kDET+sErBhDn5zt6FBexr0VmR7//ZBXxs7PX90BnxUoXU2udIIvZQ21pCBZTOAVLsvTQ+b",
+            "L2fQQHIYFp+wGUjqfcJSQbbaBZOq2i5H/1UqKn+64K2gc9Ac5CqcltJ/VMgfdI9+6EYOVMGWgj7pfptW2BlZsuExsF",
+            "U5HXDQL+dkM1R7PKskygGFco1eE5nBUVE6f+rb+iJYT5k1Ag==",
+        );
+    }
+
+    fn v1(encoded: &str) -> Vec<u8> {
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap()
+    }
+
+    #[test]
+    fn v1_header_fee_is_total_lamports_and_price_is_derived() {
+        let info = decode_transaction(&v1(v1_fixtures::V1_FEE_AND_LIMIT)).unwrap();
+        assert!(info.is_versioned);
+        assert_eq!(info.requested_priority_fee_lamports, Some(324));
+        assert_eq!(info.cu_limit, 24);
+        assert!(!info.cu_limit_defaulted);
+        assert_eq!(info.cu_price_micro_lamports, Some(13_500_000));
+        assert_eq!(info.num_instructions, 1);
+        assert_eq!(info.num_signatures, 1);
+
+        // The heap-size bit adds a config word; it must not shift the others.
+        let info = decode_transaction(&v1(v1_fixtures::V1_FEE_LIMIT_HEAP)).unwrap();
+        assert_eq!(info.requested_priority_fee_lamports, Some(5));
+        assert_eq!(info.cu_limit, 610);
+        assert_eq!(info.cu_price_micro_lamports, Some(8_196));
+    }
+
+    /// ComputeBudget instructions inside a v1 transaction are ignored: this one
+    /// sets a limit and a price by instruction, yet paid no priority fee.
+    #[test]
+    fn v1_ignores_compute_budget_instructions() {
+        let info = decode_transaction(&v1(v1_fixtures::V1_NO_FEE_WITH_IGNORED_BUDGET_IXS)).unwrap();
+        assert_eq!(info.requested_priority_fee_lamports, None);
+        assert_eq!(info.cu_price_micro_lamports, None);
+        assert_eq!(info.cu_limit, 20_000, "from the header");
+        assert_eq!(info.num_instructions, 3);
+    }
+
+    #[test]
+    fn v1_over_1232_bytes_decodes_through_the_request_path() {
+        let raw = v1(v1_fixtures::V1_OVER_1232_BYTES);
+        assert!(raw.len() > MAX_LEGACY_LEN);
+        let body = serde_json::json!({
+            "params": [v1_fixtures::V1_OVER_1232_BYTES, {"encoding": "base64"}]
+        })
+        .to_string();
+        let info = decode_request(body.as_bytes()).unwrap();
+        assert_eq!(info.requested_priority_fee_lamports, Some(290));
+        assert_eq!(info.cu_limit, 222_603);
+        assert_eq!(info.cu_price_micro_lamports, Some(1_302));
+    }
+
+    #[test]
+    fn v1_malformed_and_unset_fields() {
+        let good = v1(v1_fixtures::V1_FEE_AND_LIMIT);
+        for end in [1, 8, 40, 42, good.len() - 1] {
+            assert_eq!(
+                decode_transaction(&good[..end]),
+                Err(DecodeError::Unparsed),
+                "truncation at {end}"
+            );
+        }
+        let mut trailing = good.clone();
+        trailing.push(0);
+        assert_eq!(decode_transaction(&trailing), Err(DecodeError::Unparsed));
+
+        // Only half of the u64 fee: clear bit 1 and drop its config word, which
+        // sits second after the addresses, so the rest still lines up.
+        let mut half = good.clone();
+        half[4] &= !0b10;
+        let config_start = 42 + 32 * good[41] as usize;
+        half.drain(config_start + 4..config_start + 8);
+        assert_eq!(decode_transaction(&half), Err(DecodeError::InvalidBudget));
+
+        // No config at all: limit 0 (Agave's default for v1), no fee.
+        let mut bare = vec![V1_PREFIX, 1, 0, 0, 0, 0, 0, 0];
+        bare.extend([0u8; 32]);
+        bare.extend([0, 0]); // no instructions, no addresses
+        bare.extend([0u8; 64]);
+        let info = decode_transaction(&bare).unwrap();
+        assert_eq!(info.cu_limit, 0);
+        assert!(info.cu_limit_defaulted);
+        assert_eq!(info.requested_priority_fee_lamports, None);
+
+        let mut future = bare.clone();
+        future[0] = 0x82;
+        assert_eq!(decode_transaction(&future), Err(DecodeError::Unsupported));
     }
 
     #[test]
