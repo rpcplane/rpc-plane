@@ -129,12 +129,15 @@ impl RateLimiter {
 
 // ── Commitment isolation ─────────────────────────────────────────────────────
 
-/// The three Solana commitment levels probed each cycle. `processed` is the hot
-/// path a provider serves cheapest; `confirmed`/`finalized` can lag on an
-/// entirely different storage tier, so drift is tracked per commitment against a
-/// per-commitment tip (finalized trails ~32 slots by design — comparing it to
-/// the processed tip would make every provider look drifting).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The Solana commitment levels a probe can read (`[health] probe_commitments`).
+/// `processed` is the hot path a provider serves cheapest; the others can lag on
+/// an entirely different storage tier, so drift is tracked per commitment
+/// against a per-commitment tip. Since Alpenglow, `confirmed` and `finalized`
+/// are the same bank (Agave sets both on finalization, ~1 slot behind
+/// `processed`) and `confirmed` is slated for removal, so the default probes
+/// `processed` + `finalized`. Every probed commitment is scored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Commitment {
     Processed,
     Confirmed,
@@ -142,9 +145,11 @@ pub enum Commitment {
 }
 
 impl Commitment {
-    /// The read commitments expected to track the tip. `finalized` is excluded:
-    /// it legitimately lags, so it feeds drift metrics but not the score.
-    const READ: [Commitment; 2] = [Commitment::Processed, Commitment::Confirmed];
+    const ALL: [Commitment; 3] = [
+        Commitment::Processed,
+        Commitment::Confirmed,
+        Commitment::Finalized,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -391,19 +396,19 @@ pub struct HealthSnapshot {
     pub score: f64,
     /// Last observed `processed` slot. None until the first successful probe.
     pub slot_height: Option<u64>,
-    /// Worst drift across the read commitments (processed/confirmed). 0 when no
-    /// slot data yet. This is the headline drift; per-commitment detail lives in
-    /// the `processed`/`confirmed`/`finalized` fields below.
+    /// Worst drift across the probed commitments. 0 when no slot data yet. This
+    /// is the headline drift; per-commitment detail lives in the
+    /// `processed`/`confirmed`/`finalized` fields below.
     pub slot_drift: u64,
-    /// True when a read commitment's drift exceeds the configured threshold.
+    /// True when a probed commitment's drift exceeds the configured threshold.
     pub is_drifting: bool,
     /// EMA latency in milliseconds (0.0 = no data yet).
     pub latency_ms: f64,
     /// Error rate in the sliding window (0.0–1.0).
     pub error_rate: f64,
     pub circuit: CircuitState,
-    /// Per-commitment slot + drift. `finalized` is observed for visibility but
-    /// excluded from the score (it legitimately trails the tip).
+    /// Per-commitment slot + drift. A commitment left out of
+    /// `[health] probe_commitments` has no slot and zero drift.
     pub processed: CommitmentHealth,
     pub confirmed: CommitmentHealth,
     pub finalized: CommitmentHealth,
@@ -547,11 +552,11 @@ impl Inner {
         self.push_sample(sample, latency_ms, update_latency, window_secs);
     }
 
-    /// Worst drift across the read commitments (processed/confirmed), each
-    /// compared to its own tip — from the round it was sampled in, when known.
-    /// None until at least one has slot data.
-    fn worst_read_drift(&self, tips: &impl TipSource) -> Option<u64> {
-        Commitment::READ
+    /// Worst drift across the probed commitments, each compared to its own tip
+    /// — from the round it was sampled in, when known. None until at least one
+    /// has slot data. (A commitment that isn't probed never has any.)
+    fn worst_drift(&self, tips: &impl TipSource) -> Option<u64> {
+        Commitment::ALL
             .into_iter()
             .filter_map(|c| self.drift(c, tips))
             .max()
@@ -581,9 +586,9 @@ impl Inner {
         let error_score = 1.0 - error_rate;
 
         // Slot freshness: 0 drift → 1.0; decays as drift grows past threshold.
-        // Scored off the worst read commitment so a provider whose `confirmed`
+        // Scored off the worst probed commitment so a provider whose `finalized`
         // stalls while `processed` stays fresh is still demoted.
-        let slot_score = match self.worst_read_drift(tips) {
+        let slot_score = match self.worst_drift(tips) {
             Some(drift) => {
                 let thr = cfg.slot_drift_threshold as f64;
                 thr / (thr + drift as f64)
@@ -637,9 +642,10 @@ impl ProviderHealth {
         let processed = commitment(Commitment::Processed);
         let confirmed = commitment(Commitment::Confirmed);
         let finalized = commitment(Commitment::Finalized);
-        // Headline drift = worst of the read commitments (finalized excluded).
-        let slot_drift = processed.drift.max(confirmed.drift);
-        let is_drifting = processed.is_drifting || confirmed.is_drifting;
+        // Headline drift = worst of the probed commitments (an unprobed one has
+        // no slot, so its drift is 0 and it is never drifting).
+        let slot_drift = processed.drift.max(confirmed.drift).max(finalized.drift);
+        let is_drifting = processed.is_drifting || confirmed.is_drifting || finalized.is_drifting;
         HealthSnapshot {
             name: self.name.clone(),
             score: g.score(tips, cfg),
@@ -976,6 +982,12 @@ impl HealthMonitor {
         let reference_slots = *self.reference_slots.read();
         tips.observe(&reference_slots);
         observed_tips.observe_max(&reference_slots);
+        // Alpenglow sets `confirmed` and `finalized` from the same bank, so with
+        // `confirmed` left out of `probe_commitments` its tip is the finalized
+        // one — history analytics can still date `confirmed` reads.
+        if observed_tips.confirmed.is_none() {
+            observed_tips.confirmed = observed_tips.finalized;
+        }
         let book = TipBook {
             latest: tips,
             rounds: *self.round_tips.read(),
@@ -1079,7 +1091,7 @@ async fn health_loop(
         }
         let round = clock.on_grid_round(tick);
         let t0 = Instant::now();
-        match probe(&client, &provider).await {
+        match probe(&client, &provider, &cfg.probe_commitments).await {
             Ok(res) => {
                 // Score latency off the `processed` call alone — confirmed/finalized
                 // hit slower storage tiers and would inflate the EMA.
@@ -1148,8 +1160,8 @@ async fn reference_loop(
     let Probing {
         clock,
         round_tips,
+        cfg,
         metrics,
-        ..
     } = probing;
     // A dedicated client — the reference is not in the routed provider pool.
     // Plain HTTP (no http3): the reference is a public cluster RPC.
@@ -1183,7 +1195,7 @@ async fn reference_loop(
             break;
         }
         let round = clock.on_grid_round(tick);
-        match probe(&client, &reference).await {
+        match probe(&client, &reference, &cfg.probe_commitments).await {
             Ok(res) => {
                 let processed = res.slots.processed.unwrap_or_default();
                 if let Some(round) = round {
@@ -1228,18 +1240,32 @@ struct ProbeResult {
 /// shape of real client traffic. `processed` is the liveness signal — the probe
 /// fails only if it fails; a stalled `confirmed`/`finalized` surfaces as drift,
 /// not a probe error (its slot is simply left unchanged this cycle).
-async fn probe(client: &Client, provider: &ProviderConfig) -> anyhow::Result<ProbeResult> {
+async fn probe(
+    client: &Client,
+    provider: &ProviderConfig,
+    commitments: &[Commitment],
+) -> anyhow::Result<ProbeResult> {
+    // `processed` is always read (config validation requires it): liveness and
+    // latency hang off it. The others cost one billed call each, so only the
+    // configured ones are sent.
+    let optional = |c: Commitment| async move {
+        if commitments.contains(&c) {
+            get_slot(client, provider, c).await.ok().map(|(s, _)| s)
+        } else {
+            None
+        }
+    };
     let (processed, confirmed, finalized) = tokio::join!(
         get_slot(client, provider, Commitment::Processed),
-        get_slot(client, provider, Commitment::Confirmed),
-        get_slot(client, provider, Commitment::Finalized),
+        optional(Commitment::Confirmed),
+        optional(Commitment::Finalized),
     );
     let (processed_slot, processed_latency_ms) = processed?;
     Ok(ProbeResult {
         slots: CommitmentSlots {
             processed: Some(processed_slot),
-            confirmed: confirmed.ok().map(|(s, _)| s),
-            finalized: finalized.ok().map(|(s, _)| s),
+            confirmed,
+            finalized,
         },
         processed_latency_ms,
     })
@@ -1873,13 +1899,16 @@ mod tests {
         assert_eq!(clock.on_grid_round(late), None);
     }
 
+    /// Drift is per commitment: a provider is compared with the best slot
+    /// *at that commitment*, so however far `finalized` sits behind `processed`
+    /// (~32 slots under TowerBFT, ~1 under Alpenglow) it never reads as drift.
     #[test]
     fn finalized_drift_measured_against_finalized_tip() {
         let ph = ProviderHealth::new("p");
         ph.update_slots(CommitmentSlots {
             processed: Some(1000),
             confirmed: Some(998),
-            finalized: Some(968), // ~32 behind processed by design, but at the finalized tip
+            finalized: Some(968), // well behind processed, but at the finalized tip
         });
         let t = SlotTips {
             processed: 1000,
@@ -1887,13 +1916,41 @@ mod tests {
             finalized: 968,
         };
         let snap = ph.snapshot(&t, &default_cfg()); // threshold 10
-                                                    // Against the *finalized* tip it is not behind at all — comparing it
-                                                    // to the processed tip (1000) would falsely show a 32-slot lag.
         assert_eq!(snap.finalized.drift, 0);
         assert!(!snap.finalized.is_drifting);
-        // Headline drift folds processed(0) + confirmed(2) but never finalized.
+        // Headline drift folds every probed commitment: max(0, 2, 0).
         assert_eq!(snap.slot_drift, 2);
         assert!(!snap.is_drifting);
+    }
+
+    /// `finalized` is scored now: a provider whose finalized view stalls while
+    /// processed stays fresh is demoted, as a confirmed stall always was.
+    #[test]
+    fn finalized_stall_demotes_score_and_flags_drift() {
+        let cfg = default_cfg();
+        let t = SlotTips {
+            processed: 1000,
+            confirmed: 0,
+            finalized: 999,
+        };
+        let probed = |finalized| CommitmentSlots {
+            processed: Some(1000),
+            confirmed: None, // not probed by default
+            finalized: Some(finalized),
+        };
+        let healthy = ProviderHealth::new("healthy");
+        healthy.update_slots(probed(999));
+        let stalled = ProviderHealth::new("stalled");
+        stalled.update_slots(probed(950));
+
+        let hs = healthy.snapshot(&t, &cfg);
+        let ss = stalled.snapshot(&t, &cfg);
+        assert!(!hs.is_drifting);
+        assert_eq!(ss.slot_drift, 49);
+        assert!(ss.is_drifting);
+        assert!(ss.score < hs.score);
+        assert_eq!(ss.confirmed.slot, None);
+        assert_eq!(ss.confirmed.drift, 0, "an unprobed commitment never drifts");
     }
 
     #[test]
