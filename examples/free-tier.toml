@@ -71,14 +71,14 @@
 listen         = "127.0.0.1:9400"
 metrics_listen = "127.0.0.1:9401"
 
-# Each health probe is three getSlot calls per provider (one per commitment
-# level). They are billed like any other call and run whether or not you send
-# traffic. At a 2 s interval that is 3.9M calls per key per month, which on its
-# own uses up Helius's 1M credits in ~8 days, Alchemy's 30M CU in ~12 (getSlot
-# is 20 CU) and the QuickNode trial in ~3. At 30 s the probes cost 26%, 17% and
-# 39 days respectively. The trade: slot drift and latency are refreshed every
-# 30 s instead of every 2. Failures still count at once, because live requests
-# feed the circuit breaker too.
+# Each health probe is two getSlot calls per provider (processed and finalized,
+# the default probe_commitments). They are billed like any other call and run
+# whether or not you send traffic. At a 2 s interval that is 2.6M calls per key
+# per month, which on its own uses up Helius's 1M credits in ~12 days, Alchemy's
+# 30M CU in ~17 (getSlot is 20 CU) and the QuickNode trial in ~4. At 30 s the
+# probes cost 17%, 12% and 58 days respectively. The trade: slot drift and
+# latency are refreshed every 30 s instead of every 2. Failures still count at
+# once, because live requests feed the circuit breaker too.
 [health]
 interval_ms             = 30000
 window_secs             = 30
