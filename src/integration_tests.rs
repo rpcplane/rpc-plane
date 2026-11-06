@@ -1199,6 +1199,64 @@ async fn providers_at_the_same_slot_show_no_drift_whatever_their_latency() {
     assert!(worst <= 4, "phantom drift of {worst} slots");
 }
 
+/// CONTRACT: a probe sends one billed `getSlot` per configured commitment and
+/// no others. The default skips `confirmed` — the same bank as `finalized` since
+/// Alpenglow — and history analytics borrows the finalized tip for it.
+#[tokio::test]
+async fn probes_send_only_the_configured_commitments() {
+    for (probed, expect_confirmed, expect_finalized) in [
+        (None, false, true),
+        (
+            Some(vec![crate::health::Commitment::Processed]),
+            false,
+            false,
+        ),
+    ] {
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log = seen.clone();
+        let router = Router::new().route(
+            "/",
+            post(move |body: axum::body::Bytes| {
+                let log = log.clone();
+                async move {
+                    let request: Value = serde_json::from_slice(&body).unwrap();
+                    let commitment = request["params"][0]["commitment"]
+                        .as_str()
+                        .unwrap_or("none")
+                        .to_string();
+                    log.lock().unwrap().push(commitment);
+                    slot_response(500)
+                }
+            }),
+        );
+        let (url, _abort) = start_mock(router).await;
+        let mut cfg = test_config(&[("p", &url)], RoutingStrategy::BestScore, 0, 5);
+        cfg.health.interval_ms = 50;
+        if let Some(list) = probed {
+            cfg.health.probe_commitments = list;
+        }
+        let state = ProxyState::new(cfg);
+        tokio::time::sleep(Duration::from_millis(180)).await;
+
+        let seen = seen.lock().unwrap().clone();
+        let count = |c: &str| seen.iter().filter(|s| *s == c).count();
+        assert!(count("processed") >= 2, "{seen:?}");
+        assert_eq!(count("confirmed") > 0, expect_confirmed, "{seen:?}");
+        assert_eq!(count("finalized") > 0, expect_finalized, "{seen:?}");
+
+        let (snaps, tips) = state.monitor.snapshots_with_tips();
+        assert_eq!(snaps[0].confirmed.slot, None);
+        if expect_finalized {
+            assert_eq!(tips.finalized, Some(500));
+            assert_eq!(
+                tips.confirmed,
+                Some(500),
+                "confirmed borrows the finalized tip"
+            );
+        }
+    }
+}
+
 const GET_BALANCE: &str = r#"{"jsonrpc":"2.0","id":1,"method":"getBalance","params":["addr"]}"#;
 
 /// A mock that answers `getSlot` health probes normally (so probe failures don't

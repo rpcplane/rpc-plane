@@ -1,3 +1,4 @@
+use crate::health::Commitment;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::Path;
@@ -94,6 +95,18 @@ impl Config {
              would have no provider; mark at least one provider history = \"full\", or set \
              routing.full_history_methods = [] to send those calls to recent providers",
             self.routing.full_history_methods.join(", ")
+        );
+        let probed = &self.health.probe_commitments;
+        anyhow::ensure!(
+            probed.contains(&Commitment::Processed),
+            "health.probe_commitments must include \"processed\": probe liveness and latency come from it"
+        );
+        anyhow::ensure!(
+            probed
+                .iter()
+                .enumerate()
+                .all(|(i, c)| !probed[..i].contains(c)),
+            "health.probe_commitments lists a commitment twice"
         );
         if let Some(url) = &self.health.reference_url {
             anyhow::ensure!(
@@ -251,6 +264,13 @@ pub struct HealthConfig {
     /// Sliding window for error rate calculation (s).
     #[serde(default = "default_window_secs")]
     pub window_secs: u64,
+    /// Commitments each probe reads with `getSlot` — one billed call apiece,
+    /// every round, even when idle. `processed` is required (probe liveness and
+    /// latency hang off it). Every probed commitment is scored for drift against
+    /// its own tip. Since Alpenglow `confirmed` and `finalized` are the same bank
+    /// and `confirmed` is slated for removal, hence the default.
+    #[serde(default = "default_probe_commitments")]
+    pub probe_commitments: Vec<Commitment>,
     /// Slots behind network tip before a provider is considered drifting.
     #[serde(default = "default_slot_drift_threshold")]
     pub slot_drift_threshold: u64,
@@ -291,6 +311,7 @@ impl Default for HealthConfig {
         Self {
             interval_ms: default_interval_ms(),
             window_secs: default_window_secs(),
+            probe_commitments: default_probe_commitments(),
             slot_drift_threshold: default_slot_drift_threshold(),
             reference_url: None,
             circuit_open_failures: default_circuit_open_failures(),
@@ -309,6 +330,9 @@ fn default_interval_ms() -> u64 {
 }
 fn default_window_secs() -> u64 {
     60
+}
+fn default_probe_commitments() -> Vec<Commitment> {
+    vec![Commitment::Processed, Commitment::Finalized]
 }
 fn default_slot_drift_threshold() -> u64 {
     10
@@ -884,6 +908,54 @@ url = "http://localhost:8899"
         );
         let err = Config::load(f.path()).unwrap_err().to_string();
         assert!(err.contains("reference_url"), "got: {err}");
+    }
+
+    fn load_probe_commitments(list: &str) -> anyhow::Result<Config> {
+        let f = write_config(&format!(
+            "[health]\nprobe_commitments = {list}\n\n[[providers]]\nname = \"p\"\nurl = \"http://localhost:8899\"\n"
+        ));
+        Config::load(f.path())
+    }
+
+    #[test]
+    fn probe_commitments_default_to_processed_and_finalized() {
+        let f = write_config(
+            r#"
+[[providers]]
+name = "p"
+url = "http://localhost:8899"
+"#,
+        );
+        let cfg = Config::load(f.path()).unwrap();
+        assert_eq!(
+            cfg.health.probe_commitments,
+            [Commitment::Processed, Commitment::Finalized]
+        );
+        assert_eq!(
+            HealthConfig::default().probe_commitments,
+            cfg.health.probe_commitments
+        );
+    }
+
+    #[test]
+    fn parses_probe_commitments() {
+        let cfg = load_probe_commitments(r#"["processed"]"#).unwrap();
+        assert_eq!(cfg.health.probe_commitments, [Commitment::Processed]);
+        let cfg = load_probe_commitments(r#"["finalized", "processed", "confirmed"]"#).unwrap();
+        assert_eq!(cfg.health.probe_commitments.len(), 3);
+    }
+
+    #[test]
+    fn rejects_bad_probe_commitments() {
+        for (list, needle) in [
+            (r#"["finalized"]"#, "must include \"processed\""),
+            ("[]", "must include \"processed\""),
+            (r#"["processed", "processed"]"#, "twice"),
+            (r#"["processed", "notarized"]"#, "unknown variant"),
+        ] {
+            let err = format!("{:#}", load_probe_commitments(list).unwrap_err());
+            assert!(err.contains(needle), "{list}: got {err}");
+        }
     }
 
     #[test]
