@@ -1,14 +1,14 @@
 # Free-tier maxxing
 #
-# ~105 requests/second of Solana RPC at zero cost. No single free tier gets you
-# there — the largest is 25 req/s — so this spreads load across eight providers,
+# ~110 requests/second of Solana RPC at zero cost. No single free tier gets you
+# there — the largest is 25 req/s — so this spreads load across nine providers,
 # weighted so each one sits at roughly the same percentage of its own limit.
 #
 # `max_rps` is what makes that work. The circuit breaker is reactive: it only
 # reroutes after a key has already returned 429s. A cap sheds load before they
 # start. The values below are each provider's documented limit — Alchemy,
 # QuickNode and Helius verified 2026-09-05, Chainstack, OnFinality and dRPC
-# 2026-09-06. Re-check them, provider tiers move.
+# 2026-09-06, Solana Vibe Station 2026-11-06. Re-check them, provider tiers move.
 #
 #   Provider           Rate limit   Monthly allowance
 #   ─────────────────  ───────────  ──────────────────────────────────────────
@@ -20,6 +20,7 @@
 #   Solana Foundation  10 req/s     unmetered, no SLA, not for production
 #   PublicNode         unpublished  unmetered, no SLA (Allnodes) — no documented cap
 #   dRPC               unpublished  210M CU/30d (~10.5M calls) — PUBLIC NODE POOL
+#   Solana Vibe Station 5 req/s     unmetered (flat-rate provider); 1 sendTransaction/s
 #
 # Two of those do not read the way the others do. OnFinality's cap is 40
 # RESPONSE UNITS per second and every Solana method costs 2 RU, so it is 20
@@ -41,6 +42,8 @@
 # No sign-up:
 #   - api.mainnet-beta.solana.com  (Solana Foundation public RPC)
 #   - solana-rpc.publicnode.com    (PublicNode, operated by Allnodes)
+#   (public.rpc.solanavibestation.com is left out: it held ~1 req/s when
+#   measured on 2026-11-06, a tenth of the smallest leg here.)
 # Free account, no card:
 #   - Alchemy    https://alchemy.com
 #   - Chainstack https://chainstack.com
@@ -48,6 +51,7 @@
 #   - dRPC       https://drpc.org        (public pool on the free tier)
 #   - QuickNode  https://quicknode.com   (trial credits, then paid)
 #   - Helius     https://helius.dev
+#   - Solana Vibe Station https://solanavibestation.com
 #
 # Chainstack, OnFinality and dRPC take a whole endpoint URL rather than a bare
 # key, so pass the full URL from their console. Env vars are expanded across the
@@ -60,22 +64,31 @@
 #   export CHAINSTACK_URL=...
 #   export ONFINALITY_URL=...
 #   export DRPC_URL=...
+#   export SVS_API_KEY=...
 #   rpc-plane -c examples/free-tier.toml run
 
 [server]
 listen         = "127.0.0.1:9400"
 metrics_listen = "127.0.0.1:9401"
 
+# Each health probe is three getSlot calls per provider (one per commitment
+# level). They are billed like any other call and run whether or not you send
+# traffic. At a 2 s interval that is 3.9M calls per key per month, which on its
+# own uses up Helius's 1M credits in ~8 days, Alchemy's 30M CU in ~12 (getSlot
+# is 20 CU) and the QuickNode trial in ~3. At 30 s the probes cost 26%, 17% and
+# 39 days respectively. The trade: slot drift and latency are refreshed every
+# 30 s instead of every 2. Failures still count at once, because live requests
+# feed the circuit breaker too.
 [health]
-interval_ms             = 2000
+interval_ms             = 30000
 window_secs             = 30
-circuit_open_failures   = 3     # open quickly when a key rate-limits
+circuit_open_failures   = 3     # hard failures in a row; a 429 never opens a circuit
 circuit_error_threshold = 0.4
-circuit_cooldown_secs   = 2     # RPS windows reset per-second; recover fast
+circuit_cooldown_secs   = 2     # a failed key gets back on trial at the first probe after this
 
 [routing]
 strategy    = "weighted_random"  # spread load — avoid hammering one key
-max_retries = 8                  # try all nine entries before giving up
+max_retries = 9                  # try all ten entries before giving up
 
 # ── Free-tier accounts ─────────────────────────────────────────────────────────
 # Weights track capacity, not provider count. Equal weights would saturate
@@ -146,3 +159,14 @@ name    = "drpc"
 url     = "${DRPC_URL}"
 weight  = 2
 max_rps = 10   # no published free-tier limit, and it runs on the public pool; stay conservative
+
+[[providers]]
+name    = "solana-vibe-station"
+url     = "https://free.rpc.solanavibestation.com/?api_key=${SVS_API_KEY}"
+weight  = 1
+max_rps = 5    # unmetered: no allowance to burn, the rate is the only ceiling
+# Checked 2026-11-06: getSignaturesForAddress covered only the last ~11 hours,
+# and getTransaction returned `null` for most transactions from 2026-08-31 to
+# 2026-10-21 while serving history back to 2024-10-25 otherwise. Neither came
+# with an error. With this set, those lookups fail over to a full-history provider.
+history = "recent"
