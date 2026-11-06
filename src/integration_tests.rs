@@ -1699,3 +1699,53 @@ async fn parallel_race_returns_miss_when_archive_fails() {
     assert_eq!(status, StatusCode::OK);
     assert!(body["result"].is_null());
 }
+
+// ── Probe phase ───────────────────────────────────────────────────────────────
+
+/// A mock whose slot advances every 5 ms of wall clock (shared across mocks, so
+/// they agree on the true tip). The slot is read on arrival and the answer is
+/// sent after `delay`, like a provider further away.
+async fn start_clock_mock(
+    epoch: std::time::Instant,
+    delay: Duration,
+) -> (String, tokio::task::AbortHandle) {
+    let router = Router::new().route(
+        "/",
+        post(move || async move {
+            let slot = 1_000 + epoch.elapsed().as_millis() as u64 / 5;
+            tokio::time::sleep(delay).await;
+            slot_response(slot)
+        }),
+    );
+    start_mock(router).await
+}
+
+/// CONTRACT: two providers at the same true slot show no drift, however
+/// different their latency. Probe loops used to sleep `interval_ms` after each
+/// probe, so a provider 60 ms slower fell 60 ms further out of phase every
+/// round and was compared against samples taken up to a whole interval later
+/// — here up to ~20 phantom slots against a threshold of 10.
+#[tokio::test]
+async fn providers_at_the_same_slot_show_no_drift_whatever_their_latency() {
+    let epoch = std::time::Instant::now();
+    let (fast, _a) = start_clock_mock(epoch, Duration::ZERO).await;
+    let (slow, _b) = start_clock_mock(epoch, Duration::from_millis(60)).await;
+    let mut cfg = test_config(
+        &[("fast", &fast), ("slow", &slow)],
+        RoutingStrategy::BestScore,
+        0,
+        5,
+    );
+    cfg.health.interval_ms = 100;
+    let state = ProxyState::new(cfg);
+
+    let mut worst = 0;
+    let until = std::time::Instant::now() + Duration::from_millis(1_500);
+    while std::time::Instant::now() < until {
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        for snap in state.monitor.snapshots() {
+            worst = worst.max(snap.processed.drift);
+        }
+    }
+    assert!(worst <= 4, "phantom drift of {worst} slots");
+}

@@ -228,6 +228,151 @@ impl SlotTips {
     }
 }
 
+// ── Probe rounds ─────────────────────────────────────────────────────────────
+
+/// The shared probe schedule. Every provider, and the external reference, is
+/// probed on one grid — `start + n × interval_ms`, round `n` — so the slots of a
+/// round are sampled at the same moment and drift compares like with like.
+///
+/// Independent loops that slept `interval_ms` after each probe drifted out of
+/// phase by their latency difference every cycle, until samples taken up to a
+/// whole interval apart were compared. At ~200 ms slots that read as up to
+/// `interval_ms / 200` slots of drift that wasn't there — ~5 at the 1 s default,
+/// ~140 at a 30 s interval.
+#[derive(Debug, Clone, Copy)]
+struct ProbeClock {
+    start: tokio::time::Instant,
+    period: Duration,
+}
+
+impl ProbeClock {
+    fn new(interval_ms: u64) -> Self {
+        Self {
+            start: tokio::time::Instant::now(),
+            period: Duration::from_millis(interval_ms.max(1)),
+        }
+    }
+
+    fn round(&self, at: tokio::time::Instant) -> u64 {
+        (at.saturating_duration_since(self.start).as_nanos() / self.period.as_nanos()) as u64
+    }
+
+    /// A ticker on the grid. Its first tick is the current grid point (so the
+    /// loops spawned at startup probe at once); ticks a slow probe overran are
+    /// skipped rather than bunched, which keeps it on the grid.
+    fn ticker(&self) -> tokio::time::Interval {
+        let n = self.round(tokio::time::Instant::now()) as u128;
+        let offset = Duration::from_nanos((self.period.as_nanos() * n) as u64);
+        let mut ticker = tokio::time::interval_at(self.start + offset, self.period);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker
+    }
+
+    /// The round a tick samples, or `None` when it fired too late to count as
+    /// sampled with the rest of its round: a provider added mid-round by hot
+    /// reload, or the catch-up tick after a probe that overran the interval.
+    /// Such a probe still updates health; it is only left out of round tips.
+    fn on_grid_round(&self, tick: tokio::time::Instant) -> Option<u64> {
+        let slack = (self.period / 4).min(Duration::from_millis(100));
+        (tick.elapsed() <= slack).then(|| self.round(tick))
+    }
+}
+
+/// Probe round each of a provider's commitment slots was sampled in; `None`
+/// for a sample taken off the grid (see [`ProbeClock::on_grid_round`]).
+#[derive(Debug, Clone, Copy, Default)]
+struct CommitmentRounds {
+    processed: Option<u64>,
+    confirmed: Option<u64>,
+    finalized: Option<u64>,
+}
+
+impl CommitmentRounds {
+    fn get(&self, c: Commitment) -> Option<u64> {
+        match c {
+            Commitment::Processed => self.processed,
+            Commitment::Confirmed => self.confirmed,
+            Commitment::Finalized => self.finalized,
+        }
+    }
+
+    /// Stamp `round` on every commitment `slots` carries — the ones
+    /// [`CommitmentSlots::merge`] overwrites.
+    fn stamp(&mut self, slots: &CommitmentSlots, round: Option<u64>) {
+        if slots.processed.is_some() {
+            self.processed = round;
+        }
+        if slots.confirmed.is_some() {
+            self.confirmed = round;
+        }
+        if slots.finalized.is_some() {
+            self.finalized = round;
+        }
+    }
+}
+
+/// How many recent rounds keep their own tips. A provider whose latest sample
+/// is older than that is compared against the latest tip instead.
+const TIP_ROUNDS: usize = 4;
+
+/// Per-commitment tips of the last [`TIP_ROUNDS`] probe rounds: the max slot
+/// each commitment reached across every provider (and the reference) sampled
+/// in that round. `Copy`, so the routing hot path reads it without allocating.
+#[derive(Debug, Clone, Copy, Default)]
+struct RoundTips([Option<(u64, SlotTips)>; TIP_ROUNDS]);
+
+impl RoundTips {
+    fn observe(&mut self, round: u64, slots: &CommitmentSlots) {
+        let entry = &mut self.0[(round % TIP_ROUNDS as u64) as usize];
+        match entry {
+            Some((r, tips)) if *r == round => tips.observe(slots),
+            // A straggler from a round the ring has already moved past.
+            Some((r, _)) if *r > round => {}
+            _ => {
+                let mut tips = SlotTips::default();
+                tips.observe(slots);
+                *entry = Some((round, tips));
+            }
+        }
+    }
+
+    fn get(&self, round: u64) -> Option<&SlotTips> {
+        match &self.0[(round % TIP_ROUNDS as u64) as usize] {
+            Some((r, tips)) if *r == round => Some(tips),
+            _ => None,
+        }
+    }
+}
+
+/// What a provider's drift at commitment `c` is measured against: the tip of
+/// the round its slot was sampled in, when known.
+pub trait TipSource {
+    fn tip(&self, c: Commitment, round: Option<u64>) -> u64;
+}
+
+/// Plain latest tips, regardless of round (tests, and the fallback below).
+impl TipSource for SlotTips {
+    fn tip(&self, c: Commitment, _round: Option<u64>) -> u64 {
+        self.get(c)
+    }
+}
+
+/// The tips routing snapshots use: a sample's own round when that round is
+/// still in the ring, otherwise the latest tip across everyone's last sample.
+struct TipBook {
+    latest: SlotTips,
+    rounds: RoundTips,
+}
+
+impl TipSource for TipBook {
+    fn tip(&self, c: Commitment, round: Option<u64>) -> u64 {
+        match round.and_then(|r| self.rounds.get(r)) {
+            Some(tips) => tips.get(c),
+            None => self.latest.get(c),
+        }
+    }
+}
+
 /// Per-commitment slice of a provider's snapshot: slot, drift vs the
 /// commitment's tip, and whether that drift crossed the threshold.
 #[derive(Debug, Clone, Copy, Default)]
@@ -283,6 +428,8 @@ impl HealthSnapshot {
 
 struct Inner {
     slots: CommitmentSlots,
+    /// The probe round each of `slots` was sampled in.
+    rounds: CommitmentRounds,
     latency_ema_ms: f64,
     consecutive_failures: u32,
     circuit: CircuitState,
@@ -295,6 +442,7 @@ impl Inner {
     fn new() -> Self {
         Self {
             slots: CommitmentSlots::default(),
+            rounds: CommitmentRounds::default(),
             latency_ema_ms: 0.0,
             consecutive_failures: 0,
             circuit: CircuitState::Closed,
@@ -400,17 +548,24 @@ impl Inner {
     }
 
     /// Worst drift across the read commitments (processed/confirmed), each
-    /// compared to its own tip. None until at least one has slot data.
-    fn worst_read_drift(&self, tips: &SlotTips) -> Option<u64> {
+    /// compared to its own tip — from the round it was sampled in, when known.
+    /// None until at least one has slot data.
+    fn worst_read_drift(&self, tips: &impl TipSource) -> Option<u64> {
         Commitment::READ
             .into_iter()
-            .filter_map(|c| self.slots.get(c).map(|h| tips.get(c).saturating_sub(h)))
+            .filter_map(|c| self.drift(c, tips))
             .max()
+    }
+
+    /// Drift at one commitment, or None without slot data.
+    fn drift(&self, c: Commitment, tips: &impl TipSource) -> Option<u64> {
+        let slot = self.slots.get(c)?;
+        Some(tips.tip(c, self.rounds.get(c)).saturating_sub(slot))
     }
 
     /// Compute health score from current state.
     /// Weights are normalised so they don't need to sum to 1.0.
-    fn score(&self, tips: &SlotTips, cfg: &HealthConfig) -> f64 {
+    fn score(&self, tips: &impl TipSource, cfg: &HealthConfig) -> f64 {
         if self.circuit == CircuitState::Open {
             return 0.0;
         }
@@ -469,18 +624,15 @@ impl ProviderHealth {
     }
 
     /// Read-only snapshot for routing decisions.
-    pub fn snapshot(&self, tips: &SlotTips, cfg: &HealthConfig) -> HealthSnapshot {
+    pub fn snapshot(&self, tips: &impl TipSource, cfg: &HealthConfig) -> HealthSnapshot {
         let g = self.inner.read();
-        let commitment = |c: Commitment| match g.slots.get(c) {
-            Some(h) => {
-                let drift = tips.get(c).saturating_sub(h);
-                CommitmentHealth {
-                    slot: Some(h),
-                    drift,
-                    is_drifting: drift > cfg.slot_drift_threshold,
-                }
-            }
-            None => CommitmentHealth::default(),
+        let commitment = |c: Commitment| match (g.slots.get(c), g.drift(c, tips)) {
+            (Some(h), Some(drift)) => CommitmentHealth {
+                slot: Some(h),
+                drift,
+                is_drifting: drift > cfg.slot_drift_threshold,
+            },
+            _ => CommitmentHealth::default(),
         };
         let processed = commitment(Commitment::Processed);
         let confirmed = commitment(Commitment::Confirmed);
@@ -535,9 +687,17 @@ impl ProviderHealth {
         self.inner.write().slots.processed = Some(slot);
     }
 
-    /// Merge a freshly-probed set of per-commitment slots.
+    /// Merge a freshly-probed set of per-commitment slots, off the probe grid.
+    #[cfg(test)]
     pub fn update_slots(&self, slots: CommitmentSlots) {
-        self.inner.write().slots.merge(slots);
+        self.update_slots_in_round(slots, None);
+    }
+
+    /// Merge a freshly-probed set of per-commitment slots sampled in `round`.
+    fn update_slots_in_round(&self, slots: CommitmentSlots, round: Option<u64>) {
+        let mut g = self.inner.write();
+        g.rounds.stamp(&slots, round);
+        g.slots.merge(slots);
     }
 }
 
@@ -616,6 +776,10 @@ pub struct HealthMonitor {
     reference_slots: Arc<RwLock<CommitmentSlots>>,
     /// Set to true to stop the reference probe loop.
     reference_stop: Arc<AtomicBool>,
+    /// The shared probe grid every loop ticks on.
+    clock: ProbeClock,
+    /// Tips of the last few probe rounds, for same-round drift.
+    round_tips: Arc<RwLock<RoundTips>>,
     pub cfg: Arc<HealthConfig>,
     metrics: Metrics,
 }
@@ -639,6 +803,8 @@ impl HealthMonitor {
             entries: Arc::new(RwLock::new(entries)),
             reference_slots: Arc::new(RwLock::new(CommitmentSlots::default())),
             reference_stop: Arc::new(AtomicBool::new(false)),
+            clock: ProbeClock::new(cfg.interval_ms),
+            round_tips: Arc::new(RwLock::new(RoundTips::default())),
             cfg: Arc::new(cfg),
             metrics,
         }
@@ -661,14 +827,7 @@ impl HealthMonitor {
                 };
                 (e.health.clone(), e.stop.clone())
             };
-            Self::spawn_loops(
-                health,
-                stop,
-                client,
-                provider,
-                self.cfg.clone(),
-                self.metrics.clone(),
-            );
+            self.spawn_loops(health, stop, client, provider);
         }
         // Opt-in external reference: probed for its slot but never added to
         // `entries`, so the router never sees it. Spawned once (a reference-URL
@@ -679,8 +838,12 @@ impl HealthMonitor {
                 self.reference_slots.clone(),
                 self.reference_stop.clone(),
                 url,
-                self.cfg.clone(),
-                self.metrics.clone(),
+                Probing {
+                    clock: self.clock,
+                    round_tips: self.round_tips.clone(),
+                    cfg: self.cfg.clone(),
+                    metrics: self.metrics.clone(),
+                },
             );
         }
     }
@@ -690,14 +853,7 @@ impl HealthMonitor {
         let stop = Arc::new(AtomicBool::new(false));
         let health = ProviderHealth::new(provider.name.as_str());
         let limiter = build_limiter(provider.max_rps);
-        Self::spawn_loops(
-            health.clone(),
-            stop.clone(),
-            client,
-            provider.clone(),
-            self.cfg.clone(),
-            self.metrics.clone(),
-        );
+        self.spawn_loops(health.clone(), stop.clone(), client, provider.clone());
         self.entries.write().insert(
             provider.name.clone(),
             ProviderEntry {
@@ -751,16 +907,19 @@ impl HealthMonitor {
     }
 
     fn spawn_loops(
+        &self,
         health: Arc<ProviderHealth>,
         stop: Arc<AtomicBool>,
         client: Arc<Client>,
         provider: ProviderConfig,
-        cfg: Arc<HealthConfig>,
-        metrics: Metrics,
     ) {
-        tokio::spawn({
-            async move { health_loop(health, client, provider, cfg, metrics, stop).await }
-        });
+        let probing = Probing {
+            clock: self.clock,
+            round_tips: self.round_tips.clone(),
+            cfg: self.cfg.clone(),
+            metrics: self.metrics.clone(),
+        };
+        tokio::spawn(async move { health_loop(health, client, provider, probing, stop).await });
     }
 
     /// Per-commitment network tips = max slot across all providers at each level,
@@ -817,10 +976,14 @@ impl HealthMonitor {
         let reference_slots = *self.reference_slots.read();
         tips.observe(&reference_slots);
         observed_tips.observe_max(&reference_slots);
+        let book = TipBook {
+            latest: tips,
+            rounds: *self.round_tips.read(),
+        };
         let snapshots = entries
             .iter()
             .map(|(h, limiter)| {
-                let mut snap = h.snapshot(&tips, &self.cfg);
+                let mut snap = h.snapshot(&book, &self.cfg);
                 // Peek the bucket (no token spent): an empty bucket marks the
                 // provider rate-limited so `is_available` sheds it from routing.
                 snap.rate_limited = limiter.as_ref().is_some_and(|l| !l.has_capacity());
@@ -873,14 +1036,28 @@ impl HealthMonitor {
 
 // ── Background health loop ────────────────────────────────────────────────────
 
+/// What every probe loop shares: the grid it ticks on, the round tips it
+/// reports into, and config/metrics.
+struct Probing {
+    clock: ProbeClock,
+    round_tips: Arc<RwLock<RoundTips>>,
+    cfg: Arc<HealthConfig>,
+    metrics: Metrics,
+}
+
 async fn health_loop(
     state: Arc<ProviderHealth>,
     client: Arc<Client>,
     provider: ProviderConfig,
-    cfg: Arc<HealthConfig>,
-    metrics: Metrics,
+    probing: Probing,
     stop: Arc<AtomicBool>,
 ) {
+    let Probing {
+        clock,
+        round_tips,
+        cfg,
+        metrics,
+    } = probing;
     // Submit-only providers (e.g. a transaction-landing service scoped to
     // `methods = ["sendTransaction"]`) can't answer the getSlot probe. Skip the
     // probe loop for them; their health is driven entirely by real request
@@ -894,11 +1071,13 @@ async fn health_loop(
         return;
     }
 
-    let interval = Duration::from_millis(cfg.interval_ms);
+    let mut ticker = clock.ticker();
     loop {
+        let tick = ticker.tick().await;
         if stop.load(Ordering::Relaxed) {
             break;
         }
+        let round = clock.on_grid_round(tick);
         let t0 = Instant::now();
         match probe(&client, &provider).await {
             Ok(res) => {
@@ -908,7 +1087,12 @@ async fn health_loop(
                 let confirmed = res.slots.confirmed;
                 let finalized = res.slots.finalized;
                 let processed = res.slots.processed.unwrap_or_default();
-                state.update_slots(res.slots);
+                // Round tips first, so a snapshot never sees this round's slot
+                // without the round it belongs to.
+                if let Some(round) = round {
+                    round_tips.write().observe(round, &res.slots);
+                }
+                state.update_slots_in_round(res.slots, round);
                 state.record(true, ms, /* is_probe */ true, &cfg);
                 metrics.record_probe(&provider.name, "health", "ok");
                 debug!(
@@ -935,10 +1119,6 @@ async fn health_loop(
                 }
             }
         }
-        if stop.load(Ordering::Relaxed) {
-            break;
-        }
-        tokio::time::sleep(interval).await;
     }
 }
 
@@ -948,10 +1128,9 @@ fn spawn_reference_loop(
     slots: Arc<RwLock<CommitmentSlots>>,
     stop: Arc<AtomicBool>,
     url: String,
-    cfg: Arc<HealthConfig>,
-    metrics: Metrics,
+    probing: Probing,
 ) {
-    tokio::spawn(async move { reference_loop(slots, stop, url, cfg, metrics).await });
+    tokio::spawn(async move { reference_loop(slots, stop, url, probing).await });
 }
 
 /// Probe the opt-in external reference (`[health] reference_url`) on the same
@@ -964,9 +1143,14 @@ async fn reference_loop(
     slots: Arc<RwLock<CommitmentSlots>>,
     stop: Arc<AtomicBool>,
     url: String,
-    cfg: Arc<HealthConfig>,
-    metrics: Metrics,
+    probing: Probing,
 ) {
+    let Probing {
+        clock,
+        round_tips,
+        metrics,
+        ..
+    } = probing;
     // A dedicated client — the reference is not in the routed provider pool.
     // Plain HTTP (no http3): the reference is a public cluster RPC.
     let client = match Client::builder()
@@ -992,14 +1176,19 @@ async fn reference_loop(
     };
     info!(reference = %reference.url, "external slot reference enabled (probe-only, never routed)");
 
-    let interval = Duration::from_millis(cfg.interval_ms);
+    let mut ticker = clock.ticker();
     loop {
+        let tick = ticker.tick().await;
         if stop.load(Ordering::Relaxed) {
             break;
         }
+        let round = clock.on_grid_round(tick);
         match probe(&client, &reference).await {
             Ok(res) => {
                 let processed = res.slots.processed.unwrap_or_default();
+                if let Some(round) = round {
+                    round_tips.write().observe(round, &res.slots);
+                }
                 // Merge (not replace) so a commitment whose leg failed this cycle
                 // keeps its last-known slot, exactly like a provider probe.
                 slots.write().merge(res.slots);
@@ -1020,10 +1209,6 @@ async fn reference_loop(
                 }
             }
         }
-        if stop.load(Ordering::Relaxed) {
-            break;
-        }
-        tokio::time::sleep(interval).await;
     }
 }
 
@@ -1575,6 +1760,118 @@ mod tests {
     }
 
     // ── Commitment isolation ──────────────────────────────────────────────────
+
+    fn slots(processed: u64) -> CommitmentSlots {
+        CommitmentSlots {
+            processed: Some(processed),
+            confirmed: Some(processed - 1),
+            finalized: Some(processed - 1),
+        }
+    }
+
+    #[test]
+    fn round_tips_keep_rounds_apart_and_ignore_stragglers() {
+        let mut ring = RoundTips::default();
+        ring.observe(5, &slots(1000));
+        ring.observe(5, &slots(1002));
+        ring.observe(6, &slots(1140));
+        assert_eq!(ring.get(5).unwrap().processed, 1002, "max within a round");
+        assert_eq!(ring.get(6).unwrap().processed, 1140);
+        assert!(ring.get(7).is_none());
+
+        // Round 9 reuses round 5's slot in the ring; a late report for round 5
+        // must not then clobber round 9.
+        ring.observe(9, &slots(1600));
+        assert!(ring.get(5).is_none(), "evicted by round 9");
+        ring.observe(5, &slots(1003));
+        assert_eq!(ring.get(9).unwrap().processed, 1600);
+        assert!(ring.get(5).is_none());
+    }
+
+    /// The bug: probe loops drifted out of phase, so one provider's sample from
+    /// round 5 was compared against another's from round 6, 140 slots later at a
+    /// 30 s interval and ~213 ms slots. Within its own round it is at the tip.
+    #[test]
+    fn drift_compares_against_the_samples_own_round() {
+        let cfg = default_cfg(); // threshold 10
+        let a = ProviderHealth::new("a");
+        let b = ProviderHealth::new("b");
+        let mut ring = RoundTips::default();
+        for (p, round, slot) in [(&a, 5, 1000), (&b, 5, 1000), (&b, 6, 1140)] {
+            ring.observe(round, &slots(slot));
+            p.update_slots_in_round(slots(slot), Some(round));
+        }
+        let latest = SlotTips {
+            processed: 1140,
+            confirmed: 1139,
+            finalized: 1139,
+        };
+        let book = TipBook {
+            latest,
+            rounds: ring,
+        };
+
+        let snap = a.snapshot(&book, &cfg);
+        assert_eq!(snap.slot_drift, 0);
+        assert!(!snap.is_drifting);
+        assert_eq!(b.snapshot(&book, &cfg).slot_drift, 0);
+        assert_eq!(snap.score, b.snapshot(&book, &cfg).score);
+
+        // Against the latest tip alone — the old behaviour — `a` looked 140 behind.
+        assert_eq!(a.snapshot(&latest, &cfg).slot_drift, 140);
+
+        // A sample whose round has left the ring falls back to the latest tip.
+        let stale = ProviderHealth::new("stale");
+        stale.update_slots_in_round(slots(900), Some(1));
+        assert_eq!(stale.snapshot(&book, &cfg).slot_drift, 240);
+        // So does an off-grid sample.
+        let late = ProviderHealth::new("late");
+        late.update_slots_in_round(slots(1130), None);
+        assert_eq!(late.snapshot(&book, &cfg).slot_drift, 10);
+    }
+
+    #[test]
+    fn a_failed_leg_keeps_its_earlier_round() {
+        let p = ProviderHealth::new("p");
+        p.update_slots_in_round(slots(1000), Some(5));
+        p.update_slots_in_round(
+            CommitmentSlots {
+                processed: Some(1005),
+                confirmed: None,
+                finalized: None,
+            },
+            Some(6),
+        );
+        let g = p.inner.read();
+        assert_eq!(g.rounds.processed, Some(6));
+        assert_eq!(
+            g.rounds.confirmed,
+            Some(5),
+            "confirmed leg failed in round 6"
+        );
+        assert_eq!(g.slots.confirmed, Some(999));
+    }
+
+    #[tokio::test]
+    async fn probe_clock_ticks_on_a_shared_grid() {
+        let clock = ProbeClock::new(1000);
+        let t = clock.start;
+        assert_eq!(clock.round(t), 0);
+        assert_eq!(clock.round(t + Duration::from_millis(999)), 0);
+        assert_eq!(clock.round(t + Duration::from_millis(1000)), 1);
+        assert_eq!(clock.round(t + Duration::from_millis(2500)), 2);
+
+        // Two tickers made at different moments fire on the same instants, and
+        // the first tick at startup comes at once, on time.
+        let mut first = clock.ticker();
+        let tick = first.tick().await;
+        assert_eq!(tick, clock.start);
+        assert_eq!(clock.on_grid_round(tick), Some(0));
+
+        // A tick that fired well past its grid point is off-grid.
+        let late = tokio::time::Instant::now() - Duration::from_millis(500);
+        assert_eq!(clock.on_grid_round(late), None);
+    }
 
     #[test]
     fn finalized_drift_measured_against_finalized_tip() {

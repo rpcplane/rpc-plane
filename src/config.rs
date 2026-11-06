@@ -244,7 +244,8 @@ fn default_pool_max_idle_per_host() -> usize {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct HealthConfig {
-    /// How often to probe each provider (ms).
+    /// How often to probe each provider (ms). Every provider is probed on the
+    /// same schedule, so one round's slots are sampled together.
     #[serde(default = "default_interval_ms")]
     pub interval_ms: u64,
     /// Sliding window for error rate calculation (s).
