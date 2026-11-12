@@ -183,6 +183,7 @@ See the [`examples/`](examples/) directory:
 - [`helius-quicknode-triton.toml`](examples/helius-quicknode-triton.toml) — standard three-provider setup (Helius, QuickNode, Triton One)
 - [`single-provider.toml`](examples/single-provider.toml) — single provider with health monitoring
 - [`trading-bot.toml`](examples/trading-bot.toml) — write-path optimized for transaction landing
+- [`validator-monitoring.toml`](examples/validator-monitoring.toml) — your own node first with a commercial fallback, for validator monitoring
 
 ## Deployment
 
