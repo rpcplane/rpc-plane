@@ -1,0 +1,76 @@
+# Validator monitoring: your own node first, a commercial fallback behind it
+#
+# For the alerting loop, exporter or stake dashboard that polls cluster state
+# (getVoteAccounts, getClusterNodes, getEpochInfo, getBlockProduction, ...) and
+# sends no transactions. Your own node answers nearly all of it for free. The
+# fallback covers the time the node is down and, more often, the time it is
+# behind.
+#
+# Why best_score and not failover_ordered:
+#   After a restart a node replays its way back to the tip and answers HTTP 200
+#   the whole time, thousands of slots behind. failover_ordered leaves the
+#   first provider only when its circuit opens, and a circuit opens on
+#   failures, so it keeps reading from that node. best_score reads the health
+#   score, and the weights below let slot freshness outweigh the node's
+#   latency advantage.
+#
+#   Measured on v0.14.0 with a simulated node and a fallback 50 ms away: the
+#   node kept every read while it was within 15 slots of the tip and lost them
+#   by 20. At 9,000 slots behind it kept 3 of 800. Those few arrive at the
+#   start of a probe round: until the fallback's probe answers, the node's own
+#   slot is the only one known for that round.
+#
+#   This needs the node to be the closest endpoint, so run the proxy on the
+#   same host or network. Latency is what makes best_score prefer the node
+#   while both are at the tip.
+#
+# Probe cost:
+#   Probes are billed like any other call and run whether or not there is
+#   traffic, so on a fallback that normally serves nothing they are the whole
+#   bill. The default (every 1 s, two commitments) is 5.2M getSlot calls a
+#   month per provider. Every 5 s at `processed` only is 518K, which fits a
+#   free tier such as Helius's 1M credits. A node that falls behind is noticed
+#   within one interval. A node that fails is noticed at once, because live
+#   requests feed the circuit breaker too.
+#
+# Usage:
+#   export HELIUS_API_KEY=...
+#   rpc-plane -c examples/validator-monitoring.toml run
+
+[server]
+listen         = "127.0.0.1:9400"
+metrics_listen = "127.0.0.1:9401"
+
+[health]
+interval_ms          = 5000            # one probe round every 5 s
+probe_commitments    = ["processed"]   # one getSlot per provider per round
+slot_drift_threshold = 150             # 30 s at 200 ms slots; the slot score is 0.5 here
+w_slot               = 0.4             # freshness outweighs latency (defaults: 0.2 and 0.4),
+w_latency            = 0.2             # and latency still decides between two fresh providers
+
+# Optional: a third slot reading that is probed but never routed to. Without it
+# the tip is whatever the fallback reports, so a fallback whose probes fail
+# leaves the node as its own tip. One more getSlot per round, to an endpoint
+# outside your provider list.
+# reference_url = "https://api.mainnet-beta.solana.com"
+
+[routing]
+strategy = "best_score"
+
+# ── Your own node ──────────────────────────────────────────────────────────────
+# The validator's private RPC port, or an RPC node you run beside it.
+
+[[providers]]
+name    = "own-node"
+url     = "http://127.0.0.1:8899"
+# A node serves only the ledger it keeps. With this set, a getBlock or
+# getTransaction it answers with `null` or "history not available" fails over
+# to the fallback, and getSignaturesForAddress goes straight there.
+history = "recent"
+
+# ── Fallback ───────────────────────────────────────────────────────────────────
+# Any commercial provider. It takes the reads while the node is down or behind.
+
+[[providers]]
+name = "helius"
+url  = "https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}"
