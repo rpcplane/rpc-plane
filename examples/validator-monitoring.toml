@@ -67,6 +67,17 @@ url     = "http://127.0.0.1:8899"
 # getTransaction it answers with `null` or "history not available" fails over
 # to the fallback, and getSignaturesForAddress goes straight there.
 history = "recent"
+# A validator started without --full-rpc-api serves only Agave's minimal RPC
+# set and answers "method not found" to everything else, getClusterNodes,
+# getBlockProduction and getBlock included. The proxy returns that error as
+# the caller's own and does not try the fallback. If that is your node, list
+# what it serves, and every other method routes to the fallback:
+# methods = [
+#   "getSlot", "getVoteAccounts", "getEpochInfo", "getBalance",
+#   "getLeaderSchedule", "getTransactionCount", "getBlockHeight",
+#   "getHealth", "getVersion", "getIdentity", "getGenesisHash",
+#   "getHighestSnapshotSlot", "getAccountInfo", "getMultipleAccounts",
+# ]
 
 # ── Fallback ───────────────────────────────────────────────────────────────────
 # Any commercial provider. It takes the reads while the node is down or behind.
